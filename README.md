@@ -1,5 +1,7 @@
-# Development-of-learning-algorithms-in-the-presence-of-diverse-human-feedback
+# Development of learning algorithms in the presence of diverse human feedback
 This is the repository for developing a software framework that aims to integrate multiple forms of feedback and use them in learning algorithms.
+
+In the first part of the thesis we want to project a FeedbackModel that given a pair of state and action or a trajectory is able to return a Feedback
 
 Some notes:
 - the Expert (or FeedbackModel) knows the environment 
