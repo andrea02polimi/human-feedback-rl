@@ -4,6 +4,8 @@ The development of the software framework is done as part of my Master Science t
 
 In the first part of the thesis we want to project a FeedbackModel that given a pair of state and action or a trajectory is able to return a Feedback.
 
+![framework RL + FeedbackModel](img/frameworkRLandFeedbackModel.png)
+
 Some notes:
 - the Expert (or FeedbackModel) knows the environment 
 - there are as many type of Experts as many Feedback are available
