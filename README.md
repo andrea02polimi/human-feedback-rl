@@ -7,6 +7,7 @@ In the first part of the thesis we want to project a FeedbackModel that given a 
 ![framework RL + FeedbackModel](img/frameworkRLandFeedbackModel.png)
 
 Some notes:
+- the Expert is a black box entity which can give Feedbacks
 - the Expert (or FeedbackModel) knows the environment 
 - there are as many type of Experts as many Feedback are available
 - there are two levels of abstractions: Trajectory (list of Steps)/Step (pair of state and action); Absolute/Relative (needs two or more steps or trajectories)
