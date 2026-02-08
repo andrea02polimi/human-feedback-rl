@@ -19,3 +19,10 @@ Some ideas:
 - since the Expert can access the environment it can obtain the reward and give it back to the agent as Feedback.
 - for preference I may consider the sum of rewards and choose the one that has higher reward 
 - correction and demonstration may have a target policy as parameter that deterministically gives the action to be performed given a state (?) but also preference?
+
+Implementation ideas:
+- FeedbackModel is an abstract class which contains the environment and history attributed. It has three abstract methods required_object_count, mode and scope.
+- FeedbackModel is inherited by StepFeedbackModel, TrajectoryFeedbackModel, AbsoluteFeedbackModel and RelativeFeedbackModel 
+- StepFeedbackModel and TrajectoryFeedbackModel implement the method scope. While AbsoluteFeedbackModel and RelativeFeedbackModel implement quired_object_count and mode
+- StepFeedbackModel and TrajectoryFeedbackModel introduce an abstract method evaluate which respectively accept a list of (state, action) pair and a list of trajectory
+- each concrete FeedbackModel checks the scope, mode and implements the evaluate method. 
