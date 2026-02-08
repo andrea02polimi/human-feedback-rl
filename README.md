@@ -26,3 +26,7 @@ Implementation ideas:
 - StepFeedbackModel and TrajectoryFeedbackModel implement the method scope. While AbsoluteFeedbackModel and RelativeFeedbackModel implement quired_object_count and mode
 - StepFeedbackModel and TrajectoryFeedbackModel introduce an abstract method evaluate which respectively accept a list of (state, action) pair and a list of trajectory
 - each concrete FeedbackModel checks the scope, mode and implements the evaluate method. 
+
+Python basic:
+- all subclass that inherits from a class that inherits ABC are considered abstract until all the abstract methods are implemented
+- for constant value (class attribute) you do not need init, if you have a state (instance attribute) you need the init
