@@ -31,6 +31,8 @@ from src.Feedback import (
     DemonstrationFeedback,
     RewardFeedback,
     PreferenceFeedback,
+    HardPreferenceFeedback,
+    SoftPreferenceFeedback,
 )
 
 
@@ -55,7 +57,6 @@ class FeedbackMode(Enum):
 # ==============================================================
 
 ObjectCount = Union[int, Tuple[int, Optional[int]]]
-EvaluationFn = Callable[..., Any]
 
 
 # ==============================================================
@@ -225,11 +226,13 @@ class Expert(ABC):
         # Validate and normalize
         validated = validate_objects(objects, self._config)
 
-        # Record in history (convert steps to single-step trajectories if needed)
+        # Delegate to subclass
+        result = self._evaluate(validated)
+
+        # Record in history (convert steps to single-step trajectories if needed) only successful evaluations
         self._record_history(validated)
 
-        # Delegate to subclass
-        return self._evaluate(validated)
+        return result
 
     def _record_history(self, objects: List[Any]) -> None:
         """Record evaluated objects in history."""
@@ -270,7 +273,7 @@ class StepCorrectionExpert(Expert):
     Given a step (state, action), suggests what the action should have been.
     """
 
-    def __init__(self, env: Any, correction_fn: Callable[[Step, Any, History], Step]):
+    def __init__(self, env: Any, correction_fn: Callable[[Step, Any, History], Any]):
         """
         Args:
             env: The environment
@@ -403,30 +406,57 @@ class TrajectoryRewardExpert(Expert):
 # PREFERENCE EXPERTS
 # ----------------------
 
+def _wrap_preference(result: Any, n_options: int) -> PreferenceFeedback:
+    """
+    Converts the raw output of a preference_fn into a PreferenceFeedback object.
+
+    Accepted return types from preference_fn:
+    - int               -> HardPreferenceFeedback (index of preferred option)
+    - List[float]       -> SoftPreferenceFeedback (probability distribution)
+    - PreferenceFeedback -> returned as-is (caller manages the type)
+
+    This helper centralises the dispatch logic so both StepPreferenceExpert
+    and TrajectoryPreferenceExpert share the same behaviour.
+    """
+    if isinstance(result, PreferenceFeedback):
+        return result
+    elif isinstance(result, list):
+        return SoftPreferenceFeedback(result)
+    else:
+        # Handles int and numpy integer types
+        idx = int(result)
+        if not (0 <= idx < n_options):
+            raise ValueError(
+                f"Preference index {idx} out of range for {n_options} options."
+            )
+        return HardPreferenceFeedback(idx)
+
 class StepPreferenceExpert(Expert):
     """
     Expert that provides preferences over multiple steps.
 
     Requires at least 2 steps to compare.
-    Returns the index of the preferred step.
+
+    The preference_fn can return:
+    - int               -> wrapped in HardPreferenceFeedback (deterministic preference)
+    - List[float]       -> wrapped in SoftPreferenceFeedback (probability distribution,
+                           supports Bradley-Terry, Plackett-Luce, etc.)
+    - PreferenceFeedback -> returned directly (full control by the caller)
     """
 
-    def __init__(self, env: Any, preference_fn: Callable[[Sequence[Step], Any, History], int]):
+    def __init__(self, env: Any, preference_fn: Callable[[Sequence[Step], Any, History], Any]):
         """
         Args:
             env: The environment
-            preference_fn: Function(steps, env, history) -> preferred_index
+            preference_fn: Function(steps, env, history) -> int | List[float] | PreferenceFeedback
         """
         super().__init__(env, STEP_RELATIVE)
         self._preference_fn = preference_fn
 
     def _evaluate(self, objects: List[Step]) -> PreferenceFeedback:
-        preferred_idx = self._preference_fn(objects, self._env, self._history)
-        if not (0 <= preferred_idx < len(objects)):
-            raise ValueError(
-                f"Preference index {preferred_idx} out of range for {len(objects)} objects"
-            )
-        return PreferenceFeedback(preferred_idx)
+        result = self._preference_fn(objects, self._env, self._history)
+        return _wrap_preference(result, n_options=len(objects))
+
 
 
 class TrajectoryPreferenceExpert(Expert):
@@ -434,25 +464,25 @@ class TrajectoryPreferenceExpert(Expert):
     Expert that provides preferences over multiple trajectories.
 
     Requires at least 2 trajectories to compare.
-    Returns the index of the preferred trajectory.
+
+    The preference_fn can return:
+    - int               -> wrapped in HardPreferenceFeedback
+    - List[float]       -> wrapped in SoftPreferenceFeedback
+    - PreferenceFeedback -> returned directly
     """
 
-    def __init__(self, env: Any, preference_fn: Callable[[Sequence[Trajectory], Any, History], int]):
+    def __init__(self, env: Any, preference_fn: Callable[[Sequence[Trajectory], Any, History], Any]):
         """
         Args:
             env: The environment
-            preference_fn: Function(trajectories, env, history) -> preferred_index
+            preference_fn: Function(trajectories, env, history) -> int | List[float] | PreferenceFeedback
         """
         super().__init__(env, TRAJECTORY_RELATIVE)
         self._preference_fn = preference_fn
 
     def _evaluate(self, objects: List[Trajectory]) -> PreferenceFeedback:
-        preferred_idx = self._preference_fn(objects, self._env, self._history)
-        if not (0 <= preferred_idx < len(objects)):
-            raise ValueError(
-                f"Preference index {preferred_idx} out of range for {len(objects)} objects"
-            )
-        return PreferenceFeedback(preferred_idx)
+        result = self._preference_fn(objects, self._env, self._history)
+        return _wrap_preference(result, n_options=len(objects))
 
 
 # ==============================================================

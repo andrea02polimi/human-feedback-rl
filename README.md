@@ -2,12 +2,13 @@
 This is the repository for developing a software framework that aims to integrate multiple forms of feedback and uses them in learning algorithms. 
 The development of the software framework is done as part of my Master Science thesis.
 
-In the first part of the thesis we want to project a FeedbackModel (or Expert) that given a pair of state and action or a trajectory is able to return a Feedback.
+In the first part of the thesis we want to implement a FeedbackModel (or Expert) that given a pair of state and action or a trajectory is able to return a Feedback.
 
 ![framework RL + FeedbackModel](img/frameworkRLandFeedbackModel.png)
 
 Dubbi:
-- Quando si parla di esperto umano come black box, si assume implicitamente l’esistenza di una funzione deterministica (o stocastica) `F: Trajectory/Step → Feedback?`
+- Quando si parla di esperto umano come black box, si assume implicitamente l’esistenza di una funzione deterministica (o stocastica) `F: Trajectory/Step → Feedback`?
+- come vogliamo usare questi feedback?
 
 Some notes:
 - the Expert is a **black box** entity which can give Feedbacks

@@ -7,7 +7,7 @@ Defines the fundamental data structures for the feedback system:
 - History: Collection of trajectories observed by an Expert
 """
 
-from typing import Sequence, List, Any, Iterator
+from typing import List, Any, Iterator
 from dataclasses import dataclass, field
 
 
@@ -32,8 +32,13 @@ class Trajectory:
     """
     steps: List[Step] = field(default_factory=list)
 
-    def __init__(self, steps: Sequence[Step] = ()):
-        self.steps = list(steps)
+    @property
+    def states(self):
+        return [step.state for step in self.steps]
+
+    @property
+    def actions(self):
+        return [step.action for step in self.steps]
 
     def __len__(self) -> int:
         return len(self.steps)
