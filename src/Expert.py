@@ -21,7 +21,7 @@ The Expert base class uses template method pattern for validation.
 
 from abc import ABC, abstractmethod
 from enum import Enum, auto
-from typing import Sequence, Any, Callable, Union, Tuple, Optional, List
+from typing import Sequence, Any, Callable, Union, Tuple, Optional, List, TypeVar, Generic
 from dataclasses import dataclass
 
 from src.Core import Step, Trajectory, History
@@ -35,6 +35,7 @@ from src.Feedback import (
     SoftPreferenceFeedback,
 )
 
+T = TypeVar('T')
 
 # ==============================================================
 # ENUMERATIONS
@@ -155,7 +156,7 @@ def validate_objects(objects: Any, config: ExpertConfig) -> List[Any]:
 # BASE EXPERT CLASS
 # ==============================================================
 
-class Expert(ABC):
+class Expert(ABC, Generic[T]):
     """
     Abstract base class for all Experts (FeedbackModels).
 
@@ -234,7 +235,7 @@ class Expert(ABC):
 
         return result
 
-    def _record_history(self, objects: List[Any]) -> None:
+    def _record_history(self, objects: List[T]) -> None:
         """Record evaluated objects in history."""
         if self._config.scope == FeedbackScope.STEP:
             # Wrap steps in trajectories for history
@@ -245,7 +246,7 @@ class Expert(ABC):
                 self._history.add(traj)
 
     @abstractmethod
-    def _evaluate(self, objects: List[Any]) -> Feedback:
+    def _evaluate(self, objects: List[T]) -> Feedback:
         """
         Perform the actual evaluation. Implemented by subclasses.
 
@@ -266,7 +267,7 @@ class Expert(ABC):
 # CORRECTION EXPERTS
 # ----------------------
 
-class StepCorrectionExpert(Expert):
+class StepCorrectionExpert(Expert[Step]):
     """
     Expert that provides corrected actions for steps.
 
@@ -288,7 +289,7 @@ class StepCorrectionExpert(Expert):
         return CorrectionFeedback(corrected_action)
 
 
-class TrajectoryCorrectionExpert(Expert):
+class TrajectoryCorrectionExpert(Expert[Trajectory]):
     """
     Expert that provides corrected trajectories.
 
@@ -314,7 +315,7 @@ class TrajectoryCorrectionExpert(Expert):
 # DEMONSTRATION EXPERTS
 # ----------------------
 
-class StepDemonstrationExpert(Expert):
+class StepDemonstrationExpert(Expert[Step]):
     """
     Expert that provides demonstration steps.
 
@@ -336,7 +337,7 @@ class StepDemonstrationExpert(Expert):
         return DemonstrationFeedback(demo_step)
 
 
-class TrajectoryDemonstrationExpert(Expert):
+class TrajectoryDemonstrationExpert(Expert[Trajectory]):
     """
     Expert that provides demonstration trajectories.
 
@@ -362,7 +363,7 @@ class TrajectoryDemonstrationExpert(Expert):
 # REWARD EXPERTS
 # ----------------------
 
-class StepRewardExpert(Expert):
+class StepRewardExpert(Expert[Step]):
     """
     Expert that provides scalar rewards for steps.
     """
@@ -382,7 +383,7 @@ class StepRewardExpert(Expert):
         return RewardFeedback(reward)
 
 
-class TrajectoryRewardExpert(Expert):
+class TrajectoryRewardExpert(Expert[Trajectory]):
     """
     Expert that provides scalar rewards for trajectories.
     """
@@ -431,7 +432,7 @@ def _wrap_preference(result: Any, n_options: int) -> PreferenceFeedback:
             )
         return HardPreferenceFeedback(idx)
 
-class StepPreferenceExpert(Expert):
+class StepPreferenceExpert(Expert[Step]):
     """
     Expert that provides preferences over multiple steps.
 
@@ -459,7 +460,7 @@ class StepPreferenceExpert(Expert):
 
 
 
-class TrajectoryPreferenceExpert(Expert):
+class TrajectoryPreferenceExpert(Expert[Trajectory]):
     """
     Expert that provides preferences over multiple trajectories.
 
