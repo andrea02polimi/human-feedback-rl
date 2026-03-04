@@ -1,6 +1,7 @@
 from typing import Any
 
-from src import Step, History, Trajectory, StepRewardExpert, TrajectoryRewardExpert
+from src.interfaces.Expert import StepRewardExpert,  TrajectoryRewardExpert
+from src.Core import Step, Trajectory
 
 
 class ConcreteStepCorrectionExpert(StepRewardExpert):
@@ -8,7 +9,7 @@ class ConcreteStepCorrectionExpert(StepRewardExpert):
         self._policy = policy
         super().__init__(env)
 
-    def _reward_fn(self, step: Step, env: Any, history: History) -> Any:
+    def _reward_fn(self, step: Step) -> Any:
         pass  # implementation...
 
 
@@ -17,5 +18,5 @@ class ConcreteTrajectoryCorrectionExpert(TrajectoryRewardExpert):
         self._policy = policy
         super().__init__(env)
 
-    def _reward_fn(self, step: Trajectory, env: Any, history: History) -> Any:
+    def _reward_fn(self, trajectory: Trajectory) -> Any:
         pass  # implementation...

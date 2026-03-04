@@ -1,6 +1,7 @@
-from typing import Any
+from typing import Any, List
 
-from src import Step, History, Trajectory, StepPreferenceExpert, TrajectoryPreferenceExpert
+from src.interfaces.Expert import StepPreferenceExpert,  TrajectoryPreferenceExpert
+from src.Core import Step, Trajectory
 
 
 class ConcreteStepCorrectionExpert(StepPreferenceExpert):
@@ -8,7 +9,7 @@ class ConcreteStepCorrectionExpert(StepPreferenceExpert):
         self._policy = policy
         super().__init__(env)
 
-    def _preference_fn(self, step: Step, env: Any, history: History) -> Any:
+    def _preference_fn(self, step: List[Step]) -> Any:
         pass  # implementation...
 
 
@@ -17,5 +18,5 @@ class ConcreteTrajectoryCorrectionExpert(TrajectoryPreferenceExpert):
         self._policy = policy
         super().__init__(env)
 
-    def _preference_fn(self, step: Trajectory, env: Any, history: History) -> Any:
+    def _preference_fn(self, trajectories: List[Trajectory]) -> Any:
         pass  # implementation...

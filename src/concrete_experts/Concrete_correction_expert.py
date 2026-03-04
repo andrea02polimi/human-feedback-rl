@@ -1,6 +1,7 @@
 from typing import Any
 
-from src import StepCorrectionExpert, Step, History, TrajectoryCorrectionExpert, Trajectory
+from src.interfaces.Expert import StepCorrectionExpert,  TrajectoryCorrectionExpert
+from src.Core import Step, Trajectory
 
 
 class ConcreteStepCorrectionExpert(StepCorrectionExpert):
@@ -8,7 +9,7 @@ class ConcreteStepCorrectionExpert(StepCorrectionExpert):
         self._policy = policy
         super().__init__(env)
 
-    def _correction_fn(self, step: Step, env: Any, history: History) -> Any:
+    def _correction_fn(self, step: Step) -> Any:
         pass # implementation...
 
 
@@ -17,5 +18,5 @@ class ConcreteTrajectoryCorrectionExpert(TrajectoryCorrectionExpert):
         self._policy = policy
         super().__init__(env)
 
-    def _correction_fn(self, step: Trajectory, env: Any, history: History) -> Any:
+    def _correction_fn(self, trajectory: Trajectory) -> Any:
         pass  # implementation...
