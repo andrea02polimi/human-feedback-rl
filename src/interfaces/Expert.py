@@ -1,7 +1,7 @@
 """
-Abstract Classes for all available Experts
+Abstract base classes for all available Experts.
 
-To build a concrete type of Expert, you should implement that type of Expert abstract class
+Each concrete Expert must implement the corresponding abstract Expert class defined here.
 """
 
 from abc import ABC, abstractmethod
@@ -46,16 +46,13 @@ ObjectCount = Union[int, Tuple[int, Optional[int]]]
 
 
 # ==============================================================
-# CONFIGURATION (Composition over Inheritance)
+# CONFIGURATION
 # ==============================================================
 
 @dataclass(frozen=True)
 class ExpertConfig:
     """
     Configuration for an Expert, encapsulating scope and mode.
-
-    Using composition instead of multiple inheritance avoids
-    diamond inheritance issues and makes the design more flexible.
     """
     scope: FeedbackScope
     mode: FeedbackMode
@@ -91,23 +88,22 @@ class ValidationError(Exception):
 
 def validate_objects(objects: Any, config: ExpertConfig) -> List[Any]:
     """
-    Validates and normalizes input objects based on the Expert's configuration.
+    Validates input objects based on the Expert's configuration.
 
     Args:
         objects: Single object or sequence of objects to validate
         config: Expert configuration specifying requirements
 
     Returns:
-        Normalized list of objects
+        list of objects
 
     Raises:
         ValidationError: If object count doesn't match requirements
     """
-    # Normalize to list
     if not isinstance(objects, (list, tuple)):
-        objects = [objects]
+        objects = [objects] # list with one single element
     else:
-        objects = list(objects)
+        objects = list(objects) # here to convert a tuple to a list
 
     n = len(objects)
     req = config.required_object_count
@@ -143,16 +139,15 @@ def validate_objects(objects: Any, config: ExpertConfig) -> List[Any]:
 
 class Expert(ABC, Generic[T]):
     """
-    Abstract base class for all Experts (FeedbackModels).
+    Abstract base class for all Experts.
 
-    An Expert is a black-box entity that:
+    An Expert is an entity that:
     - Knows the environment
-    - Evaluates steps or trajectories
-    - Provides feedback based on its internal criteria
+    - Evaluates steps or trajectories providing a Feedback
     - Maintains a history of what it has evaluated
 
     Template Method Pattern:
-    - `query()` is the public interface that handles validation
+    - `query()` is the public interface
     - `_evaluate()` is the protected method subclasses implement
     """
 
@@ -243,11 +238,6 @@ class Expert(ABC, Generic[T]):
         """
         pass
 
-
-# ==============================================================
-# CONCRETE EXPERT IMPLEMENTATIONS
-# ==============================================================
-
 # ----------------------
 # CORRECTION EXPERTS
 # ----------------------
@@ -267,12 +257,35 @@ class StepCorrectionExpert(ABC, Expert[Step]):
         super().__init__(env, STEP_ABSOLUTE)
 
     @abstractmethod
-    def _correction_fn(self, step: Step, env: Any, history: History) -> Any:
+    def _correction_fn(self, step: Step) -> Any:
+        """
+            Compute the corrected action for a given step.
+
+            Implemented by subclasses to define the expert policy.
+
+            Args:
+                step: The step to correct (state, action).
+
+            Returns:
+                The action that should have been taken in the given state.
+        """
         pass
 
     def _evaluate(self, objects: List[Step]) -> CorrectionFeedback:
+        """
+            Evaluate a step and return the corrected action.
+
+            This method extracts the step, applies the correction function,
+            and wraps the result in a CorrectionFeedback object.
+
+            Args:
+                objects: List containing the validated step to evaluate.
+
+            Returns:
+                CorrectionFeedback containing the corrected action.
+        """
         step = objects[0]
-        corrected_action = self._correction_fn(step, self._env, self._history)
+        corrected_action = self._correction_fn(step)
         return CorrectionFeedback(corrected_action)
 
 
@@ -291,12 +304,36 @@ class TrajectoryCorrectionExpert(ABC, Expert[Trajectory]):
         super().__init__(env, TRAJECTORY_ABSOLUTE)
 
     @abstractmethod
-    def _correction_fn(self, step: Trajectory, env: Any, history: History) -> Any:
+    def _correction_fn(self, traj: Trajectory) -> Any:
+        """
+            Compute the corrected trajectory.
+
+            Implemented by subclasses to define how a trajectory should be
+            corrected according to the Expert's knowledge of the environment.
+
+            Args:
+                traj: The trajectory to correct.
+
+            Returns:
+                The trajectory that should have been produced instead.
+        """
         pass
 
     def _evaluate(self, objects: List[Trajectory]) -> CorrectionFeedback:
+        """
+           Evaluate a trajectory and return its corrected version.
+
+           This method extracts the trajectory, applies the correction
+           function, and wraps the result in a CorrectionFeedback object.
+
+           Args:
+               objects: List containing the validated trajectory to evaluate.
+
+           Returns:
+               CorrectionFeedback containing the corrected trajectory.
+        """
         traj = objects[0]
-        corrected_traj = self._correction_fn(traj, self._env, self._history)
+        corrected_traj = self._correction_fn(traj)
         return CorrectionFeedback(corrected_traj)
 
 
@@ -319,12 +356,36 @@ class StepDemonstrationExpert(ABC, Expert[Step]):
         super().__init__(env, STEP_ABSOLUTE)
 
     @abstractmethod
-    def _demo_fn(self, step: Step, env: Any, history: History) -> Any:
+    def _demo_fn(self, step: Step) -> Any:
+        """
+            Generate a demonstration trajectory.
+
+            Implemented by subclasses to provide an example of correct behavior
+            in the environment.
+
+            Args:
+                step: The step to generate a demonstration for.
+
+            Returns:
+                A trajectory demonstrating the desired behavior.
+        """
         pass
 
     def _evaluate(self, objects: List[Step]) -> DemonstrationFeedback:
+        """
+            Produce a demonstration trajectory.
+
+            This method calls the demonstration function and wraps the result
+            in a DemonstrationFeedback object.
+
+            Args:
+                objects: Validated input objects (typically unused).
+
+            Returns:
+                DemonstrationFeedback containing the generated trajectory.
+        """
         step = objects[0]
-        demo_step = self._demo_fn(step, self._env, self._history)
+        demo_step = self._demo_fn(step)
         return DemonstrationFeedback(demo_step)
 
 
@@ -343,12 +404,12 @@ class TrajectoryDemonstrationExpert(ABC, Expert[Trajectory]):
         super().__init__(env, TRAJECTORY_ABSOLUTE)
 
     @abstractmethod
-    def _demo_fn(self, step: Trajectory, env: Any, history: History) -> Any:
+    def _demo_fn(self, step: Trajectory) -> Any:
         pass
 
     def _evaluate(self, objects: List[Trajectory]) -> DemonstrationFeedback:
         traj = objects[0]
-        demo_traj = self._demo_fn(traj, self._env, self._history)
+        demo_traj = self._demo_fn(traj)
         return DemonstrationFeedback(demo_traj)
 
 
@@ -369,12 +430,12 @@ class StepRewardExpert(ABC, Expert[Step]):
         super().__init__(env, STEP_ABSOLUTE)
 
     @abstractmethod
-    def _reward_fn(self, step: Step, env: Any, history: History) -> Any:
+    def _reward_fn(self, step: Step) -> Any:
         pass
 
     def _evaluate(self, objects: List[Step]) -> RewardFeedback:
         step = objects[0]
-        reward = self._reward_fn(step, self._env, self._history)
+        reward = self._reward_fn(step)
         return RewardFeedback(reward)
 
 
@@ -391,12 +452,36 @@ class TrajectoryRewardExpert(ABC, Expert[Trajectory]):
         super().__init__(env, TRAJECTORY_ABSOLUTE)
 
     @abstractmethod
-    def _reward_fn(self, step: Trajectory, env: Any, history: History) -> Any:
+    def _reward_fn(self, step: Trajectory) -> Any:
+        """
+            Compute the reward for a given object.
+
+            Implemented by subclasses to assign a scalar reward based on the
+            Expert's knowledge of the environment.
+
+            Args:
+                step: Step or trajectory to evaluate.
+
+            Returns:
+                A scalar reward value.
+        """
         pass
 
     def _evaluate(self, objects: List[Trajectory]) -> RewardFeedback:
+        """
+            Evaluate an object and return its reward.
+
+            This method extracts the object, applies the reward function,
+            and wraps the result in a RewardFeedback object.
+
+            Args:
+                objects: List containing the validated object to evaluate.
+
+            Returns:
+                RewardFeedback containing the computed reward.
+        """
         traj = objects[0]
-        reward = self._reward_fn(traj, self._env, self._history)
+        reward = self._reward_fn(traj)
         return RewardFeedback(reward)
 
 
@@ -450,11 +535,35 @@ class StepPreferenceExpert(ABC, Expert[Step]):
         super().__init__(env, STEP_RELATIVE)
 
     @abstractmethod
-    def _preference_fn(self, step: List[Step], env: Any, history: History) -> Any:
+    def _preference_fn(self, steps: List[Step]) -> Any:
+        """
+            Determine the preferred step among multiple candidates.
+
+            Implemented by subclasses to compare steps and select the one
+            considered better according to the Expert.
+
+            Args:
+                steps: Steps to compare.
+
+            Returns:
+                Index of the preferred step in the input list.
+        """
         pass
 
     def _evaluate(self, objects: List[Step]) -> PreferenceFeedback:
-        result = self._preference_fn(objects, self._env, self._history)
+        """
+            Evaluate multiple steps and return the preferred one.
+
+            This method delegates the comparison to the preference function
+            and wraps the result in a PreferenceFeedback object.
+
+            Args:
+                objects: List of validated steps to compare.
+
+            Returns:
+                PreferenceFeedback containing the index of the preferred object.
+        """
+        result = self._preference_fn(objects)
         return _wrap_preference(result, n_options=len(objects))
 
 
@@ -479,9 +588,33 @@ class TrajectoryPreferenceExpert(ABC, Expert[Trajectory]):
         super().__init__(env, TRAJECTORY_RELATIVE)
 
     @abstractmethod
-    def _preference_fn(self, step: List[Trajectory], env: Any, history: History) -> Any:
+    def _preference_fn(self, trajectories: List[Trajectory]) -> Any:
+        """
+            Determine the preferred trajectory among multiple candidates.
+
+            Implemented by subclasses to compare trajectories and select the one
+            considered better according to the Expert.
+
+            Args:
+                trajectories: Trajectories to compare.
+
+            Returns:
+                Index of the preferred trajectory in the input list.
+        """
         pass
 
     def _evaluate(self, objects: List[Trajectory]) -> PreferenceFeedback:
-        result = self._preference_fn(objects, self._env, self._history)
+        """
+            Evaluate multiple steps and return the preferred one.
+
+            This method delegates the comparison to the preference function
+            and wraps the result in a PreferenceFeedback object.
+
+            Args:
+                objects: List of validated steps to compare.
+
+            Returns:
+                PreferenceFeedback containing the index of the preferred object.
+        """
+        result = self._preference_fn(objects)
         return _wrap_preference(result, n_options=len(objects))
