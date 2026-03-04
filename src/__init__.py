@@ -50,10 +50,10 @@ from src.Feedback import (
 )
 
 # Enumerations
-from src.Expert import FeedbackScope, FeedbackMode
+from src.interfaces.Expert import FeedbackScope, FeedbackMode
 
 # Configuration
-from src.Expert import (
+from src.interfaces.Expert import (
     ExpertConfig,
     STEP_ABSOLUTE,
     STEP_RELATIVE,
@@ -62,10 +62,10 @@ from src.Expert import (
 )
 
 # Base class
-from src.Expert import Expert, ValidationError
+from src.interfaces.Expert import Expert, ValidationError
 
 # Concrete Expert implementations
-from src.Expert import (
+from src.interfaces.Expert import (
     # Correction
     StepCorrectionExpert,
     TrajectoryCorrectionExpert,
@@ -81,7 +81,7 @@ from src.Expert import (
 )
 
 # Factory
-from src.Expert import ExpertFactory
+from src.interfaces.Expert import ExpertFactory
 
 __all__ = [
     # Core

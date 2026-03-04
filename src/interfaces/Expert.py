@@ -1,32 +1,17 @@
 """
-Expert (FeedbackModel) Module
+Abstract Classes for all available Experts
 
-Design Principles:
------------------
-1. Expert is a black-box entity that provides Feedback
-2. Expert knows the environment
-3. Each Expert type corresponds to a Feedback type
-4. Two orthogonal dimensions:
-   - Scope: Step (state-action pair) vs Trajectory (sequence of steps)
-   - Mode: Absolute (single object) vs Relative (comparison of 2+ objects)
-5. Each Expert maintains its own history of evaluations
-6. Preference-based Experts require at least 2 objects to compare
-7. Passive agent model: Expert is queried, doesn't proactively provide feedback
-
-Architecture:
-------------
-We use composition over multiple inheritance to avoid diamond problems.
-The Expert base class uses template method pattern for validation.
+To build a concrete type of Expert, you should implement that type of Expert abstract class
 """
 
 from abc import ABC, abstractmethod
 from enum import Enum, auto
-from typing import Sequence, Any, Callable, Union, Tuple, Optional, List, TypeVar, Generic
+from typing import Any, Union, Tuple, Optional, List, TypeVar, Generic
 from dataclasses import dataclass
 
 from src.Core import Step, Trajectory, History
+from src.interfaces.Feedback import Feedback
 from src.Feedback import (
-    Feedback,
     CorrectionFeedback,
     DemonstrationFeedback,
     RewardFeedback,
@@ -267,21 +252,23 @@ class Expert(ABC, Generic[T]):
 # CORRECTION EXPERTS
 # ----------------------
 
-class StepCorrectionExpert(Expert[Step]):
+class StepCorrectionExpert(ABC, Expert[Step]):
     """
     Expert that provides corrected actions for steps.
 
     Given a step (state, action), suggests what the action should have been.
     """
 
-    def __init__(self, env: Any, correction_fn: Callable[[Step, Any, History], Any]):
+    def __init__(self, env: Any):
         """
         Args:
             env: The environment
-            correction_fn: Function(step, env, history) -> corrected_action
         """
         super().__init__(env, STEP_ABSOLUTE)
-        self._correction_fn = correction_fn
+
+    @abstractmethod
+    def _correction_fn(self, step: Step, env: Any, history: History) -> Any:
+        pass
 
     def _evaluate(self, objects: List[Step]) -> CorrectionFeedback:
         step = objects[0]
@@ -289,21 +276,23 @@ class StepCorrectionExpert(Expert[Step]):
         return CorrectionFeedback(corrected_action)
 
 
-class TrajectoryCorrectionExpert(Expert[Trajectory]):
+class TrajectoryCorrectionExpert(ABC, Expert[Trajectory]):
     """
     Expert that provides corrected trajectories.
 
     Given a trajectory, suggests what the trajectory should have been.
     """
 
-    def __init__(self, env: Any, correction_fn: Callable[[Trajectory, Any, History], Trajectory]):
+    def __init__(self, env: Any):
         """
         Args:
             env: The environment
-            correction_fn: Function(trajectory, env, history) -> corrected_trajectory
         """
         super().__init__(env, TRAJECTORY_ABSOLUTE)
-        self._correction_fn = correction_fn
+
+    @abstractmethod
+    def _correction_fn(self, step: Trajectory, env: Any, history: History) -> Any:
+        pass
 
     def _evaluate(self, objects: List[Trajectory]) -> CorrectionFeedback:
         traj = objects[0]
@@ -315,21 +304,23 @@ class TrajectoryCorrectionExpert(Expert[Trajectory]):
 # DEMONSTRATION EXPERTS
 # ----------------------
 
-class StepDemonstrationExpert(Expert[Step]):
+class StepDemonstrationExpert(ABC, Expert[Step]):
     """
     Expert that provides demonstration steps.
 
     Given a step, shows the ideal step for that situation.
     """
 
-    def __init__(self, env: Any, demo_fn: Callable[[Step, Any, History], Step]):
+    def __init__(self, env: Any):
         """
         Args:
             env: The environment
-            demo_fn: Function(step, env, history) -> demonstrated_step
         """
         super().__init__(env, STEP_ABSOLUTE)
-        self._demo_fn = demo_fn
+
+    @abstractmethod
+    def _demo_fn(self, step: Step, env: Any, history: History) -> Any:
+        pass
 
     def _evaluate(self, objects: List[Step]) -> DemonstrationFeedback:
         step = objects[0]
@@ -337,21 +328,23 @@ class StepDemonstrationExpert(Expert[Step]):
         return DemonstrationFeedback(demo_step)
 
 
-class TrajectoryDemonstrationExpert(Expert[Trajectory]):
+class TrajectoryDemonstrationExpert(ABC, Expert[Trajectory]):
     """
     Expert that provides demonstration trajectories.
 
     Given a trajectory, shows the ideal trajectory.
     """
 
-    def __init__(self, env: Any, demo_fn: Callable[[Trajectory, Any, History], Trajectory]):
+    def __init__(self, env: Any):
         """
         Args:
             env: The environment
-            demo_fn: Function(trajectory, env, history) -> demonstrated_trajectory
         """
         super().__init__(env, TRAJECTORY_ABSOLUTE)
-        self._demo_fn = demo_fn
+
+    @abstractmethod
+    def _demo_fn(self, step: Trajectory, env: Any, history: History) -> Any:
+        pass
 
     def _evaluate(self, objects: List[Trajectory]) -> DemonstrationFeedback:
         traj = objects[0]
@@ -363,19 +356,21 @@ class TrajectoryDemonstrationExpert(Expert[Trajectory]):
 # REWARD EXPERTS
 # ----------------------
 
-class StepRewardExpert(Expert[Step]):
+class StepRewardExpert(ABC, Expert[Step]):
     """
     Expert that provides scalar rewards for steps.
     """
 
-    def __init__(self, env: Any, reward_fn: Callable[[Step, Any, History], float]):
+    def __init__(self, env: Any):
         """
         Args:
             env: The environment
-            reward_fn: Function(step, env, history) -> reward (float)
         """
         super().__init__(env, STEP_ABSOLUTE)
-        self._reward_fn = reward_fn
+
+    @abstractmethod
+    def _reward_fn(self, step: Step, env: Any, history: History) -> Any:
+        pass
 
     def _evaluate(self, objects: List[Step]) -> RewardFeedback:
         step = objects[0]
@@ -383,19 +378,21 @@ class StepRewardExpert(Expert[Step]):
         return RewardFeedback(reward)
 
 
-class TrajectoryRewardExpert(Expert[Trajectory]):
+class TrajectoryRewardExpert(ABC, Expert[Trajectory]):
     """
     Expert that provides scalar rewards for trajectories.
     """
 
-    def __init__(self, env: Any, reward_fn: Callable[[Trajectory, Any, History], float]):
+    def __init__(self, env: Any):
         """
         Args:
             env: The environment
-            reward_fn: Function(trajectory, env, history) -> reward (float)
         """
         super().__init__(env, TRAJECTORY_ABSOLUTE)
-        self._reward_fn = reward_fn
+
+    @abstractmethod
+    def _reward_fn(self, step: Trajectory, env: Any, history: History) -> Any:
+        pass
 
     def _evaluate(self, objects: List[Trajectory]) -> RewardFeedback:
         traj = objects[0]
@@ -432,7 +429,7 @@ def _wrap_preference(result: Any, n_options: int) -> PreferenceFeedback:
             )
         return HardPreferenceFeedback(idx)
 
-class StepPreferenceExpert(Expert[Step]):
+class StepPreferenceExpert(ABC, Expert[Step]):
     """
     Expert that provides preferences over multiple steps.
 
@@ -445,14 +442,16 @@ class StepPreferenceExpert(Expert[Step]):
     - PreferenceFeedback -> returned directly (full control by the caller)
     """
 
-    def __init__(self, env: Any, preference_fn: Callable[[Sequence[Step], Any, History], Any]):
+    def __init__(self, env: Any):
         """
         Args:
             env: The environment
-            preference_fn: Function(steps, env, history) -> int | List[float] | PreferenceFeedback
         """
         super().__init__(env, STEP_RELATIVE)
-        self._preference_fn = preference_fn
+
+    @abstractmethod
+    def _preference_fn(self, step: List[Step], env: Any, history: History) -> Any:
+        pass
 
     def _evaluate(self, objects: List[Step]) -> PreferenceFeedback:
         result = self._preference_fn(objects, self._env, self._history)
@@ -460,7 +459,7 @@ class StepPreferenceExpert(Expert[Step]):
 
 
 
-class TrajectoryPreferenceExpert(Expert[Trajectory]):
+class TrajectoryPreferenceExpert(ABC, Expert[Trajectory]):
     """
     Expert that provides preferences over multiple trajectories.
 
@@ -472,72 +471,17 @@ class TrajectoryPreferenceExpert(Expert[Trajectory]):
     - PreferenceFeedback -> returned directly
     """
 
-    def __init__(self, env: Any, preference_fn: Callable[[Sequence[Trajectory], Any, History], Any]):
+    def __init__(self, env: Any):
         """
         Args:
             env: The environment
-            preference_fn: Function(trajectories, env, history) -> int | List[float] | PreferenceFeedback
         """
         super().__init__(env, TRAJECTORY_RELATIVE)
-        self._preference_fn = preference_fn
+
+    @abstractmethod
+    def _preference_fn(self, step: List[Trajectory], env: Any, history: History) -> Any:
+        pass
 
     def _evaluate(self, objects: List[Trajectory]) -> PreferenceFeedback:
         result = self._preference_fn(objects, self._env, self._history)
         return _wrap_preference(result, n_options=len(objects))
-
-
-# ==============================================================
-# FACTORY (Optional convenience)
-# ==============================================================
-
-class ExpertFactory:
-    """
-    Factory for creating Experts.
-
-    Provides a cleaner API for creating experts without knowing
-    the exact class names.
-    """
-
-    @staticmethod
-    def create_correction_expert(
-            env: Any,
-            scope: FeedbackScope,
-            correction_fn: Callable
-    ) -> Expert:
-        if scope == FeedbackScope.STEP:
-            return StepCorrectionExpert(env, correction_fn)
-        else:
-            return TrajectoryCorrectionExpert(env, correction_fn)
-
-    @staticmethod
-    def create_demonstration_expert(
-            env: Any,
-            scope: FeedbackScope,
-            demo_fn: Callable
-    ) -> Expert:
-        if scope == FeedbackScope.STEP:
-            return StepDemonstrationExpert(env, demo_fn)
-        else:
-            return TrajectoryDemonstrationExpert(env, demo_fn)
-
-    @staticmethod
-    def create_reward_expert(
-            env: Any,
-            scope: FeedbackScope,
-            reward_fn: Callable
-    ) -> Expert:
-        if scope == FeedbackScope.STEP:
-            return StepRewardExpert(env, reward_fn)
-        else:
-            return TrajectoryRewardExpert(env, reward_fn)
-
-    @staticmethod
-    def create_preference_expert(
-            env: Any,
-            scope: FeedbackScope,
-            preference_fn: Callable
-    ) -> Expert:
-        if scope == FeedbackScope.STEP:
-            return StepPreferenceExpert(env, preference_fn)
-        else:
-            return TrajectoryPreferenceExpert(env, preference_fn)
