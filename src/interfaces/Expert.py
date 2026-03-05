@@ -142,7 +142,6 @@ class Expert(ABC, Generic[T]):
     Abstract base class for all Experts.
 
     An Expert is an entity that:
-    - Knows the environment
     - Evaluates steps or trajectories providing a Feedback
     - Maintains a history of what it has evaluated
 
@@ -151,22 +150,15 @@ class Expert(ABC, Generic[T]):
     - `_evaluate()` is the protected method subclasses implement
     """
 
-    def __init__(self, env: Any, config: ExpertConfig):
+    def __init__(self, config: ExpertConfig):
         """
         Initialize the Expert.
 
         Args:
-            env: The environment the Expert has knowledge of
             config: Configuration specifying scope and mode
         """
-        self._env = env
         self._config = config
         self._history = History()
-
-    @property
-    def env(self) -> Any:
-        """The environment this Expert knows."""
-        return self._env
 
     @property
     def scope(self) -> FeedbackScope:
@@ -249,12 +241,8 @@ class StepCorrectionExpert(ABC, Expert[Step]):
     Given a step (state, action), suggests what the action should have been.
     """
 
-    def __init__(self, env: Any):
-        """
-        Args:
-            env: The environment
-        """
-        super().__init__(env, STEP_ABSOLUTE)
+    def __init__(self):
+        super().__init__(STEP_ABSOLUTE)
 
     @abstractmethod
     def _correction_fn(self, step: Step) -> Any:
@@ -296,12 +284,8 @@ class TrajectoryCorrectionExpert(ABC, Expert[Trajectory]):
     Given a trajectory, suggests what the trajectory should have been.
     """
 
-    def __init__(self, env: Any):
-        """
-        Args:
-            env: The environment
-        """
-        super().__init__(env, TRAJECTORY_ABSOLUTE)
+    def __init__(self):
+        super().__init__(TRAJECTORY_ABSOLUTE)
 
     @abstractmethod
     def _correction_fn(self, traj: Trajectory) -> Any:
@@ -348,12 +332,8 @@ class StepDemonstrationExpert(ABC, Expert[Step]):
     Given a step, shows the ideal step for that situation.
     """
 
-    def __init__(self, env: Any):
-        """
-        Args:
-            env: The environment
-        """
-        super().__init__(env, STEP_ABSOLUTE)
+    def __init__(self):
+        super().__init__(STEP_ABSOLUTE)
 
     @abstractmethod
     def _demo_fn(self, step: Step) -> Any:
@@ -396,12 +376,8 @@ class TrajectoryDemonstrationExpert(ABC, Expert[Trajectory]):
     Given a trajectory, shows the ideal trajectory.
     """
 
-    def __init__(self, env: Any):
-        """
-        Args:
-            env: The environment
-        """
-        super().__init__(env, TRAJECTORY_ABSOLUTE)
+    def __init__(self):
+        super().__init__(TRAJECTORY_ABSOLUTE)
 
     @abstractmethod
     def _demo_fn(self, step: Trajectory) -> Any:
@@ -422,12 +398,8 @@ class StepRewardExpert(ABC, Expert[Step]):
     Expert that provides scalar rewards for steps.
     """
 
-    def __init__(self, env: Any):
-        """
-        Args:
-            env: The environment
-        """
-        super().__init__(env, STEP_ABSOLUTE)
+    def __init__(self):
+        super().__init__(STEP_ABSOLUTE)
 
     @abstractmethod
     def _reward_fn(self, step: Step) -> Any:
@@ -444,12 +416,8 @@ class TrajectoryRewardExpert(ABC, Expert[Trajectory]):
     Expert that provides scalar rewards for trajectories.
     """
 
-    def __init__(self, env: Any):
-        """
-        Args:
-            env: The environment
-        """
-        super().__init__(env, TRAJECTORY_ABSOLUTE)
+    def __init__(self):
+        super().__init__(TRAJECTORY_ABSOLUTE)
 
     @abstractmethod
     def _reward_fn(self, step: Trajectory) -> Any:
@@ -527,12 +495,8 @@ class StepPreferenceExpert(ABC, Expert[Step]):
     - PreferenceFeedback -> returned directly (full control by the caller)
     """
 
-    def __init__(self, env: Any):
-        """
-        Args:
-            env: The environment
-        """
-        super().__init__(env, STEP_RELATIVE)
+    def __init__(self):
+        super().__init__(STEP_RELATIVE)
 
     @abstractmethod
     def _preference_fn(self, steps: List[Step]) -> Any:
@@ -580,12 +544,8 @@ class TrajectoryPreferenceExpert(ABC, Expert[Trajectory]):
     - PreferenceFeedback -> returned directly
     """
 
-    def __init__(self, env: Any):
-        """
-        Args:
-            env: The environment
-        """
-        super().__init__(env, TRAJECTORY_RELATIVE)
+    def __init__(self):
+        super().__init__(TRAJECTORY_RELATIVE)
 
     @abstractmethod
     def _preference_fn(self, trajectories: List[Trajectory]) -> Any:

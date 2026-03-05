@@ -5,9 +5,9 @@ from src.Core import Step, Trajectory
 
 
 class ConcreteStepDemonstrationExpert(StepDemonstrationExpert):
-    def __init__(self, env: Any, policy: Any):
+    def __init__(self, policy: Any):
         self._policy = policy
-        super().__init__(env)
+        super().__init__()
 
     def _demo_fn(self, step: Step) -> Any:
         action, _ = self._policy.predict(step.state, deterministic=True)
@@ -15,9 +15,9 @@ class ConcreteStepDemonstrationExpert(StepDemonstrationExpert):
 
 
 class ConcreteTrajectoryDemonstrationExpert(TrajectoryDemonstrationExpert):
-    def __init__(self, env: Any, policy: Any):
+    def __init__(self, policy: Any):
         self._policy = policy
-        super().__init__(env)
+        super().__init__()
 
     def _demo_fn(self, trajectory: Trajectory) -> Any:
         state = self.env.reset()
