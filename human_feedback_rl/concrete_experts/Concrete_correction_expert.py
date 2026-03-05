@@ -1,7 +1,7 @@
 from typing import Any
 
-from src.interfaces.Expert import StepCorrectionExpert,  TrajectoryCorrectionExpert
-from src.Core import Step, Trajectory
+from human_feedback_rl.interfaces.Expert import StepCorrectionExpert,  TrajectoryCorrectionExpert
+from human_feedback_rl.Core import Step, Trajectory
 
 
 class ConcreteStepCorrectionExpert(StepCorrectionExpert):

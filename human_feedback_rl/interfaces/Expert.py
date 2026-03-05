@@ -9,9 +9,9 @@ from enum import Enum, auto
 from typing import Any, Union, Tuple, Optional, List, TypeVar, Generic
 from dataclasses import dataclass
 
-from src.Core import Step, Trajectory, History
-from src.interfaces.Feedback import Feedback
-from src.Feedback import (
+from human_feedback_rl.Core import Step, Trajectory, History
+from human_feedback_rl.interfaces.Feedback import Feedback
+from human_feedback_rl.Feedback import (
     CorrectionFeedback,
     DemonstrationFeedback,
     RewardFeedback,

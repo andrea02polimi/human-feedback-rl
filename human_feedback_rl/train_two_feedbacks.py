@@ -5,8 +5,8 @@ import torch.optim as optim
 
 from stable_baselines3 import DQN
 
-from src.Core import Step
-from src.concrete_experts.Concrete_demonstration_expert import (
+from human_feedback_rl.Core import Step
+from human_feedback_rl.concrete_experts.Concrete_demonstration_expert import (
     ConcreteStepDemonstrationExpert,
 )
 

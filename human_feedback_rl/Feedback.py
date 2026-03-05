@@ -7,7 +7,7 @@ Feedback is the output of an Expert's evaluation.
 
 from typing import Generic, List, TypeVar
 
-from src.interfaces.Feedback import Feedback
+from human_feedback_rl.interfaces.Feedback import Feedback
 
 T = TypeVar("T")
 
