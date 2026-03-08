@@ -1,22 +1,40 @@
-from typing import Any, List
+from typing import Any, List, Sequence
 
+import torch
+
+from human_feedback_rl.Feedback import SoftPreferenceFeedback
 from human_feedback_rl.interfaces.Expert import StepPreferenceExpert,  TrajectoryPreferenceExpert
 from human_feedback_rl.Core import Step, Trajectory
 
 
-class ConcreteStepCorrectionExpert(StepPreferenceExpert):
+class ConcreteStepPreferenceExpert(StepPreferenceExpert):
     def __init__(self, env: Any, policy: Any):
         self._policy = policy
-        super().__init__(env)
+        self._env = env
+        super().__init__()
 
-    def _preference_fn(self, step: List[Step]) -> Any:
-        pass  # implementation...
+    def _preference_fn(self, steps: Sequence[Step]):
+        s = torch.tensor(steps[0].state, dtype=torch.float32).unsqueeze(0)
+
+        with torch.no_grad():
+            q_values = self._policy.q_net(s)[0]
+
+        a0 = steps[0].action
+        a1 = steps[1].action
+
+        score0 = q_values[a0].item()
+        score1 = q_values[a1].item()
+
+        probs = torch.softmax(torch.tensor([score0, score1]), dim=0)
+
+        return SoftPreferenceFeedback(probs.tolist())
 
 
-class ConcreteTrajectoryCorrectionExpert(TrajectoryPreferenceExpert):
+class ConcreteTrajectoryPreferenceExpert(TrajectoryPreferenceExpert):
     def __init__(self, env: Any, policy: Any):
+        self._env = env
         self._policy = policy
-        super().__init__(env)
+        super().__init__()
 
     def _preference_fn(self, trajectories: List[Trajectory]) -> Any:
         pass  # implementation...

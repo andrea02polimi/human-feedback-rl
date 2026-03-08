@@ -6,7 +6,7 @@ Each concrete Expert must implement the corresponding abstract Expert class defi
 
 from abc import ABC, abstractmethod
 from enum import Enum, auto
-from typing import Any, Union, Tuple, Optional, List, TypeVar, Generic
+from typing import Any, Union, Tuple, Optional, List, TypeVar, Generic, Sequence
 from dataclasses import dataclass
 
 from human_feedback_rl.Core import Step, Trajectory, History
@@ -234,7 +234,7 @@ class Expert(ABC, Generic[T]):
 # CORRECTION EXPERTS
 # ----------------------
 
-class StepCorrectionExpert(ABC, Expert[Step]):
+class StepCorrectionExpert(Expert[Step], ABC):
     """
     Expert that provides corrected actions for steps.
 
@@ -259,7 +259,7 @@ class StepCorrectionExpert(ABC, Expert[Step]):
         """
         pass
 
-    def _evaluate(self, objects: List[Step]) -> CorrectionFeedback:
+    def _evaluate(self, objects: Sequence[Step]) -> CorrectionFeedback:
         """
             Evaluate a step and return the corrected action.
 
@@ -277,7 +277,7 @@ class StepCorrectionExpert(ABC, Expert[Step]):
         return CorrectionFeedback(corrected_action)
 
 
-class TrajectoryCorrectionExpert(ABC, Expert[Trajectory]):
+class TrajectoryCorrectionExpert(Expert[Trajectory], ABC):
     """
     Expert that provides corrected trajectories.
 
@@ -303,7 +303,7 @@ class TrajectoryCorrectionExpert(ABC, Expert[Trajectory]):
         """
         pass
 
-    def _evaluate(self, objects: List[Trajectory]) -> CorrectionFeedback:
+    def _evaluate(self, objects: Sequence[Trajectory]) -> CorrectionFeedback:
         """
            Evaluate a trajectory and return its corrected version.
 
@@ -325,7 +325,7 @@ class TrajectoryCorrectionExpert(ABC, Expert[Trajectory]):
 # DEMONSTRATION EXPERTS
 # ----------------------
 
-class StepDemonstrationExpert(ABC, Expert[Step]):
+class StepDemonstrationExpert(Expert[Step], ABC):
     """
     Expert that provides demonstration steps.
 
@@ -351,7 +351,7 @@ class StepDemonstrationExpert(ABC, Expert[Step]):
         """
         pass
 
-    def _evaluate(self, objects: List[Step]) -> DemonstrationFeedback:
+    def _evaluate(self, objects: Sequence[Step]) -> DemonstrationFeedback:
         """
             Produce a demonstration trajectory.
 
@@ -369,7 +369,7 @@ class StepDemonstrationExpert(ABC, Expert[Step]):
         return DemonstrationFeedback(demo_step)
 
 
-class TrajectoryDemonstrationExpert(ABC, Expert[Trajectory]):
+class TrajectoryDemonstrationExpert(Expert[Trajectory], ABC):
     """
     Expert that provides demonstration trajectories.
 
@@ -383,7 +383,7 @@ class TrajectoryDemonstrationExpert(ABC, Expert[Trajectory]):
     def _demo_fn(self, step: Trajectory) -> Any:
         pass
 
-    def _evaluate(self, objects: List[Trajectory]) -> DemonstrationFeedback:
+    def _evaluate(self, objects: Sequence[Trajectory]) -> DemonstrationFeedback:
         traj = objects[0]
         demo_traj = self._demo_fn(traj)
         return DemonstrationFeedback(demo_traj)
@@ -393,7 +393,7 @@ class TrajectoryDemonstrationExpert(ABC, Expert[Trajectory]):
 # REWARD EXPERTS
 # ----------------------
 
-class StepRewardExpert(ABC, Expert[Step]):
+class StepRewardExpert(Expert[Step], ABC):
     """
     Expert that provides scalar rewards for steps.
     """
@@ -405,13 +405,13 @@ class StepRewardExpert(ABC, Expert[Step]):
     def _reward_fn(self, step: Step) -> Any:
         pass
 
-    def _evaluate(self, objects: List[Step]) -> RewardFeedback:
+    def _evaluate(self, objects: Sequence[Step]) -> RewardFeedback:
         step = objects[0]
         reward = self._reward_fn(step)
         return RewardFeedback(reward)
 
 
-class TrajectoryRewardExpert(ABC, Expert[Trajectory]):
+class TrajectoryRewardExpert(Expert[Trajectory], ABC):
     """
     Expert that provides scalar rewards for trajectories.
     """
@@ -435,7 +435,7 @@ class TrajectoryRewardExpert(ABC, Expert[Trajectory]):
         """
         pass
 
-    def _evaluate(self, objects: List[Trajectory]) -> RewardFeedback:
+    def _evaluate(self, objects: Sequence[Trajectory]) -> RewardFeedback:
         """
             Evaluate an object and return its reward.
 
@@ -482,7 +482,7 @@ def _wrap_preference(result: Any, n_options: int) -> PreferenceFeedback:
             )
         return HardPreferenceFeedback(idx)
 
-class StepPreferenceExpert(ABC, Expert[Step]):
+class StepPreferenceExpert(Expert[Step], ABC):
     """
     Expert that provides preferences over multiple steps.
 
@@ -532,7 +532,7 @@ class StepPreferenceExpert(ABC, Expert[Step]):
 
 
 
-class TrajectoryPreferenceExpert(ABC, Expert[Trajectory]):
+class TrajectoryPreferenceExpert(Expert[Trajectory], ABC):
     """
     Expert that provides preferences over multiple trajectories.
 
