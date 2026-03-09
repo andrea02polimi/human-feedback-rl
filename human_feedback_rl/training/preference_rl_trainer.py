@@ -33,6 +33,50 @@ class PreferenceRLTrainer(BaseTrainer):
 
         self.logger = Logger(log_dir)
 
+    def pretrain_with_demonstrations(self, episodes=30):
+
+        print("=== PRETRAINING WITH DEMONSTRATIONS ===")
+
+        for ep in range(episodes):
+
+            obs, _ = self.env.reset()
+            obs = obs[0] if hasattr(obs, "shape") and len(obs.shape) > 1 else obs
+
+            done = False
+
+            while not done:
+                state = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
+
+                with torch.no_grad():
+                    expert_action, _ = self.expert_model.predict(obs, deterministic=True)
+
+                if isinstance(expert_action, (list, tuple)):
+                    expert_action = expert_action[0]
+
+                if hasattr(expert_action, "shape"):
+                    expert_action = expert_action.item()
+
+                target = torch.tensor([expert_action], dtype=torch.long)
+
+                logits = self.policy(state)
+
+                loss = torch.nn.functional.cross_entropy(
+                    logits,
+                    target
+                )
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+                obs, _, terminated, truncated, _ = self.env.step(expert_action)
+
+                obs = obs[0] if hasattr(obs, "shape") and len(obs.shape) > 1 else obs
+
+                done = terminated or truncated
+
+        print("pretraining completed")
+
     def train(self,
               iterations=1000,
               query_interval=20):
@@ -53,7 +97,7 @@ class PreferenceRLTrainer(BaseTrainer):
             episode_entropy = stats["entropy"]
             episode_kl = stats["kl"]
 
-            self.buffer.add_trajectory(traj.steps)
+            self.buffer.add_trajectory(traj)
 
             # query preference
             if it % query_interval == 0 and len(self.buffer.states) > 50:
@@ -63,24 +107,30 @@ class PreferenceRLTrainer(BaseTrainer):
 
                 pref = feedback.preferred_index
 
-                loss = self.reward_model.update_reward_model(
-                    seg1,
-                    seg2,
-                    pref,
-                    self.reward_optimizer
-                )
+                for _ in range(3):
+                    loss = self.reward_model.update_reward_model(
+                        seg1,
+                        seg2,
+                        pref,
+                        self.reward_optimizer
+                    )
 
-                print("reward model loss", loss)
+                    print("reward model loss", loss)
 
             # relabel rewards
-            if it > 20:
+            if it % 20 == 0 and it > 50:
                 self.buffer.relabel_rewards(self.reward_model)
 
             # update policy
-            policy_loss = self.policy.update_policy(
-                self.buffer,
-                self.optimizer
-            )
+            policy_loss = 0
+
+            for _ in range(5):
+                policy_loss += self.policy.update_policy(
+                    self.buffer,
+                    self.optimizer
+                )
+
+            policy_loss /= 5
 
             avg_match = episode_match / length
             avg_entropy = episode_entropy / length
@@ -111,9 +161,20 @@ class PreferenceRLTrainer(BaseTrainer):
             f"min reward: {min(global_rewards):.2f}"
         )
 
+        save_dir = os.path.join(self.base_log_dir, "models")
+        os.makedirs(save_dir, exist_ok=True)
+
+        model_path = os.path.join(save_dir, "agent_policy.pt")
+
+        torch.save(self.policy.state_dict(), model_path)
+
+        print("model saved to:", model_path)
+
     def rollout(self):
 
         obs, _ = self.env.reset()
+
+        obs = obs[0] if len(obs.shape) > 1 else obs
 
         done = False
 
@@ -135,6 +196,8 @@ class PreferenceRLTrainer(BaseTrainer):
             action = dist.sample().item()
 
             obs, reward, terminated, truncated, _ = self.env.step(action)
+
+            obs = obs[0] if hasattr(obs, "shape") and len(obs.shape) > 1 else obs
 
             steps.append(Step(state, action))
 
