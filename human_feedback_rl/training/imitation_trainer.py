@@ -3,9 +3,9 @@ import os
 import torch
 import torch.nn.functional as f
 
-from human_feedback_rl.concrete_experts.Concrete_demonstration_expert import ConcreteStepDemonstrationExpert
+from human_feedback_rl.concrete_experts.concrete_demonstration_expert import ConcreteStepDemonstrationExpert
 from human_feedback_rl.training.base_trainer import BaseTrainer
-from human_feedback_rl.Core import Step
+from human_feedback_rl.core import Step
 from human_feedback_rl.utils.logging import Logger
 
 

@@ -2,7 +2,7 @@ from sumo_rl_ego.infra.builders.env_factory import build_env
 from sumo_rl_ego.infra.builders.model_factory import load_model
 from sumo_rl_ego.infra.loaders.config_loader import load_config_from_model
 
-from human_feedback_rl.AgentPolicyNetwork import AgentPolicyNetwork
+from human_feedback_rl.agent_policy_network import AgentPolicyNetwork
 
 
 def build_env_and_expert(model_dir, seed=0):

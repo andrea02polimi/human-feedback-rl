@@ -1,12 +1,12 @@
 import os
 
-from human_feedback_rl.Feedback import PreferenceFeedback
-from human_feedback_rl.concrete_experts.Concrete_demonstration_expert import ConcreteStepDemonstrationExpert
-from human_feedback_rl.concrete_experts.Concrete_preference_expert import ConcreteStepPreferenceExpert
+from human_feedback_rl.feedback import PreferenceFeedback
+from human_feedback_rl.concrete_experts.concrete_demonstration_expert import ConcreteStepDemonstrationExpert
+from human_feedback_rl.concrete_experts.concrete_preference_expert import ConcreteStepPreferenceExpert
 from human_feedback_rl.training.base_trainer import BaseTrainer
 from human_feedback_rl.utils.logging import Logger
 from human_feedback_rl.utils.losses import imitation_loss, preference_loss
-from human_feedback_rl.Core import Step
+from human_feedback_rl.core import Step
 from human_feedback_rl.utils.sampling import sample_topk_actions
 
 

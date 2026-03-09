@@ -2,9 +2,9 @@ from typing import Any, List, Sequence
 
 import torch
 
-from human_feedback_rl.Feedback import PreferenceFeedback
-from human_feedback_rl.interfaces.Expert import StepPreferenceExpert,  TrajectoryPreferenceExpert
-from human_feedback_rl.Core import Step, Trajectory
+from human_feedback_rl.feedback import PreferenceFeedback
+from human_feedback_rl.interfaces.expert import StepPreferenceExpert,  TrajectoryPreferenceExpert
+from human_feedback_rl.core import Step, Trajectory
 
 
 class ConcreteStepPreferenceExpert(StepPreferenceExpert):
