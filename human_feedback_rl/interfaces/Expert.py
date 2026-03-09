@@ -15,9 +15,7 @@ from human_feedback_rl.Feedback import (
     CorrectionFeedback,
     DemonstrationFeedback,
     RewardFeedback,
-    PreferenceFeedback,
-    HardPreferenceFeedback,
-    SoftPreferenceFeedback,
+    PreferenceFeedback
 )
 
 T = TypeVar('T')
@@ -457,42 +455,11 @@ class TrajectoryRewardExpert(Expert[Trajectory], ABC):
 # PREFERENCE EXPERTS
 # ----------------------
 
-def _wrap_preference(result: Any, n_options: int) -> PreferenceFeedback:
-    """
-    Converts the raw output of a preference_fn into a PreferenceFeedback object.
-
-    Accepted return types from preference_fn:
-    - int               -> HardPreferenceFeedback (index of preferred option)
-    - List[float]       -> SoftPreferenceFeedback (probability distribution)
-    - PreferenceFeedback -> returned as-is (caller manages the type)
-
-    This helper centralises the dispatch logic so both StepPreferenceExpert
-    and TrajectoryPreferenceExpert share the same behaviour.
-    """
-    if isinstance(result, PreferenceFeedback):
-        return result
-    elif isinstance(result, list):
-        return SoftPreferenceFeedback(result)
-    else:
-        # Handles int and numpy integer types
-        idx = int(result)
-        if not (0 <= idx < n_options):
-            raise ValueError(
-                f"Preference index {idx} out of range for {n_options} options."
-            )
-        return HardPreferenceFeedback(idx)
-
 class StepPreferenceExpert(Expert[Step], ABC):
     """
     Expert that provides preferences over multiple steps.
 
     Requires at least 2 steps to compare.
-
-    The preference_fn can return:
-    - int               -> wrapped in HardPreferenceFeedback (deterministic preference)
-    - List[float]       -> wrapped in SoftPreferenceFeedback (probability distribution,
-                           supports Bradley-Terry, Plackett-Luce, etc.)
-    - PreferenceFeedback -> returned directly (full control by the caller)
     """
 
     def __init__(self):
@@ -505,12 +472,6 @@ class StepPreferenceExpert(Expert[Step], ABC):
 
             Implemented by subclasses to compare steps and select the one
             considered better according to the Expert.
-
-            Args:
-                steps: Steps to compare.
-
-            Returns:
-                Index of the preferred step in the input list.
         """
         pass
 
@@ -520,15 +481,14 @@ class StepPreferenceExpert(Expert[Step], ABC):
 
             This method delegates the comparison to the preference function
             and wraps the result in a PreferenceFeedback object.
-
-            Args:
-                objects: List of validated steps to compare.
-
-            Returns:
-                PreferenceFeedback containing the index of the preferred object.
         """
         result = self._preference_fn(objects)
-        return _wrap_preference(result, n_options=len(objects))
+        if isinstance(result, list):
+            return PreferenceFeedback(result)
+        else:
+            raise ValueError(
+                f"result needs to be a list of probabilities."
+            )
 
 
 
@@ -537,11 +497,6 @@ class TrajectoryPreferenceExpert(Expert[Trajectory], ABC):
     Expert that provides preferences over multiple trajectories.
 
     Requires at least 2 trajectories to compare.
-
-    The preference_fn can return:
-    - int               -> wrapped in HardPreferenceFeedback
-    - List[float]       -> wrapped in SoftPreferenceFeedback
-    - PreferenceFeedback -> returned directly
     """
 
     def __init__(self):
@@ -554,12 +509,6 @@ class TrajectoryPreferenceExpert(Expert[Trajectory], ABC):
 
             Implemented by subclasses to compare trajectories and select the one
             considered better according to the Expert.
-
-            Args:
-                trajectories: Trajectories to compare.
-
-            Returns:
-                Index of the preferred trajectory in the input list.
         """
         pass
 
@@ -569,12 +518,11 @@ class TrajectoryPreferenceExpert(Expert[Trajectory], ABC):
 
             This method delegates the comparison to the preference function
             and wraps the result in a PreferenceFeedback object.
-
-            Args:
-                objects: List of validated steps to compare.
-
-            Returns:
-                PreferenceFeedback containing the index of the preferred object.
         """
         result = self._preference_fn(objects)
-        return _wrap_preference(result, n_options=len(objects))
+        if isinstance(result, list):
+            return PreferenceFeedback(result)
+        else:
+            raise ValueError(
+                f"result needs to be a list of probabilities."
+            )
