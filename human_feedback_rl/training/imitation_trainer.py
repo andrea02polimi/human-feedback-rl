@@ -1,7 +1,7 @@
 import os
 
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as f
 
 from human_feedback_rl.concrete_experts.Concrete_demonstration_expert import ConcreteStepDemonstrationExpert
 from human_feedback_rl.training.base_trainer import BaseTrainer
@@ -42,34 +42,7 @@ class ImitationTrainer(BaseTrainer):
 
             while not done:
 
-                state = obs[0] if len(obs.shape) > 1 else obs
-
-                state_tensor = torch.tensor(
-                    state, dtype=torch.float32
-                ).unsqueeze(0)
-
-                logits = self.policy(state_tensor)
-
-                # -------- METRICS --------
-
-                with torch.no_grad():
-                    expert_logits = self.expert_model.q_net(state_tensor)
-
-                agent_probs = torch.softmax(logits, dim=1)
-                expert_probs = torch.softmax(expert_logits, dim=1)
-
-                agent_action = torch.argmax(agent_probs, dim=1)
-                expert_action = torch.argmax(expert_probs, dim=1)
-
-                action_match = (agent_action == expert_action).float().item()
-
-                entropy = -(agent_probs * torch.log(agent_probs + 1e-8)).sum(dim=1).item()
-
-                kl = F.kl_div(
-                    torch.log_softmax(logits, dim=1),
-                    expert_probs,
-                    reduction="batchmean"
-                ).item()
+                logits, action_match, entropy, kl, state = self.forward_and_metrics(obs)
 
                 # --------------------------
 
@@ -79,26 +52,18 @@ class ImitationTrainer(BaseTrainer):
 
                 expert_action = int(feedback.value)
 
-                loss = F.cross_entropy(
+                loss = f.cross_entropy(
                     logits,
                     torch.tensor([expert_action])
                 )
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-
-                action = self.select_action(logits)
-
-                obs, reward, terminated, truncated, _ = self.env.step(action)
-
-                done = terminated or truncated
-
-                # kl = self.compute_kl_on_expert_state(step)
+                obs, reward, done, action = self.optimize_step(
+                    logits,
+                    loss
+                )
 
                 reward_sum += reward
                 loss_sum += loss.item()
-                # kl_sum += kl.item()
                 length += 1
 
                 episode_match += action_match
@@ -114,7 +79,6 @@ class ImitationTrainer(BaseTrainer):
                 reward_sum,
                 length,
                 loss_sum / length,
-                # kl_sum / length
                 avg_kl,
                 avg_match,
                 avg_entropy,
