@@ -4,19 +4,21 @@ from human_feedback_rl.interfaces.Expert import StepRewardExpert,  TrajectoryRew
 from human_feedback_rl.Core import Step, Trajectory
 
 
-class ConcreteStepCorrectionExpert(StepRewardExpert):
+class ConcreteStepRewardExpert(StepRewardExpert):
     def __init__(self, env: Any, policy: Any):
         self._policy = policy
-        super().__init__(env)
+        self.env = env
+        super().__init__()
 
     def _reward_fn(self, step: Step) -> Any:
         pass  # implementation...
 
 
-class ConcreteTrajectoryCorrectionExpert(TrajectoryRewardExpert):
+class ConcreteTrajectoryRewardExpert(TrajectoryRewardExpert):
     def __init__(self, env: Any, policy: Any):
         self._policy = policy
-        super().__init__(env)
+        self.env = env
+        super().__init__()
 
     def _reward_fn(self, trajectory: Trajectory) -> Any:
         pass  # implementation...
