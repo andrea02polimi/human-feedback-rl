@@ -32,6 +32,8 @@ class ImitationTrainer(BaseTrainer):
         self.dataset_states = []
         self.dataset_actions = []
 
+        self.dataset_capacity = 50000
+
     # ------------------------------------------------
 
     def train(self, episodes):
@@ -68,10 +70,28 @@ class ImitationTrainer(BaseTrainer):
                 self.dataset_states.append(state.squeeze(0))
                 self.dataset_actions.append(expert_action)
 
-                # supervised update verso l'azione dell'esperto
+                if len(self.dataset_states) > self.dataset_capacity:
+                    self.dataset_states.pop(0)
+                    self.dataset_actions.pop(0)
+
+                batch_size = min(64, len(self.dataset_states))
+
+                recent = min(10000, len(self.dataset_states))
+
+                idx = torch.randint(
+                    len(self.dataset_states) - recent,
+                    len(self.dataset_states),
+                    (batch_size,)
+                )
+
+                states = torch.stack([self.dataset_states[i] for i in idx])
+                actions = torch.tensor([self.dataset_actions[i] for i in idx])
+
+                logits = self.policy(states)
+
                 loss = f.cross_entropy(
                     logits,
-                    torch.tensor([expert_action], dtype=torch.long),
+                    actions,
                     label_smoothing=0.05
                 )
 
