@@ -4,7 +4,7 @@ import torch
 from human_feedback_rl.concrete_experts.concrete_preference_expert import ConcreteTrajectoryPreferenceExpert
 from human_feedback_rl.core import Step, Trajectory
 from human_feedback_rl.feedback import PreferenceFeedback
-from human_feedback_rl.replay_buffer import ReplayBuffer
+from human_feedback_rl.preference_dataset import ReplayBuffer
 from human_feedback_rl.training.base_trainer import BaseTrainer
 from human_feedback_rl.utils.logging import Logger
 
