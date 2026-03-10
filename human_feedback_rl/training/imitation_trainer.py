@@ -62,7 +62,10 @@ class ImitationTrainer(BaseTrainer):
                 logits, action_match, entropy, kl, state = self.forward_and_metrics(obs)
 
                 # azione dell'agente (sample dalla policy)
-                agent_action = self.select_action(logits)
+                if episode < 300:
+                    agent_action = torch.multinomial(torch.softmax(logits, dim=1), 1).item()
+                else:
+                    agent_action = torch.argmax(logits, dim=1).item()
 
                 # query all'esperto sullo stato corrente
                 step = Step(state, None)
