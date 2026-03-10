@@ -10,7 +10,8 @@ from human_feedback_rl.utils.env_setup import build_env_and_expert
 ROOT = Path(__file__).resolve().parents[2]
 
 EXPERT_MODEL = ROOT / "2026-03-09_17-15-41_train_highway_fast_DQN/model"
-AGENT_MODEL = ROOT / "models/policy_final.pt"
+# AGENT_MODEL = ROOT / "models/policy_final.pt"
+AGENT_MODEL = ROOT / "scripts/models/policy_rlhf.pt"
 
 EPISODES = 20
 
