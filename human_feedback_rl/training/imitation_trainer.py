@@ -28,6 +28,10 @@ class ImitationTrainer(BaseTrainer):
         self.global_entropy = []
         self.global_kl = []
 
+        # dataset aggregation
+        self.dataset_states = []
+        self.dataset_actions = []
+
     # ------------------------------------------------
 
     def train(self, episodes):
@@ -45,31 +49,43 @@ class ImitationTrainer(BaseTrainer):
             episode_entropy = 0
             episode_kl = 0
 
+            # β schedule: all'inizio usa più spesso l'esperto, poi l'agente
+            beta = 0.9 ** episode
+            beta = max(beta, 0.2)
+
             while not done:
+
                 logits, action_match, entropy, kl, state = self.forward_and_metrics(obs)
 
+                # azione dell'agente (sample dalla policy)
                 agent_action = self.select_action(logits)
 
-                step = Step(state, agent_action)
-
+                # query all'esperto sullo stato corrente
+                step = Step(state, None)
                 feedback = self.demo_expert.query(step)
-
                 expert_action = int(feedback.value)
 
+                self.dataset_states.append(state.squeeze(0))
+                self.dataset_actions.append(expert_action)
+
+                # supervised update verso l'azione dell'esperto
                 loss = f.cross_entropy(
                     logits,
                     torch.tensor([expert_action], dtype=torch.long),
                     label_smoothing=0.05
                 )
 
-                # update policy
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
 
-                # environment step (expert action)
-                obs, reward, terminated, truncated, _ = self.env.step(expert_action)
+                # DAgger: mix tra azione esperto e agente
+                if torch.rand(1).item() < beta:
+                    action_to_env = expert_action
+                else:
+                    action_to_env = agent_action
 
+                obs, reward, terminated, truncated, _ = self.env.step(action_to_env)
                 done = terminated or truncated
 
                 reward_sum += reward
