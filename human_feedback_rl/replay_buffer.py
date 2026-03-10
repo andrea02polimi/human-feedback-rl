@@ -1,7 +1,5 @@
 import random
-
 import torch
-
 from human_feedback_rl.core import Trajectory, Step
 
 
@@ -15,14 +13,13 @@ class ReplayBuffer:
 
         self.capacity = capacity
 
-
     def add_trajectory(self, trajectory):
 
         for step in trajectory.steps:
 
             self.states.append(step.state)
             self.actions.append(step.action)
-            self.rewards.append(0)
+            self.rewards.append(0.0)
 
         if len(self.states) > self.capacity:
 
@@ -30,38 +27,47 @@ class ReplayBuffer:
             self.actions = self.actions[-self.capacity:]
             self.rewards = self.rewards[-self.capacity:]
 
-    def relabel_rewards(self, reward_model):
+    def relabel_rewards(self, reward_model, window=20000):
 
-        new_rewards = []
+        start = max(0, len(self.states) - window)
 
-        for s, a in zip(self.states, self.actions):
+        for i in range(start, len(self.states)):
+
+            s = self.states[i]
+            a = self.actions[i]
+
             with torch.no_grad():
-                r = torch.tanh(
-                    reward_model(s, a)
-                ).item()
+                r = reward_model(s, a)
 
-            new_rewards.append(r)
+            r = torch.clamp(r, -5, 5)
+            r = torch.tanh(r)
 
-        r = torch.tensor(new_rewards)
+            # exponential smoothing
+            self.rewards[i] = 0.9 * self.rewards[i] + 0.1 * r.item()
 
-        r = (r - r.mean()) / (r.std() + 1e-8)
+    def sample_batch(self, batch_size=256):
 
-        self.rewards = r.tolist()
+        n = len(self.states)
+
+        if n == 0:
+            raise RuntimeError("Replay buffer empty")
+
+        batch_size = min(batch_size, n)
+
+        idx = random.sample(range(n), batch_size)
+
+        states = [self.states[i] for i in idx]
+        actions = [self.actions[i] for i in idx]
+        rewards = [self.rewards[i] for i in idx]
+
+        return states, actions, rewards
 
     def sample_segments(self, segment_length=25):
 
         max_start = len(self.states) - segment_length - 1
 
-        if max_start <= 0:
-            raise ValueError("Not enough data in replay buffer")
-
         idx1 = random.randint(0, max_start)
         idx2 = random.randint(0, max_start)
-
-        for _ in range(10):
-            if abs(idx1 - idx2) >= segment_length:
-                break
-            idx2 = random.randint(0, max_start)
 
         traj1 = Trajectory([
             Step(self.states[i], self.actions[i])
@@ -74,14 +80,3 @@ class ReplayBuffer:
         ])
 
         return traj1, traj2
-
-    def sample_batch(self, batch_size=256):
-
-        batch_size = min(batch_size, len(self.states))
-        idx = random.sample(range(len(self.states)), batch_size)
-
-        states = [self.states[i] for i in idx]
-        actions = [self.actions[i] for i in idx]
-        rewards = [self.rewards[i] for i in idx]
-
-        return states, actions, rewards
