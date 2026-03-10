@@ -41,7 +41,8 @@ class BaseTrainer:
 
     @staticmethod
     def select_action(logits):
-        return torch.argmax(logits, dim=1).item()
+        probs = torch.softmax(logits, dim=1)
+        return torch.multinomial(probs, 1).item()
 
 
     def optimize_step(self, logits, loss):

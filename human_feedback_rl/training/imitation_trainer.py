@@ -48,7 +48,9 @@ class ImitationTrainer(BaseTrainer):
             while not done:
                 logits, action_match, entropy, kl, state = self.forward_and_metrics(obs)
 
-                step = Step(state, 0)
+                agent_action = self.select_action(logits)
+
+                step = Step(state, agent_action)
 
                 feedback = self.demo_expert.query(step)
 
@@ -56,13 +58,19 @@ class ImitationTrainer(BaseTrainer):
 
                 loss = f.cross_entropy(
                     logits,
-                    torch.tensor([expert_action])
+                    torch.tensor([expert_action], dtype=torch.long),
+                    label_smoothing=0.05
                 )
 
-                obs, reward, done, action = self.optimize_step(
-                    logits,
-                    loss
-                )
+                # update policy
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+                # environment step (expert action)
+                obs, reward, terminated, truncated, _ = self.env.step(expert_action)
+
+                done = terminated or truncated
 
                 reward_sum += reward
                 loss_sum += loss.item()
