@@ -1,89 +1,46 @@
-import os
-
-from human_feedback_rl.feedback import PreferenceFeedback
-from human_feedback_rl.concrete_experts.concrete_preference_expert import ConcreteStepPreferenceExpert
-from human_feedback_rl.training.base_trainer import BaseTrainer
-from human_feedback_rl.utils.logging import Logger
-from human_feedback_rl.utils.losses import preference_loss
-from human_feedback_rl.utils.sampling import sample_two_actions
-from human_feedback_rl.core import Step
+import torch
 
 
-class PreferenceTrainer(BaseTrainer):
+class PreferenceTrainer:
 
-    def __init__(self, env, policy, expert_model, optimizer):
+    def __init__(self, reward_model, optimizer, dataset):
 
-        super().__init__(env, policy, expert_model, optimizer)
+        self.reward_model = reward_model
+        self.optimizer = optimizer
+        self.dataset = dataset
 
-        self.pref_expert = ConcreteStepPreferenceExpert(env, expert_model)
+    def train(self, epochs=2000, batch_size=64):
 
-        log_dir = os.path.join(self.base_log_dir, "preference")
+        for epoch in range(epochs):
 
-        self.logger = Logger(log_dir)
+            batch = self.dataset.sample(batch_size)
 
-    # ------------------------------------------------
+            loss_total = 0
 
-    def train(self, episodes):
+            for step1, step2, probs in batch:
 
-        for episode in range(1, episodes + 1):
+                s1 = step1.state.unsqueeze(0)
+                a1 = torch.tensor([step1.action])
 
-            obs, _ = self.env.reset()
+                s2 = step2.state.unsqueeze(0)
+                a2 = torch.tensor([step2.action])
 
-            done = False
+                r1 = self.reward_model(s1, a1)
+                r2 = self.reward_model(s2, a2)
 
-            reward_sum = 0
-            loss_sum = 0
-            # kl_sum = 0
-            length = 0
+                logits = torch.cat([r1, r2], dim=1)
 
-            episode_match = 0
-            episode_entropy = 0
-            episode_kl = 0
+                target = torch.tensor(probs.value).unsqueeze(0)
 
-            while not done:
+                loss = -(target * torch.log_softmax(logits, dim=1)).sum()
 
-                logits, action_match, entropy, kl, state = self.forward_and_metrics(obs)
+                loss_total += loss
 
-                # --------------------------
+            loss_total /= batch_size
 
-                a_i, a_j = sample_two_actions(logits)
+            self.optimizer.zero_grad()
+            loss_total.backward()
+            self.optimizer.step()
 
-                step_i = Step(state, a_i)
-                step_j = Step(state, a_j)
-
-                feedback: PreferenceFeedback = self.pref_expert.query([step_i, step_j])
-
-                loss = preference_loss(
-                    logits,
-                    a_i,
-                    a_j,
-                    feedback.preferred_index
-                )
-
-                obs, reward, done, action = self.optimize_step(
-                    logits,
-                    loss
-                )
-
-                reward_sum += reward
-                loss_sum += loss.item()
-                length += 1
-
-                episode_match += action_match
-                episode_entropy += entropy
-                episode_kl += kl
-
-            avg_match = episode_match / length
-            avg_entropy = episode_entropy / length
-            avg_kl = episode_kl / length
-
-            self.logger.log_episode(
-                episode,
-                reward_sum,
-                length,
-                loss_sum / length,
-                # kl_sum / length,
-                avg_kl,
-                avg_match,
-                avg_entropy,
-            )
+            if epoch % 100 == 0:
+                print(f"Preference epoch {epoch} | loss {loss_total.item():.4f}")

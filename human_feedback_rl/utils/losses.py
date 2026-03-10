@@ -9,14 +9,14 @@ def imitation_loss(logits, expert_action):
     return F.cross_entropy(logits, target)
 
 
-def preference_loss(logits, a_i, a_j, preferred, margin=0.2):
+def preference_loss(r1, r2, probs):
 
-    q_i = logits[0, a_i]
-    q_j = logits[0, a_j]
+    logits = torch.stack([r1, r2], dim=1)
 
-    if preferred == 0:
-        diff = q_i - q_j
-    else:
-        diff = q_j - q_i
+    target = torch.tensor(probs)
 
-    return torch.relu(margin - diff)
+    pred = torch.log_softmax(logits, dim=1)
+
+    loss = -(target * pred).sum(dim=1).mean()
+
+    return loss
