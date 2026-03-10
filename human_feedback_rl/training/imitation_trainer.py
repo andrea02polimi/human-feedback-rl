@@ -34,6 +34,8 @@ class ImitationTrainer(BaseTrainer):
 
         self.dataset_capacity = 50000
 
+        self.train_step_counter = 0
+
     # ------------------------------------------------
 
     def train(self, episodes):
@@ -52,8 +54,8 @@ class ImitationTrainer(BaseTrainer):
             episode_kl = 0
 
             # β schedule: all'inizio usa più spesso l'esperto, poi l'agente
-            beta = 0.9 ** episode
-            beta = max(beta, 0.2)
+            beta = 0.97 ** episode
+            beta = max(beta, 0.5)
 
             while not done:
 
@@ -69,6 +71,8 @@ class ImitationTrainer(BaseTrainer):
 
                 self.dataset_states.append(state.squeeze(0))
                 self.dataset_actions.append(expert_action)
+
+                self.train_step_counter += 1
 
                 if len(self.dataset_states) > self.dataset_capacity:
                     self.dataset_states.pop(0)
@@ -87,17 +91,32 @@ class ImitationTrainer(BaseTrainer):
                 states = torch.stack([self.dataset_states[i] for i in idx])
                 actions = torch.tensor([self.dataset_actions[i] for i in idx])
 
-                logits = self.policy(states)
+                if self.train_step_counter % 8 == 0:
 
-                loss = f.cross_entropy(
-                    logits,
-                    actions,
-                    label_smoothing=0.05
-                )
+                    logits = self.policy(states)
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+                    ce_loss = f.cross_entropy(
+                        logits,
+                        actions,
+                        label_smoothing=0.05
+                    )
+
+                    with torch.no_grad():
+                        expert_logits = self.expert_model.q_net(states)
+
+                    kl = torch.nn.functional.kl_div(
+                        torch.log_softmax(logits, dim=1),
+                        torch.softmax(expert_logits, dim=1),
+                        reduction="batchmean"
+                    )
+
+                    loss = ce_loss + 0.1 * kl
+
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+                else:
+                    loss = torch.tensor(0.0)
 
                 # DAgger: mix tra azione esperto e agente
                 if torch.rand(1).item() < beta:
