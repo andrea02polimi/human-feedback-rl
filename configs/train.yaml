@@ -1,0 +1,24 @@
+env:
+  expert_model: "2026-03-09_17-15-41_train_highway_fast_DQN/model.zip"
+
+pipeline:
+  imitation: true
+  preferences: true
+  rlhf: true
+
+imitation:
+  episodes: 2000
+  policy_lr: 5e-5
+
+preferences:
+  collect_episodes: 200
+  epochs: 2000
+  lr: 1e-4
+
+rl:
+  episodes: 1000
+
+hydra:
+  run:
+    dir: experiments/runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  output_subdir: config
