@@ -1,7 +1,7 @@
 from sumo_rl_ego.infra.builders.env_factory import build_env
 from sumo_rl_ego.infra.builders.model_factory import load_model
 
-from human_feedback_rl.agent_policy_network import AgentPolicyNetwork
+from human_feedback_rl.agents.policy_network import AgentPolicyNetwork
 
 from pathlib import Path
 from omegaconf import OmegaConf, DictConfig
