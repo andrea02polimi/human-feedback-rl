@@ -18,23 +18,25 @@ preferences:
   oracle: "expert"    # "expert" → DQN synthetic | "human" → terminal R/L/E/S
   initial_prefs: 200  # preferences to collect before pretraining the rp
   segment_len: 25     # steps per trajectory segment (paper default)
-  max_segs: 1000      # max segment pairs queued in PrefInterface
+  max_segs: 1000      # max segments kept in pref-worker buffer
   db_train_maxlen: 3000
   db_val_maxlen: 750
-  seg_pipe_maxsize: 10  # max segment pairs buffered between processes
+  seg_pipe_maxsize: 100  # individual segments buffered between processes
 
-# ── Policy (REINFORCE) ────────────────────────────────────────────────────────
+# ── Policy (A2C — algorithm used in the paper) ────────────────────────────────
 policy:
-  lr: 5e-5
+  lr: 7e-4            # A2C typical learning rate
   gamma: 0.99
+  nsteps: 20          # rollout length per A2C update
+  ent_coef: 0.01      # entropy bonus coefficient
+  vf_coef: 0.5        # value loss coefficient
+  max_grad_norm: 0.5  # gradient clipping
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 training:
-  rp_iterations: 100          # how many times the main process retrains the rp
-  rp_train_interval_sec: 30   # seconds to wait between rp retraining steps
-  policy_episodes_per_step: 5 # episodes per policy-worker iteration
-  policy_save_interval: 10    # save policy checkpoint every N policy steps
-  rp_reload_interval: 5       # reload rp checkpoint every N policy steps
+  rp_iterations: 500          # total RP retrainings (no sleep between them)
+  policy_save_interval: 100   # save policy checkpoint every N A2C steps
+  rp_reload_interval: 10      # reload rp checkpoint every N A2C steps
 
 hydra:
   run:

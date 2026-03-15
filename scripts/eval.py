@@ -51,7 +51,7 @@ def _run_episodes(env, policy, episodes: int):
         while not (terminated or truncated):
             state = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
-                logits = policy(state)
+                logits, _ = policy(state)   # actor-critic: unpack (logits, values)
             action = torch.argmax(logits, dim=1).item()
             obs, _, terminated, truncated, _ = env.step(action)
 
