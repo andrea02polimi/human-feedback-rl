@@ -1,15 +1,23 @@
-env:
-  expert_model: "2026-03-09_17-15-41_train_highway_fast_DQN/model"
+seed: 0
+
+run:
+
+  # directory del run da valutare
+  dir: experiments/runs/2026-03-11/11-47-18
 
 agent:
-  model: "scripts/models/policy_rlhf.pt"
+
+  # modello da valutare (relativo alla root del progetto)
+  model: models/policy_bc.pt
 
 eval:
-  mode: side_by_side   # agent | expert | side_by_side
-  episodes: 20
-  deterministic: true
+
+  episodes: 100
+
 
 hydra:
+
   run:
     dir: experiments/eval/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
   output_subdir: config

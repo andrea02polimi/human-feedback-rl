@@ -1,29 +1,40 @@
-from sumo_rl_ego.infra.builders.env_factory import build_env
-from sumo_rl_ego.infra.builders.model_factory import load_model
-
-from human_feedback_rl.agents.policy_network import AgentPolicyNetwork
 
 from pathlib import Path
-from omegaconf import OmegaConf, DictConfig
+from omegaconf import OmegaConf
 
-def load_config() -> DictConfig:
-    root = Path(__file__).resolve().parents[3]
-    cfg_env: DictConfig = OmegaConf.load(root / "sumo-rl-ego/experiments/configs/env/highway_fast.yaml")
-    cfg_algo: DictConfig = OmegaConf.load(root / "sumo-rl-ego/experiments/configs/rl/dqn.yaml")
-    return cfg_env, cfg_algo
+from human_feedback_rl.agents.policy_network import AgentPolicyNetwork
+import sumo_rl_ego as sre
 
 
-def build_env_and_expert(model_dir, seed=0):
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
-    cfg_env, cfg_algo = load_config()
 
-    env = build_env(cfg_env, seed=seed)
+def build_env_and_expert(cfg):
+    """
+    Build SUMO environment and load expert model using the same
+    logic used in the main training script.
+    """
 
-    expert_model = load_model(
+    model_path = PROJECT_ROOT / cfg.env.expert_model / "model.zip"
+
+    run_cfg_path = PROJECT_ROOT / cfg.env.expert_model / ".hydra" / "config.yaml"
+
+    run_cfg = OmegaConf.load(run_cfg_path)
+
+    # build vectorized env exactly like in sre training
+    env = sre.make_vec_env(
+        run_cfg.env,
+        n_envs=run_cfg.resources.n_envs,
+        base_seed=cfg.seed,
+    )
+
+    # load expert model
+    expert_model = sre.load_model(
         env,
-        cfg_algo,
-        load_path=model_dir,
-        seed=seed
+        cfg = run_cfg,
+        load_path=model_path,
+        seed=run_cfg.seed,
+        device=run_cfg.resources.device,
     )
 
     return env, expert_model

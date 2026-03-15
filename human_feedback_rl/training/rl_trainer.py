@@ -1,23 +1,24 @@
-import os
 import torch
-from human_feedback_rl.utils.logging import Logger
+
+from human_feedback_rl.training.base_trainer import BaseTrainer
 
 
-class RLTrainer:
+class RLTrainer(BaseTrainer):
 
-    def __init__(self, env, policy, reward_model, log_dir="runs/rl"):
+    def __init__(self, env, policy, reward_model, run_dir=None):
 
-        self.env = env
-        self.policy = policy
+        optimizer = torch.optim.Adam(policy.parameters(), lr=5e-5)
+
+        super().__init__(
+            env=env,
+            policy=policy,
+            expert_model=None,
+            optimizer=optimizer,
+            run_dir=run_dir,
+            name="rl"
+        )
+
         self.reward_model = reward_model
-
-        self.optimizer = torch.optim.Adam(policy.parameters(), lr=5e-5)
-
-        self.logger = Logger(log_dir)
-
-        self.global_rewards = []
-        self.global_lengths = []
-        self.global_losses = []
 
     # ------------------------------------------
 
@@ -92,44 +93,12 @@ class RLTrainer:
             loss.backward()
             self.optimizer.step()
 
-            # tensorboard logging
-            self.logger.log_episode(
+            self.log_episode(
                 episode,
                 reward_sum,
                 length,
                 loss.item(),
-                0,
-                0,
-                0
+                kl=0,
+                match=0,
+                entropy=0
             )
-
-            self.global_rewards.append(reward_sum)
-            self.global_lengths.append(length)
-            self.global_losses.append(loss.item())
-
-    # ------------------------------------------
-
-    def save_model(self, path):
-
-        os.makedirs("models", exist_ok=True)
-
-        full_path = os.path.join("models", path)
-
-        torch.save(self.policy.state_dict(), full_path)
-
-        print(f"\nModel saved to {full_path}")
-
-    # ------------------------------------------
-
-    def print_summary(self):
-
-        print("\n====== RL TRAINING SUMMARY ======")
-
-        print(
-            f"Episodes: {len(self.global_rewards)}\n"
-            f"Average reward: {sum(self.global_rewards) / len(self.global_rewards):.2f}\n"
-            f"Max reward: {max(self.global_rewards):.2f}\n"
-            f"Min reward: {min(self.global_rewards):.2f}\n"
-            f"Average episode length: {sum(self.global_lengths) / len(self.global_lengths):.2f}\n"
-            f"Average loss: {sum(self.global_losses) / len(self.global_losses):.4f}"
-        )

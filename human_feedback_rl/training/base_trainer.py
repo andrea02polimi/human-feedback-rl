@@ -1,61 +1,90 @@
+from pathlib import Path
 import torch
 import torch.nn.functional as f
 
-import os
+from human_feedback_rl.utils.logging import Logger
 
 
 class BaseTrainer:
 
-    def __init__(self, env, policy, expert_model, optimizer):
+    def __init__(self, env, policy, expert_model, optimizer, run_dir=None, name="trainer"):
 
         self.env = env
         self.policy = policy
-        self.optimizer = optimizer
         self.expert_model = expert_model
+        self.optimizer = optimizer
 
-        self.base_log_dir = os.path.join("tensorboard", "training")
+        self.run_dir = Path(run_dir) if run_dir else Path("runs")
 
-        os.makedirs(self.base_log_dir, exist_ok=True)
+        self.models_dir = self.run_dir / "models"
+        self.tb_dir = self.run_dir / "tensorboard" / name
 
-    # ------------------------------------------------
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        self.tb_dir.mkdir(parents=True, exist_ok=True)
 
-    def compute_kl_on_expert_state(self, step):
-        state = step.state
+        self.logger = Logger(self.tb_dir)
 
-        state_tensor = torch.tensor(
-            state,
-            dtype=torch.float32
-        ).unsqueeze(0)
+        # metriche comuni
+        self.global_rewards = []
+        self.global_lengths = []
+        self.global_losses = []
 
-        agent_logits = self.policy(state_tensor)
+    # ---------------------------------------------
 
-        with torch.no_grad():
-            expert_logits = self.expert_model.q_net(state_tensor)
+    def log_episode(
+        self,
+        episode,
+        reward,
+        length,
+        loss,
+        kl=0,
+        match=0,
+        entropy=0
+    ):
 
-        expert_probs = torch.softmax(expert_logits, dim=1)
-        agent_log_probs = torch.log_softmax(agent_logits, dim=1)
+        self.logger.log_episode(
+            episode,
+            reward,
+            length,
+            loss,
+            kl,
+            match,
+            entropy
+        )
 
-        return f.kl_div(agent_log_probs, expert_probs, reduction="batchmean")
+        self.global_rewards.append(reward)
+        self.global_lengths.append(length)
+        self.global_losses.append(loss)
 
-    # ------------------------------------------------
+    # ---------------------------------------------
 
-    @staticmethod
-    def select_action(logits):
-        probs = torch.softmax(logits, dim=1)
-        return torch.multinomial(probs, 1).item()
+    def save_model(self, path):
 
+        path = Path(path)
 
-    def optimize_step(self, logits, loss):
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        path.parent.mkdir(parents=True, exist_ok=True)
 
-        action = self.select_action(logits)
+        torch.save(self.policy.state_dict(), path)
 
-        obs, reward, terminated, truncated, _ = self.env.step(action)
-        done = terminated or truncated
+        print(f"\nModel saved to {path}")
 
-        return obs, reward, done, action
+    # ---------------------------------------------
+
+    def print_summary(self):
+
+        if len(self.global_rewards) == 0:
+            return
+
+        print("\n====== TRAINING SUMMARY ======")
+
+        print(
+            f"Episodes: {len(self.global_rewards)}\n"
+            f"Average reward: {sum(self.global_rewards)/len(self.global_rewards):.2f}\n"
+            f"Max reward: {max(self.global_rewards):.2f}\n"
+            f"Min reward: {min(self.global_rewards):.2f}\n"
+            f"Average episode length: {sum(self.global_lengths)/len(self.global_lengths):.2f}\n"
+            f"Average loss: {sum(self.global_losses)/len(self.global_losses):.4f}"
+        )
 
     def forward_and_metrics(self, obs):
         state = obs[0] if len(obs.shape) > 1 else obs

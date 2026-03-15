@@ -1,24 +1,40 @@
+seed: 0
+
 env:
-  expert_model: "2026-03-09_17-15-41_train_highway_fast_DQN/model.zip"
+
+  expert_model: "highway_discrete_dqn_v2_1"
+  scenario: "highway_discrete_v2"
 
 pipeline:
+
   imitation: true
-  preferences: true
-  rlhf: true
+  preferences: false
+  rlhf: false
 
 imitation:
+
   episodes: 2000
   policy_lr: 5e-5
 
 preferences:
+
   collect_episodes: 200
   epochs: 2000
   lr: 1e-4
 
 rl:
+
   episodes: 1000
 
+paths:
+
+  bc_model: models/policy_bc.pt
+  reward_model: models/reward_model.pt
+  rl_model: models/policy_rlhf.pt
+
 hydra:
+
   run:
     dir: experiments/runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
   output_subdir: config

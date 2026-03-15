@@ -1,17 +1,29 @@
 import torch
 
+from human_feedback_rl.training.base_trainer import BaseTrainer
 
-class PreferenceTrainer:
 
-    def __init__(self, reward_model, optimizer, dataset):
+class PreferenceTrainer(BaseTrainer):
+
+    def __init__(self, reward_model, optimizer, dataset, run_dir=None):
+
+        super().__init__(
+            env=None,
+            policy=None,
+            expert_model=None,
+            optimizer=optimizer,
+            run_dir=run_dir,
+            name="preferences"
+        )
 
         self.reward_model = reward_model
-        self.optimizer = optimizer
         self.dataset = dataset
+
+    # ------------------------------------------------
 
     def train(self, epochs=2000, batch_size=64):
 
-        for epoch in range(epochs):
+        for epoch in range(1, epochs + 1):
 
             batch = self.dataset.sample(batch_size)
 
@@ -42,5 +54,20 @@ class PreferenceTrainer:
             loss_total.backward()
             self.optimizer.step()
 
+            # tensorboard logging via BaseTrainer
+            self.log_episode(
+                epoch,
+                reward=0,                 # non c'è reward qui
+                length=batch_size,
+                loss=loss_total.item(),
+                kl=0,
+                match=0,
+                entropy=0
+            )
+
             if epoch % 100 == 0:
-                print(f"Preference epoch {epoch} | loss {loss_total.item():.4f}")
+
+                print(
+                    f"Preference epoch {epoch} | "
+                    f"loss {loss_total.item():.4f}"
+                )
