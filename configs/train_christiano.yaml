@@ -1,0 +1,42 @@
+seed: 0
+
+env:
+  expert_model: "highway_discrete_dqn_v2_1"
+  scenario: "highway_discrete_v2"
+
+resources:
+  device: cpu
+
+# ── Reward predictor ensemble (Christiano et al.) ─────────────────────────
+reward_predictor:
+  lr: 2e-4
+  n_preds: 3          # ensemble size (paper uses 3)
+  val_interval: 50    # log validation loss every N training steps
+
+# ── Preferences ───────────────────────────────────────────────────────────
+preferences:
+  initial_prefs: 200  # preferences to collect before pretraining
+  prefs_per_iter: 20  # new preferences per training iteration
+  segment_len: 25     # steps per segment (paper default)
+  max_segs: 1000      # max segments queued in PrefInterface
+  db_train_maxlen: 3000
+  db_val_maxlen: 750
+
+# ── Policy (REINFORCE) ────────────────────────────────────────────────────
+policy:
+  lr: 5e-5
+  gamma: 0.99
+
+# ── Training loop ─────────────────────────────────────────────────────────
+training:
+  iterations: 100
+  policy_episodes_per_iter: 10
+
+# ── Output paths ──────────────────────────────────────────────────────────
+paths:
+  policy: models/policy_christiano.pt
+
+hydra:
+  run:
+    dir: experiments/christiano/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  output_subdir: config

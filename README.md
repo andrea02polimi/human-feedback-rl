@@ -1,5 +1,28 @@
 # Human Feedback RL
-This is the repository for developing a software framework that aims to integrate multiple forms of feedback and uses them in **Learning Algorithms**. 
+This is the repository for developing a software framework that aims to integrate multiple forms of feedback and uses them in **Learning Algorithms**.
+
+## Dependencies
+
+This project uses [`learning-from-human-preferences`](https://github.com/andrea02polimi/learning-from-human-preferences) as a library for the core RLHF pipeline (reward model training, preference collection, A2C agent).
+
+### Installation
+
+```bash
+pip install -e .
+```
+
+This installs the package and all dependencies, including `learning-from-human-preferences` directly from GitHub.
+
+Alternatively, using `requirements.txt`:
+
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
+
+> **Note:** `sumo_rl_ego` (the SUMO environment) is a separate private dependency and must be installed manually before running training or evaluation scripts.
+
+
 
 *The development of the software framework is done as part of my Master Science thesis.*
 

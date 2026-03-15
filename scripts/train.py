@@ -1,3 +1,13 @@
+"""
+Imitation + RLHF training script.
+
+Pipeline:
+  imitation — behavioural cloning from DQN expert demonstrations
+  rlhf      — REINFORCE using a separately trained reward model
+
+For the Christiano et al. preference-learning pipeline see train_christiano.py.
+"""
+
 import hydra
 import torch
 import torch.optim as optim
@@ -7,15 +17,10 @@ from omegaconf import DictConfig, OmegaConf
 from hydra.core.hydra_config import HydraConfig
 
 from human_feedback_rl.training.imitation_trainer import ImitationTrainer
-from human_feedback_rl.training.preference_trainer import PreferenceTrainer
 from human_feedback_rl.training.rl_trainer import RLTrainer
-
-from human_feedback_rl.experts.preference_expert import ConcreteStepPreferenceExpert
-from human_feedback_rl.data.preference_dataset import PreferenceDataset
 from human_feedback_rl.models.reward_model import RewardModel
 
 from human_feedback_rl.utils.env_setup import build_env_and_expert, build_policy
-from human_feedback_rl.utils.preferences import collect_preferences
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="train.yaml")
@@ -59,59 +64,16 @@ def main(cfg: DictConfig):
         imitation.print_summary()
 
     # -----------------------------
-    # Preferences
-    # -----------------------------
-
-    reward_model = None
-
-    if cfg.pipeline.preferences:
-
-        dataset = PreferenceDataset()
-
-        pref_expert = ConcreteStepPreferenceExpert(env, expert_model)
-
-        collect_preferences(
-            env,
-            policy,
-            pref_expert,
-            dataset,
-            episodes=cfg.preferences.collect_episodes
-        )
-
-        reward_model = RewardModel(obs_dim, n_actions)
-
-        pref_trainer = PreferenceTrainer(
-            reward_model,
-            optim.Adam(
-                reward_model.parameters(),
-                lr=cfg.preferences.lr
-            ),
-            dataset,
-            run_dir
-        )
-
-        pref_trainer.train(cfg.preferences.epochs)
-
-        torch.save(
-            reward_model.state_dict(),
-            cfg.paths.reward_model
-        )
-
-        print(f"\nReward model saved to {cfg.paths.reward_model}")
-
-    # -----------------------------
-    # RLHF
+    # RLHF (with pre-trained reward model)
     # -----------------------------
 
     if cfg.pipeline.rlhf:
 
-        if reward_model is None:
+        reward_model = RewardModel(obs_dim, n_actions)
 
-            reward_model = RewardModel(obs_dim, n_actions)
-
-            reward_model.load_state_dict(
-                torch.load(cfg.paths.reward_model)
-            )
+        reward_model.load_state_dict(
+            torch.load(cfg.paths.reward_model)
+        )
 
         rl_trainer = RLTrainer(
             env,
