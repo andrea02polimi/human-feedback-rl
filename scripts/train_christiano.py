@@ -62,13 +62,15 @@ def _collect_preferences(collector, policy, pref_interface, db_train, db_val, n:
 def _policy_episode(env, policy, rp) -> tuple[float, list]:
     """
     Run one episode with `policy`, compute per-step rewards from `rp`, and
-    return (total_env_reward, list_of_(log_prob, predicted_reward) pairs).
+    return (total_predicted_reward, list_of_(log_prob, predicted_reward) pairs).
+
+    Assumes env is an SB3 VecEnv: reset() returns obs directly, step() takes
+    an array of actions and returns (obs, rewards, dones, infos).
     """
-    result = env.reset()
-    obs = result[0] if isinstance(result, tuple) else result
+    obs = env.reset()                        # SB3 VecEnv: no info tuple
     obs = np.asarray(obs)
-    if obs.ndim > 1:
-        obs = obs[0]
+    n_envs = obs.shape[0] if obs.ndim > 1 else 1
+    obs = obs[0] if obs.ndim > 1 else obs    # follow env 0
 
     done = False
     log_probs = []
@@ -83,20 +85,23 @@ def _policy_episode(env, policy, rp) -> tuple[float, list]:
         log_probs.append(probs_dist.log_prob(action))
         obs_list.append(obs.copy())
 
-        step_result = env.step(action.item())
-        if len(step_result) == 5:
-            next_obs, _, terminated, truncated, _ = step_result
-            done = terminated or truncated
-        else:
-            next_obs, _, done, _ = step_result
+        # SB3 VecEnv: pass array of actions, returns 4-tuple
+        actions = np.array([action.item()] * n_envs)
+        next_obs, _, dones, _ = env.step(actions)
+        done = bool(dones[0]) if hasattr(dones, '__len__') else bool(dones)
 
         next_obs = np.asarray(next_obs)
-        if next_obs.ndim > 1:
-            next_obs = next_obs[0]
-        obs = next_obs
+        obs = next_obs[0] if next_obs.ndim > 1 else next_obs
 
     obs_batch = np.stack(obs_list, axis=0)       # (T, obs_dim)
     rewards_np = rp.reward(obs_batch)            # (T,) — normalised by rp
+
+    # Guard against NaN/Inf from an under-trained predictor
+    if not np.all(np.isfinite(rewards_np)):
+        rewards_np = np.zeros_like(rewards_np)
+
+    # Clip to avoid exploding returns
+    rewards_np = np.clip(rewards_np, -10.0, 10.0)
 
     return rewards_np.sum().item(), list(zip(log_probs, rewards_np.tolist()))
 
@@ -113,11 +118,19 @@ def _train_policy_episode(env, policy, optimizer, rp, gamma: float) -> tuple[flo
         returns.insert(0, G)
 
     returns_t = torch.tensor(returns, dtype=torch.float32)
-    returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
+
+    # Normalise only when there is more than one step (std is NaN for n=1)
+    if returns_t.numel() > 1:
+        std = returns_t.std(correction=0)  # population std, never NaN
+        returns_t = (returns_t - returns_t.mean()) / (std + 1e-8)
 
     loss = sum(
         -lp * G_t for (lp, _), G_t in zip(transitions, returns_t)
     ) / len(transitions)
+
+    # Skip update if loss is NaN (e.g. reward predictor not yet stable)
+    if not torch.isfinite(loss):
+        return total_reward, 0.0
 
     optimizer.zero_grad()
     loss.backward()

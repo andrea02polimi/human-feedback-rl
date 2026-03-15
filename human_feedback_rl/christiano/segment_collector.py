@@ -29,10 +29,12 @@ class SegmentCollector:
     # ------------------------------------------------------------------
 
     def _reset(self):
-        result = self.env.reset()
-        # Support both gym (obs, info) and SB3 VecEnv (obs,) reset return
-        obs = result[0] if isinstance(result, tuple) else result
+        # SB3 VecEnv.reset() returns obs directly (no info tuple)
+        obs = self.env.reset()
         self._current_obs = self._flatten_obs(obs)
+        # Cache number of parallel envs for step calls
+        raw = np.asarray(obs)
+        self._n_envs = raw.shape[0] if raw.ndim > 1 else 1
 
     # ------------------------------------------------------------------
 
@@ -73,13 +75,11 @@ class SegmentCollector:
                 logits = policy(state)
             action = torch.argmax(logits, dim=1).item()
 
-            step_result = self.env.step(action)
-            # Support both (obs, rew, term, trunc, info) and (obs, rew, done, info)
-            if len(step_result) == 5:
-                next_obs, _, terminated, truncated, _ = step_result
-                done = terminated or truncated
-            else:
-                next_obs, _, done, _ = step_result
+            # SB3 VecEnv expects an array of actions, one per parallel env
+            actions = np.array([action] * self._n_envs)
+            # SB3 VecEnv.step() returns (obs, rewards, dones, infos) — 4 values
+            next_obs, _, dones, _ = self.env.step(actions)
+            done = bool(dones[0]) if hasattr(dones, '__len__') else bool(dones)
 
             if done:
                 episode_ended = True
