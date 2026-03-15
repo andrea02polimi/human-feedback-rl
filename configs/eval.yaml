@@ -1,23 +1,15 @@
-seed: 0
-
 run:
-
-  # directory del run da valutare
-  dir: experiments/runs/2026-03-11/11-47-18
+  # Path to the training run directory (relative to human-feedback-rl/)
+  dir: "experiments/christiano/2026-03-15/16-45-23"
 
 agent:
-
-  # modello da valutare (relativo alla root del progetto)
-  model: models/policy_bc.pt
+  # Path to the policy checkpoint (relative to human-feedback-rl/)
+  model: "experiments/christiano/2026-03-15/16-45-23/models/policy_christiano.pt"
 
 eval:
-
   episodes: 100
 
-
 hydra:
-
   run:
     dir: experiments/eval/${now:%Y-%m-%d}/${now:%H-%M-%S}
-
   output_subdir: config

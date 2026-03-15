@@ -1,40 +1,40 @@
 seed: 0
 
 env:
-  expert_model: "highway_discrete_dqn_v2_1"
-  scenario: "highway_discrete_v2"
+  expert_model: "highway_discrete_dqn_v2_1"   # folder at repo root
+  scenario: "highway_discrete_v2"              # used by eval.py to recreate the env
 
 resources:
   device: cpu
 
-# ── Reward predictor ensemble (Christiano et al.) ─────────────────────────
+# ── Reward predictor ensemble (Christiano et al.) ────────────────────────────
 reward_predictor:
   lr: 2e-4
-  n_preds: 3          # ensemble size (paper uses 3)
-  val_interval: 50    # log validation loss every N training steps
+  n_preds: 3          # ensemble size (paper: 3)
+  val_interval: 50    # steps between validation-loss logs
 
-# ── Preferences ───────────────────────────────────────────────────────────
+# ── Preferences ───────────────────────────────────────────────────────────────
 preferences:
-  initial_prefs: 200  # preferences to collect before pretraining
-  prefs_per_iter: 20  # new preferences per training iteration
-  segment_len: 25     # steps per segment (paper default)
-  max_segs: 1000      # max segments queued in PrefInterface
+  oracle: "expert"    # "expert" → DQN synthetic | "human" → terminal R/L/E/S
+  initial_prefs: 200  # preferences to collect before pretraining the rp
+  segment_len: 25     # steps per trajectory segment (paper default)
+  max_segs: 1000      # max segment pairs queued in PrefInterface
   db_train_maxlen: 3000
   db_val_maxlen: 750
+  seg_pipe_maxsize: 10  # max segment pairs buffered between processes
 
-# ── Policy (REINFORCE) ────────────────────────────────────────────────────
+# ── Policy (REINFORCE) ────────────────────────────────────────────────────────
 policy:
   lr: 5e-5
   gamma: 0.99
 
-# ── Training loop ─────────────────────────────────────────────────────────
+# ── Training loop ─────────────────────────────────────────────────────────────
 training:
-  iterations: 100
-  policy_episodes_per_iter: 10
-
-# ── Output paths ──────────────────────────────────────────────────────────
-paths:
-  policy: models/policy_christiano.pt
+  rp_iterations: 100          # how many times the main process retrains the rp
+  rp_train_interval_sec: 30   # seconds to wait between rp retraining steps
+  policy_episodes_per_step: 5 # episodes per policy-worker iteration
+  policy_save_interval: 10    # save policy checkpoint every N policy steps
+  rp_reload_interval: 5       # reload rp checkpoint every N policy steps
 
 hydra:
   run:

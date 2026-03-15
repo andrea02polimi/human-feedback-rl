@@ -1,3 +1,15 @@
+"""
+Evaluate a policy trained with train_christiano.py.
+
+Usage:
+    python scripts/eval.py \
+        run.dir=experiments/christiano/2026-03-15/16-45-23 \
+        agent.model=experiments/christiano/2026-03-15/16-45-23/models/policy_christiano.pt
+
+    # override number of evaluation episodes
+    python scripts/eval.py run.dir=... eval.episodes=100
+"""
+
 import hydra
 import torch
 from tqdm import tqdm
@@ -5,74 +17,48 @@ from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
 
 import sumo_rl_ego as sre
-
 from human_feedback_rl.agents.policy_network import AgentPolicyNetwork
 
 
-# ------------------------------------------------------------
-# Utility
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-def print_log(log):
-
-    groups = {}
-
+def _print_metrics(log: dict):
+    """Pretty-print the environment's metric groups."""
+    groups: dict = {}
     for key, value in log.items():
-
         group, name = key.split("/", 1)
-
-        if group not in groups:
-            groups[group] = {}
-
-        groups[group][name] = value
+        groups.setdefault(group, {})[name] = value
 
     for group, items in groups.items():
-
         print(f"[{group}]")
-
         for name, value in items.items():
-
             if isinstance(value, float):
-                value = round(value, 3)
-
-            print(f"  {name:20s} : {value}")
-
+                value = round(value, 4)
+            print(f"  {name:26s}: {value}")
         print()
 
 
-# ------------------------------------------------------------
-# Agent evaluation
-# ------------------------------------------------------------
-
-def evaluate_agent(env, policy, episodes):
-
-    print("\n=== Agent evaluation ===")
+def _run_episodes(env, policy, episodes: int):
+    """Roll out `policy` for `episodes` episodes (single gymnasium env)."""
+    print(f"\n=== Evaluating — {episodes} episodes ===")
 
     for _ in tqdm(range(episodes)):
-
-        obs, _ = env.reset()
-
-        terminated = False
-        truncated = False
+        obs, _ = env.reset()          # gymnasium API: (obs, info)
+        terminated = truncated = False
 
         while not (terminated or truncated):
-
-            state_tensor = torch.tensor(
-                obs,
-                dtype=torch.float32
-            ).unsqueeze(0)
-
+            state = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
-                logits = policy(state_tensor)
-
+                logits = policy(state)
             action = torch.argmax(logits, dim=1).item()
-
             obs, _, terminated, truncated, _ = env.step(action)
 
 
-# ------------------------------------------------------------
-# Hydra main
-# ------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
 @hydra.main(version_base=None, config_path="../configs", config_name="eval.yaml")
 def main(cfg: DictConfig):
@@ -80,65 +66,37 @@ def main(cfg: DictConfig):
     print("\nConfiguration:")
     print(OmegaConf.to_yaml(cfg))
 
-    PROJECT_ROOT = Path(__file__).resolve().parents[0]
+    # PROJECT_ROOT = human-feedback-rl/
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-    # ------------------------------------------------------------
-    # Load training configuration
-    # ------------------------------------------------------------
-
+    # ── Load training config to reproduce the exact environment ──────────────
     run_dir = PROJECT_ROOT / cfg.run.dir
+    train_cfg = OmegaConf.load(run_dir / "config" / "config.yaml")
 
-    config_path = run_dir / "config" / "config.yaml"
+    print(f"[eval] Training run : {run_dir}")
+    print(f"[eval] Scenario     : {train_cfg.env.scenario}")
 
-    print("[Eval] Loading run config from:", config_path)
+    # ── Build single (non-vectorized) environment ─────────────────────────────
+    env = sre.make_env(train_cfg.env.scenario, seed=train_cfg.seed)
 
-    train_cfg = OmegaConf.load(config_path)
-
-    # ------------------------------------------------------------
-    # Build environment exactly like training
-    # ------------------------------------------------------------
-
-    env = sre.make_env(
-        train_cfg.env.scenario,
-        seed=train_cfg.seed
-    )
-
-    # ------------------------------------------------------------
-    # Load policy
-    # ------------------------------------------------------------
-
-    obs_dim = env.observation_space.shape[0]
+    obs_dim   = env.observation_space.shape[0]
     n_actions = env.action_space.n
 
+    # ── Load policy ───────────────────────────────────────────────────────────
     policy = AgentPolicyNetwork(obs_dim, n_actions)
 
     agent_path = PROJECT_ROOT / cfg.agent.model
+    print(f"[eval] Policy path  : {agent_path}")
 
-    print("[Agent] Loading policy from:", agent_path)
-
-    policy.load_state_dict(
-        torch.load(agent_path, map_location="cpu")
-    )
-
+    policy.load_state_dict(torch.load(agent_path, map_location="cpu"))
     policy.eval()
 
-    # ------------------------------------------------------------
-    # Run evaluation
-    # ------------------------------------------------------------
+    # ── Run evaluation ────────────────────────────────────────────────────────
+    _run_episodes(env, policy, cfg.eval.episodes)
 
-    evaluate_agent(
-        env,
-        policy,
-        cfg.eval.episodes
-    )
-
-    # ------------------------------------------------------------
-    # Print metrics
-    # ------------------------------------------------------------
-
+    # ── Print environment metrics ─────────────────────────────────────────────
     log = env.metrics_tracker.get_log_metrics()
-
-    print_log(log)
+    _print_metrics(log)
 
     env.close()
 
