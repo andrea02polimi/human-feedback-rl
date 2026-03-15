@@ -2,7 +2,7 @@ seed: 0
 
 env:
   expert_model: "highway_discrete_dqn_v2_1"   # folder at repo root
-  scenario: "highway_discrete_v2"              # used by eval.py to recreate the env
+  scenario: "highway_discrete_v2"              # used by eval.py / play.py
 
 resources:
   device: cpu
@@ -15,28 +15,28 @@ reward_predictor:
 
 # ── Preferences ───────────────────────────────────────────────────────────────
 preferences:
-  oracle: "expert"    # "expert" → DQN synthetic | "human" → terminal R/L/E/S
-  initial_prefs: 200  # preferences to collect before pretraining the rp
-  segment_len: 25     # steps per trajectory segment (paper default)
-  max_segs: 1000      # max segments kept in pref-worker buffer
+  oracle: "expert"        # "expert" → DQN synthetic | "human" → terminal L/R/E/S
+  initial_prefs: 200      # preferences collected before pretraining the reward predictor
+  segment_len: 25         # steps per trajectory segment (paper default)
+  max_segs: 1000          # max segments kept in preference-worker buffer
   db_train_maxlen: 3000
   db_val_maxlen: 750
-  seg_pipe_maxsize: 100  # individual segments buffered between processes
+  seg_pipe_maxsize: 100   # individual segments buffered between processes
 
 # ── Policy (A2C — algorithm used in the paper) ────────────────────────────────
 policy:
-  lr: 7e-4            # A2C typical learning rate
-  gamma: 0.99
-  nsteps: 20          # rollout length per A2C update
-  ent_coef: 0.01      # entropy bonus coefficient
-  vf_coef: 0.5        # value loss coefficient
-  max_grad_norm: 0.5  # gradient clipping
+  lr: 7e-4              # A2C learning rate
+  gamma: 0.99           # discount factor
+  rollout_steps: 20     # steps collected per A2C update
+  entropy_coef: 0.01    # entropy bonus coefficient
+  value_coef: 0.5       # value loss coefficient
+  max_gradient_norm: 0.5
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 training:
-  rp_iterations: 500          # total RP retrainings (no sleep between them)
-  policy_save_interval: 100   # save policy checkpoint every N A2C steps
-  rp_reload_interval: 10      # reload rp checkpoint every N A2C steps
+  reward_predictor_iterations: 500     # total reward predictor retrainings
+  reward_predictor_reload_interval: 10 # reload reward predictor checkpoint every N policy steps
+  policy_save_interval: 100            # save policy checkpoint every N A2C steps
 
 hydra:
   run:

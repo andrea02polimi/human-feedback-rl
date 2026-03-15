@@ -4,28 +4,33 @@ Asynchronous A2C implementation for the SUMO highway environment.
 
 Three concurrent activities running in separate processes:
 
-  Policy process  — runs A2C rollouts over `nsteps` steps, generates
-                    individual trajectory segments → seg_pipe, and uses the
-                    reward predictor's predicted rewards (once ready) instead
-                    of environment rewards.  Mirrors run.py's _training_worker
-                    + Runner.
+  Policy process  — runs A2C rollouts, generates individual trajectory
+                    segments sent to segment_pipe, and updates the policy
+                    ONLY with rewards from the reward predictor (never with
+                    environment rewards — the environment reward is unknown,
+                    as required by the paper).
 
-  Pref process    — accumulates segments from seg_pipe in a circular buffer,
-                    randomly samples pairs, labels them via the configured
-                    oracle (DQN expert or human terminal), and forwards labeled
-                    triples to pref_pipe.  Mirrors run.py's _pref_interface_worker.
+  Preference process — accumulates segments from segment_pipe in a circular
+                    buffer, randomly samples pairs, labels them via the
+                    configured oracle (DQN expert or human terminal), and
+                    forwards labeled triples to preference_pipe.
 
   Main process    — manages PrefDB, trains the RewardPredictorEnsemble on
                     incoming preferences, and saves checkpoints to disk.
-                    Mirrors run.py's _train_policy_with_preferences.
 
 Communication:
-  seg_pipe   : Queue[Segment]                    policy → pref
-  pref_pipe  : Queue[(frames, frames, pref)]     pref   → main (PrefBuffer)
-  start_event: mp.Event                          main   → policy  (rp ready)
-  stop_event : mp.Event                          main   → all     (shutdown)
-  filesystem : reward_predictor_checkpoints/     main   → policy  (rp weights)
-               models/policy_christiano.pt       policy → eval
+  segment_pipe                : Queue[Segment]
+                                  policy → preference
+  preference_pipe             : Queue[(frames, frames, pref)]
+                                  preference → main (PrefBuffer)
+  reward_predictor_ready_event: mp.Event
+                                  main → policy  (reward predictor ready)
+  shutdown_event              : mp.Event
+                                  main → all     (time to stop)
+  filesystem                  : reward_predictor_checkpoints/
+                                  main → policy  (reward predictor weights)
+                                models/policy_christiano.pt
+                                  policy → eval / play
 """
 
 import functools
@@ -65,19 +70,19 @@ from human_feedback_rl.utils.env_setup import build_env_and_expert, build_single
 # A2C helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _discount_with_dones(rewards, dones, gamma: float):
+def _discount_with_dones(rewards, dones, discount_factor: float):
     """
     Compute discounted returns with episode-end masking.
 
-    If the last element of dones is 0 (episode not ended), the caller should
-    append the bootstrap value to rewards and 0 to dones before calling, then
-    drop the last element of the result.
+    When the last step did NOT end the episode, the caller should append the
+    bootstrap value to `rewards` and 0 to `dones`, then drop the last element
+    of the returned list.
     """
     returns = []
-    R = 0.0
-    for r, d in zip(reversed(rewards), reversed(dones)):
-        R = r + gamma * R * (1.0 - float(d))
-        returns.append(R)
+    cumulative_return = 0.0
+    for reward, done in zip(reversed(rewards), reversed(dones)):
+        cumulative_return = reward + discount_factor * cumulative_return * (1.0 - float(done))
+        returns.append(cumulative_return)
     return returns[::-1]
 
 
@@ -85,203 +90,243 @@ def _discount_with_dones(rewards, dones, gamma: float):
 # Worker: A2C policy training + segment generation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _policy_worker(cfg_dict, seg_pipe, start_event, stop_event,
-                   rp_ckpt_dir, policy_ckpt_path, log_dir):
+def _policy_worker(
+    config_dict,
+    segment_pipe,
+    reward_predictor_ready_event,
+    shutdown_event,
+    reward_predictor_checkpoint_dir,
+    policy_checkpoint_path,
+    log_directory,
+):
     """
     Subprocess responsible for:
-      1. Running nsteps A2C rollouts and sending individual Segment objects
-         (env 0 only, like run.py's Runner) to seg_pipe.
-      2. Using environment rewards before the reward predictor is ready, then
-         switching to predicted rewards once start_event is set and a checkpoint
-         is available.
+      1. Running A2C rollouts and sending individual Segment objects to
+         segment_pipe so that the preference process can label them.
+      2. Updating the policy with PREDICTED rewards from the reward predictor
+         — never with environment rewards (the paper assumes the environment
+         reward is unknown).  Policy gradient updates are skipped entirely
+         until reward_predictor_ready_event is set and a checkpoint is
+         available.
     """
-    cfg = OmegaConf.create(cfg_dict)
+    config = OmegaConf.create(config_dict)
 
-    env, _ = build_env_and_expert(cfg)
+    env, _ = build_env_and_expert(config)
 
-    raw       = np.asarray(env.reset())
-    n_envs    = raw.shape[0] if raw.ndim > 1 else 1
-    obs_dim   = raw.shape[-1]
-    n_actions = env.action_space.n
+    initial_observations = np.asarray(env.reset())
+    num_envs        = initial_observations.shape[0] if initial_observations.ndim > 1 else 1
+    observation_dim = initial_observations.shape[-1]
+    num_actions     = env.action_space.n
 
-    policy    = AgentPolicyNetwork(obs_dim, n_actions)
-    optimizer = optim.Adam(policy.parameters(), lr=cfg.policy.lr)
+    policy    = AgentPolicyNetwork(observation_dim, num_actions)
+    optimizer = optim.Adam(policy.parameters(), lr=config.policy.lr)
 
-    # Inference-only reward predictor in this process (no TensorBoard writes)
-    rp = RewardPredictorEnsemble(
-        core_network=functools.partial(SumoRewardNetwork, obs_dim=obs_dim),
+    # Inference-only reward predictor in this process (no checkpoint writes,
+    # no TensorBoard).  Rewards produced by reward_predictor.reward() are
+    # normalised to zero mean and constant standard deviation (× 0.05) as
+    # described in Section 2.3 of Christiano et al.
+    reward_predictor = RewardPredictorEnsemble(
+        core_network=functools.partial(SumoRewardNetwork, obs_dim=observation_dim),
         log_dir=None,
-        device=cfg.resources.device,
+        device=config.resources.device,
     )
 
-    writer = SummaryWriter(os.path.join(log_dir, "policy"))
+    writer = SummaryWriter(os.path.join(log_directory, "policy"))
 
-    # Current observations: (n_envs, obs_dim)
-    current_obs = raw if raw.ndim > 1 else raw[np.newaxis]
-    dones       = np.zeros(n_envs, dtype=bool)
+    # Current observations: shape (num_envs, observation_dim)
+    current_observations = (
+        initial_observations
+        if initial_observations.ndim > 1
+        else initial_observations[np.newaxis]
+    )
+    episode_dones = np.zeros(num_envs, dtype=bool)
 
-    # Segment accumulation for env 0 (mirrors run.py's Runner.update_segment_buffer)
-    seg_frames = []
+    # Segment accumulation for environment 0 only (mirrors run.py's Runner)
+    current_segment_frames = []
 
-    nsteps        = cfg.policy.nsteps
-    gamma         = cfg.policy.gamma
-    ent_coef      = cfg.policy.ent_coef
-    vf_coef       = cfg.policy.vf_coef
-    max_grad_norm = cfg.policy.max_grad_norm
-    segment_len   = cfg.preferences.segment_len
+    rollout_steps         = config.policy.rollout_steps
+    discount_factor       = config.policy.gamma
+    entropy_coefficient   = config.policy.entropy_coef
+    value_coefficient     = config.policy.value_coef
+    max_gradient_norm     = config.policy.max_gradient_norm
+    segment_length        = config.preferences.segment_len
 
-    rp_ready = False
-    step     = 0
+    reward_predictor_ready = False
+    training_step          = 0
 
-    while not stop_event.is_set():
+    while not shutdown_event.is_set():
 
         # ── Load / refresh reward predictor ───────────────────────────────────
-        if not rp_ready and start_event.is_set():
-            latest = RewardPredictorEnsemble.latest_checkpoint(rp_ckpt_dir)
-            if latest:
-                try:
-                    rp.load(latest)
-                    rp_ready = True
-                    print("[policy] rp loaded — switching to predicted rewards.",
-                          flush=True)
-                except Exception as e:
-                    print(f"[policy] rp load failed: {e}", flush=True)
-
-        if rp_ready and step % cfg.training.rp_reload_interval == 0 and step > 0:
-            latest = RewardPredictorEnsemble.latest_checkpoint(rp_ckpt_dir)
-            if latest:
-                try:
-                    rp.load(latest)
-                except Exception:
-                    pass
-
-        # ── Collect nsteps rollout ─────────────────────────────────────────────
-        mb_obs     = []   # (nsteps, n_envs, obs_dim)
-        mb_actions = []   # (nsteps, n_envs)
-        mb_values  = []   # (nsteps, n_envs)
-        mb_rewards = []   # (nsteps, n_envs)
-        mb_dones   = []   # (nsteps, n_envs)
-
-        for _ in range(nsteps):
-            obs_t = torch.as_tensor(current_obs, dtype=torch.float32)
-            with torch.no_grad():
-                logits, values = policy(obs_t)   # (n_envs, n_actions), (n_envs,)
-
-            dist    = torch.distributions.Categorical(logits=logits)
-            actions = dist.sample()              # (n_envs,)
-
-            mb_obs.append(current_obs.copy())
-            mb_actions.append(actions.numpy())
-            mb_values.append(values.numpy())
-            mb_dones.append(dones.copy())
-
-            next_obs_raw, env_rewards, dones_raw, _ = env.step(actions.numpy())
-            next_obs    = np.asarray(next_obs_raw)
-            if next_obs.ndim == 1:
-                next_obs = next_obs[np.newaxis]
-            dones       = np.asarray(dones_raw, dtype=bool)
-            env_rewards = np.asarray(env_rewards).flatten()
-            mb_rewards.append(env_rewards)
-
-            # ── Segment generation (env 0 only, like run.py's Runner) ─────────
-            seg_frames.append(current_obs[0].copy())
-            if len(seg_frames) >= segment_len or dones[0]:
-                while len(seg_frames) < segment_len:
-                    seg_frames.append(seg_frames[-1].copy())
-                seg = Segment(seg_frames[:segment_len])
-                try:
-                    seg_pipe.put(seg, block=False)
-                except Exception:
-                    pass
-                seg_frames = []
-
-            current_obs = next_obs
-
-        # ── Replace env rewards with predicted rewards (when rp is ready) ─────
-        mb_obs_arr = np.stack(mb_obs, axis=0)    # (nsteps, n_envs, obs_dim)
-
-        if rp_ready:
-            obs_flat  = mb_obs_arr.reshape(-1, obs_dim)
-            predicted = rp.reward(obs_flat)              # (nsteps*n_envs,)
-            if not np.all(np.isfinite(predicted)):
-                predicted = np.zeros_like(predicted)
-            mb_rewards_arr = predicted.reshape(nsteps, n_envs)
-        else:
-            mb_rewards_arr = np.stack(mb_rewards, axis=0)
-
-        # ── Bootstrap last value ───────────────────────────────────────────────
-        with torch.no_grad():
-            _, last_values = policy(
-                torch.as_tensor(current_obs, dtype=torch.float32)
+        if not reward_predictor_ready and reward_predictor_ready_event.is_set():
+            latest_checkpoint = RewardPredictorEnsemble.latest_checkpoint(
+                reward_predictor_checkpoint_dir
             )
-        last_values_np = last_values.numpy()          # (n_envs,)
+            if latest_checkpoint:
+                try:
+                    reward_predictor.load(latest_checkpoint)
+                    reward_predictor_ready = True
+                    print(
+                        "[policy] reward predictor loaded — "
+                        "A2C training with predicted rewards started.",
+                        flush=True,
+                    )
+                except Exception as error:
+                    print(f"[policy] reward predictor load failed: {error}", flush=True)
 
-        mb_dones_arr  = np.stack(mb_dones, axis=0)   # (nsteps, n_envs)
+        if (
+            reward_predictor_ready
+            and training_step % config.training.reward_predictor_reload_interval == 0
+            and training_step > 0
+        ):
+            latest_checkpoint = RewardPredictorEnsemble.latest_checkpoint(
+                reward_predictor_checkpoint_dir
+            )
+            if latest_checkpoint:
+                try:
+                    reward_predictor.load(latest_checkpoint)
+                except Exception:
+                    pass
 
-        # ── Discounted returns per env (mirrors run.py's Runner.run) ──────────
-        returns = np.zeros((nsteps, n_envs), dtype=np.float32)
-        for env_i in range(n_envs):
-            rew_i  = mb_rewards_arr[:, env_i].tolist()
-            done_i = mb_dones_arr[:, env_i].tolist()
-            if not done_i[-1]:
-                rew_i  = rew_i  + [float(last_values_np[env_i])]
-                done_i = done_i + [0]
-                returns[:, env_i] = _discount_with_dones(rew_i, done_i, gamma)[:-1]
+        # ── Collect rollout_steps of experience ───────────────────────────────
+        rollout_observations = []   # (rollout_steps, num_envs, observation_dim)
+        rollout_actions      = []   # (rollout_steps, num_envs)
+        rollout_values       = []   # (rollout_steps, num_envs)
+        rollout_dones        = []   # (rollout_steps, num_envs)
+
+        for _ in range(rollout_steps):
+            observations_tensor = torch.as_tensor(
+                current_observations, dtype=torch.float32
+            )
+            with torch.no_grad():
+                action_logits, state_values = policy(observations_tensor)
+
+            action_distribution = torch.distributions.Categorical(logits=action_logits)
+            sampled_actions     = action_distribution.sample()
+
+            rollout_observations.append(current_observations.copy())
+            rollout_actions.append(sampled_actions.numpy())
+            rollout_values.append(state_values.numpy())
+            rollout_dones.append(episode_dones.copy())
+
+            next_observations_raw, _env_rewards, dones_raw, _ = env.step(
+                sampled_actions.numpy()
+            )
+            next_observations = np.asarray(next_observations_raw)
+            if next_observations.ndim == 1:
+                next_observations = next_observations[np.newaxis]
+            episode_dones = np.asarray(dones_raw, dtype=bool)
+
+            # ── Segment generation (environment 0, mirrors run.py Runner) ─────
+            current_segment_frames.append(current_observations[0].copy())
+            if len(current_segment_frames) >= segment_length or episode_dones[0]:
+                while len(current_segment_frames) < segment_length:
+                    current_segment_frames.append(current_segment_frames[-1].copy())
+                completed_segment = Segment(current_segment_frames[:segment_length])
+                try:
+                    segment_pipe.put(completed_segment, block=False)
+                except Exception:
+                    pass
+                current_segment_frames = []
+
+            current_observations = next_observations
+
+        # ── A2C update — skipped until reward predictor is ready ──────────────
+        # The paper assumes the environment reward is unknown.  Policy gradient
+        # updates only start once the reward predictor has been pretrained.
+        if not reward_predictor_ready:
+            continue
+
+        # ── Replace env rewards with normalised predicted rewards ─────────────
+        # reward_predictor.reward() normalises rewards to zero mean and constant
+        # standard deviation (scaled by 0.05) using running statistics, as
+        # described in Section 2.3 of Christiano et al. (2017).
+        observations_array = np.stack(rollout_observations, axis=0)   # (T, N, obs_dim)
+        flat_observations  = observations_array.reshape(-1, observation_dim)
+        predicted_rewards  = reward_predictor.reward(flat_observations)   # (T*N,)
+        if not np.all(np.isfinite(predicted_rewards)):
+            predicted_rewards = np.zeros_like(predicted_rewards)
+        predicted_rewards_grid = predicted_rewards.reshape(rollout_steps, num_envs)
+
+        # ── Bootstrap last state value ────────────────────────────────────────
+        with torch.no_grad():
+            _, last_state_values = policy(
+                torch.as_tensor(current_observations, dtype=torch.float32)
+            )
+        last_state_values_np = last_state_values.numpy()   # (num_envs,)
+
+        dones_array = np.stack(rollout_dones, axis=0)      # (rollout_steps, num_envs)
+
+        # ── Discounted returns per environment (mirrors run.py Runner.run) ────
+        discounted_returns = np.zeros((rollout_steps, num_envs), dtype=np.float32)
+        for env_index in range(num_envs):
+            rewards_for_env = predicted_rewards_grid[:, env_index].tolist()
+            dones_for_env   = dones_array[:, env_index].tolist()
+            if not dones_for_env[-1]:
+                rewards_for_env = rewards_for_env + [float(last_state_values_np[env_index])]
+                dones_for_env   = dones_for_env   + [0]
+                discounted_returns[:, env_index] = _discount_with_dones(
+                    rewards_for_env, dones_for_env, discount_factor
+                )[:-1]
             else:
-                returns[:, env_i] = _discount_with_dones(rew_i, done_i, gamma)
+                discounted_returns[:, env_index] = _discount_with_dones(
+                    rewards_for_env, dones_for_env, discount_factor
+                )
 
-        # ── A2C update ─────────────────────────────────────────────────────────
-        obs_flat     = mb_obs_arr.reshape(-1, obs_dim)        # (T*N, obs_dim)
-        actions_flat = np.concatenate(mb_actions)             # (T*N,)
-        returns_flat = returns.flatten()                      # (T*N,)
-        values_flat  = np.concatenate(mb_values)              # (T*N,)
+        # ── A2C loss = policy loss + value loss − entropy bonus ───────────────
+        flat_observations_tensor = torch.as_tensor(
+            observations_array.reshape(-1, observation_dim), dtype=torch.float32
+        )
+        flat_actions_tensor  = torch.as_tensor(
+            np.concatenate(rollout_actions), dtype=torch.long
+        )
+        flat_returns_tensor  = torch.as_tensor(
+            discounted_returns.flatten(), dtype=torch.float32
+        )
+        flat_values_tensor   = torch.as_tensor(
+            np.concatenate(rollout_values), dtype=torch.float32
+        )
 
-        obs_t     = torch.as_tensor(obs_flat,     dtype=torch.float32)
-        actions_t = torch.as_tensor(actions_flat, dtype=torch.long)
-        returns_t = torch.as_tensor(returns_flat, dtype=torch.float32)
-        values_t  = torch.as_tensor(values_flat,  dtype=torch.float32)
+        advantages = (flat_returns_tensor - flat_values_tensor).detach()
 
-        advantages = (returns_t - values_t).detach()
+        new_logits, new_values = policy(flat_observations_tensor)
+        action_distribution    = torch.distributions.Categorical(logits=new_logits)
+        log_probabilities      = action_distribution.log_prob(flat_actions_tensor)
+        entropy                = action_distribution.entropy().mean()
 
-        logits_new, values_new = policy(obs_t)
-        dist_new   = torch.distributions.Categorical(logits=logits_new)
-        log_probs  = dist_new.log_prob(actions_t)
-        entropy    = dist_new.entropy().mean()
+        policy_loss = -(log_probabilities * advantages).mean()
+        value_loss  = F.mse_loss(new_values, flat_returns_tensor)
+        total_loss  = policy_loss + value_coefficient * value_loss - entropy_coefficient * entropy
 
-        policy_loss = -(log_probs * advantages).mean()
-        value_loss  = F.mse_loss(values_new, returns_t)
-        loss        = policy_loss + vf_coef * value_loss - ent_coef * entropy
-
-        if torch.isfinite(loss):
+        if torch.isfinite(total_loss):
             optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_gradient_norm)
             optimizer.step()
 
         # ── TensorBoard ───────────────────────────────────────────────────────
-        writer.add_scalar("policy/policy_loss", policy_loss.item(),         step)
-        writer.add_scalar("policy/value_loss",  value_loss.item(),          step)
-        writer.add_scalar("policy/entropy",     entropy.item(),             step)
-        writer.add_scalar("policy/avg_return",  float(returns_flat.mean()), step)
+        writer.add_scalar("policy/policy_loss",  policy_loss.item(),                   training_step)
+        writer.add_scalar("policy/value_loss",   value_loss.item(),                    training_step)
+        writer.add_scalar("policy/entropy",      entropy.item(),                       training_step)
+        writer.add_scalar("policy/avg_return",   float(discounted_returns.mean()),     training_step)
 
-        if step % cfg.training.policy_save_interval == 0:
-            path = Path(policy_ckpt_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(policy.state_dict(), path)
+        if training_step % config.training.policy_save_interval == 0:
+            checkpoint_path = Path(policy_checkpoint_path)
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(policy.state_dict(), checkpoint_path)
             print(
-                f"[policy] step={step}"
-                f"  avg_return={returns_flat.mean():.3f}"
+                f"[policy] step={training_step}"
+                f"  avg_return={discounted_returns.mean():.3f}"
                 f"  policy_loss={policy_loss.item():.4f}"
                 f"  value_loss={value_loss.item():.4f}",
                 flush=True,
             )
 
-        step += 1
+        training_step += 1
 
-    # Final save before exit
-    path = Path(policy_ckpt_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(policy.state_dict(), path)
+    # Final checkpoint before exit
+    checkpoint_path = Path(policy_checkpoint_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(policy.state_dict(), checkpoint_path)
     writer.close()
     env.close()
 
@@ -290,69 +335,75 @@ def _policy_worker(cfg_dict, seg_pipe, start_event, stop_event,
 # Worker: preference labeling
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _sample_pair(segments):
+def _sample_pair(segment_buffer):
     """Randomly sample two different segments from the buffer."""
-    if len(segments) < 2:
+    if len(segment_buffer) < 2:
         return None
-    i, j = random.sample(range(len(segments)), 2)
-    return segments[i], segments[j]
+    first_index, second_index = random.sample(range(len(segment_buffer)), 2)
+    return segment_buffer[first_index], segment_buffer[second_index]
 
 
-def _pref_worker(cfg_dict, seg_pipe, pref_pipe, stop_event, log_dir):
+def _preference_worker(
+    config_dict,
+    segment_pipe,
+    preference_pipe,
+    shutdown_event,
+    log_directory,
+):
     """
     Subprocess responsible for labeling segment pairs.
 
-    Receives individual Segment objects from seg_pipe, accumulates them in a
-    circular buffer (mirrors PrefInterface.receive_segments), randomly samples
-    pairs (mirrors PrefInterface.sample_segment_pair), queries the oracle, and
-    forwards labeled triples to pref_pipe.
+    Receives individual Segment objects from segment_pipe, accumulates them in
+    a circular buffer (mirrors PrefInterface.receive_segments), randomly
+    samples pairs (mirrors PrefInterface.sample_segment_pair), queries the
+    oracle, and forwards labeled triples to preference_pipe.
     """
     sys.stdin = os.fdopen(0)
 
-    cfg = OmegaConf.create(cfg_dict)
+    config = OmegaConf.create(config_dict)
 
-    if cfg.preferences.oracle == "expert":
-        env, expert_model = build_env_and_expert(cfg)
-        env.close()      # only q_net weights are needed for scoring
+    if config.preferences.oracle == "expert":
+        env, expert_model = build_env_and_expert(config)
+        env.close()      # only q_net weights are needed for segment scoring
         interface = ExpertPrefInterface(
             expert_model=expert_model,
-            max_segs=cfg.preferences.max_segs,
-            log_dir=log_dir,
+            max_segs=config.preferences.max_segs,
+            log_dir=log_directory,
         )
     else:
         interface = HumanPrefInterface(
-            max_segs=cfg.preferences.max_segs,
-            log_dir=log_dir,
+            max_segs=config.preferences.max_segs,
+            log_dir=log_directory,
         )
 
-    segments  = []
-    seg_index = 0   # circular buffer write pointer
+    segment_buffer    = []
+    buffer_write_index = 0
 
-    while not stop_event.is_set():
+    while not shutdown_event.is_set():
 
-        # Drain up to 8 new segments from seg_pipe
+        # Drain up to 8 new segments from segment_pipe
         for _ in range(8):
             try:
-                seg = seg_pipe.get(timeout=0.5)
-                if len(segments) < cfg.preferences.max_segs:
-                    segments.append(seg)
+                segment = segment_pipe.get(timeout=0.5)
+                if len(segment_buffer) < config.preferences.max_segs:
+                    segment_buffer.append(segment)
                 else:
-                    segments[seg_index % cfg.preferences.max_segs] = seg
-                    seg_index += 1
+                    segment_buffer[buffer_write_index % config.preferences.max_segs] = segment
+                    buffer_write_index += 1
             except queue.Empty:
                 break
 
-        if len(segments) < 2:
+        if len(segment_buffer) < 2:
             continue
 
-        pair = _sample_pair(segments)
+        pair = _sample_pair(segment_buffer)
         if pair is None:
             continue
 
-        seg1, seg2 = pair
-        pref = interface.ask_user(seg1, seg2)
-        if pref is not None:
-            pref_pipe.put((seg1.frames, seg2.frames, pref))
+        segment_1, segment_2 = pair
+        preference = interface.ask_user(segment_1, segment_2)
+        if preference is not None:
+            preference_pipe.put((segment_1.frames, segment_2.frames, preference))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,106 +422,133 @@ def main(cfg: DictConfig):
     print("\nConfiguration:")
     print(OmegaConf.to_yaml(cfg))
 
-    run_dir     = Path(HydraConfig.get().runtime.output_dir)
-    rp_ckpt_dir = str(run_dir / "reward_predictor_checkpoints")
-    policy_path = str(run_dir / "models" / "policy_christiano.pt")
-    pref_log    = str(run_dir / "pref_interface")
+    run_directory                    = Path(HydraConfig.get().runtime.output_dir)
+    reward_predictor_checkpoint_dir  = str(run_directory / "reward_predictor_checkpoints")
+    policy_checkpoint_path           = str(run_directory / "models" / "policy_christiano.pt")
+    preference_interface_log_dir     = str(run_directory / "pref_interface")
 
-    # ── Communication ─────────────────────────────────────────────────────────
-    seg_pipe    = Queue(maxsize=cfg.preferences.seg_pipe_maxsize)
-    pref_pipe   = Queue()
-    start_event = mp.Event()   # main → policy: rp checkpoint is ready
-    stop_event  = mp.Event()   # main → all:    time to shut down
+    # ── Communication channels ────────────────────────────────────────────────
+    segment_pipe                = Queue(maxsize=cfg.preferences.seg_pipe_maxsize)
+    preference_pipe             = Queue()
+    reward_predictor_ready_event = mp.Event()   # main → policy: reward predictor ready
+    shutdown_event              = mp.Event()    # main → all:    time to stop
 
     # ── Preference databases (owned by main process) ──────────────────────────
-    db_train = PrefDB(maxlen=cfg.preferences.db_train_maxlen)
-    db_val   = PrefDB(maxlen=cfg.preferences.db_val_maxlen)
-    buf = PrefBuffer(db_train, db_val, log_dir=str(run_dir / "pref_buffer"))
-    buf.start_recv_thread(pref_pipe)
+    train_database      = PrefDB(maxlen=cfg.preferences.db_train_maxlen)
+    validation_database = PrefDB(maxlen=cfg.preferences.db_val_maxlen)
+    preference_buffer   = PrefBuffer(
+        train_database,
+        validation_database,
+        log_dir=str(run_directory / "pref_buffer"),
+    )
+    preference_buffer.start_recv_thread(preference_pipe)
 
     # ── Reward predictor (trained in main process) ────────────────────────────
-    tmp_env = build_single_env(cfg)
-    obs_dim = tmp_env.observation_space.shape[0]
-    tmp_env.close()
+    temp_env        = build_single_env(cfg)
+    observation_dim = temp_env.observation_space.shape[0]
+    temp_env.close()
 
-    rp = RewardPredictorEnsemble(
-        core_network=functools.partial(SumoRewardNetwork, obs_dim=obs_dim),
+    reward_predictor = RewardPredictorEnsemble(
+        core_network=functools.partial(SumoRewardNetwork, obs_dim=observation_dim),
         lr=cfg.reward_predictor.lr,
         n_preds=cfg.reward_predictor.n_preds,
-        log_dir=str(run_dir),
+        log_dir=str(run_directory),
         device=cfg.resources.device,
     )
 
     # ── Launch worker processes ───────────────────────────────────────────────
-    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+    config_dict = OmegaConf.to_container(cfg, resolve=True)
 
-    policy_proc = Process(
+    policy_process = Process(
         target=_policy_worker,
-        args=(cfg_dict, seg_pipe, start_event, stop_event,
-              rp_ckpt_dir, policy_path, str(run_dir)),
+        args=(
+            config_dict,
+            segment_pipe,
+            reward_predictor_ready_event,
+            shutdown_event,
+            reward_predictor_checkpoint_dir,
+            policy_checkpoint_path,
+            str(run_directory),
+        ),
     )
-    pref_proc = Process(
-        target=_pref_worker,
-        args=(cfg_dict, seg_pipe, pref_pipe, stop_event, pref_log),
+    preference_process = Process(
+        target=_preference_worker,
+        args=(
+            config_dict,
+            segment_pipe,
+            preference_pipe,
+            shutdown_event,
+            preference_interface_log_dir,
+        ),
     )
 
-    policy_proc.start()
-    pref_proc.start()
+    policy_process.start()
+    preference_process.start()
 
     def _shutdown(*_):
         print("\n[main] Shutting down…", flush=True)
-        stop_event.set()
-        policy_proc.join(timeout=15)
-        pref_proc.join(timeout=15)
-        buf.stop_recv_thread()
-        print(f"[main] Policy saved to {policy_path}")
+        shutdown_event.set()
+        policy_process.join(timeout=15)
+        preference_process.join(timeout=15)
+        preference_buffer.stop_recv_thread()
+        print(f"[main] Policy saved to {policy_checkpoint_path}")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _shutdown)
 
-    # ── Phase 1: collect initial preferences ──────────────────────────────────
-    target = cfg.preferences.initial_prefs
-    print(f"\n[Phase 1] Collecting {target} initial preferences…")
-    with tqdm(total=target, desc="preferences", unit="pref", ncols=80) as pbar:
-        prev = 0
+    # ── Phase 1: collect initial preferences (random/untrained policy) ────────
+    target_preferences = cfg.preferences.initial_prefs
+    print(f"\n[Phase 1] Collecting {target_preferences} initial preferences…")
+    with tqdm(total=target_preferences, desc="preferences", unit="pref", ncols=80) as progress_bar:
+        previous_count = 0
         while True:
-            t_db, v_db = buf.get_dbs()
-            current = len(t_db)
-            if current > prev:
-                pbar.update(current - prev)
-                prev = current
-            if current >= target and len(v_db) > 0:
+            current_train_db, current_val_db = preference_buffer.get_dbs()
+            current_count = len(current_train_db)
+            if current_count > previous_count:
+                progress_bar.update(current_count - previous_count)
+                previous_count = current_count
+            if current_count >= target_preferences and len(current_val_db) > 0:
                 break
             time.sleep(2.0)
-    t_db, v_db = buf.get_dbs()
-    print(f"  Done — train={len(t_db)}, val={len(v_db)}")
+    train_db, val_db = preference_buffer.get_dbs()
+    print(f"  Done — train={len(train_db)}, validation={len(val_db)}")
 
     # ── Phase 2: pretrain reward predictor ────────────────────────────────────
     print("\n[Phase 2] Pretraining reward predictor…")
-    rp.train(t_db, v_db, val_interval=cfg.reward_predictor.val_interval)
-    rp.save()
-    start_event.set()
+    reward_predictor.train(train_db, val_db, val_interval=cfg.reward_predictor.val_interval)
+    reward_predictor.save()
+    reward_predictor_ready_event.set()
     print("  Reward predictor ready — A2C training with predicted rewards unlocked.")
 
     # ── Phase 3: continuous reward predictor retraining ───────────────────────
-    # Mirrors run.py: train as fast as new preferences arrive (no fixed sleep).
-    # Stops after rp_iterations completed retrainings, then shuts down policy.
-    print(f"\n[Phase 3] Reward predictor loop — {cfg.training.rp_iterations} iterations")
+    # Mirrors run.py: retrain as fast as new preferences arrive, no fixed sleep.
+    # Stops after reward_predictor_iterations completed retrainings.
+    print(
+        f"\n[Phase 3] Reward predictor loop — "
+        f"{cfg.training.reward_predictor_iterations} iterations"
+    )
 
-    completed = 0
-    with tqdm(total=cfg.training.rp_iterations, desc="rp iterations", unit="iter", ncols=80) as pbar:
-        while completed < cfg.training.rp_iterations:
-            t_db, v_db = buf.get_dbs()
-            if len(t_db) == 0 or len(v_db) == 0:
-                pbar.set_postfix({"status": "waiting for data"})
+    completed_iterations = 0
+    with tqdm(
+        total=cfg.training.reward_predictor_iterations,
+        desc="rp iterations",
+        unit="iter",
+        ncols=80,
+    ) as progress_bar:
+        while completed_iterations < cfg.training.reward_predictor_iterations:
+            train_db, val_db = preference_buffer.get_dbs()
+            if len(train_db) == 0 or len(val_db) == 0:
+                progress_bar.set_postfix({"status": "waiting for data"})
                 time.sleep(1.0)
                 continue
 
-            rp.train(t_db, v_db, val_interval=cfg.reward_predictor.val_interval)
-            rp.save()
-            completed += 1
-            pbar.set_postfix({"train": len(t_db), "val": len(v_db)})
-            pbar.update(1)
+            reward_predictor.train(
+                train_db, val_db, val_interval=cfg.reward_predictor.val_interval
+            )
+            reward_predictor.save()
+            completed_iterations += 1
+            progress_bar.set_postfix({"train": len(train_db), "val": len(val_db)})
+            progress_bar.update(1)
 
     # ── Shutdown ───────────────────────────────────────────────────────────────
     _shutdown()
