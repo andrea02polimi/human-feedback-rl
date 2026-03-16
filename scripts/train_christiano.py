@@ -67,6 +67,23 @@ from human_feedback_rl.utils.env_setup import build_env_and_expert, build_single
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Checkpoint helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _keep_latest_checkpoints(checkpoint_dir: str, keep: int = 2) -> None:
+    """Delete old reward predictor checkpoints, keeping only the `keep` most recent."""
+    if not os.path.exists(checkpoint_dir):
+        return
+    files = sorted(
+        [f for f in os.listdir(checkpoint_dir)
+         if f.startswith("reward_predictor_") and f.endswith(".pt")],
+        key=lambda f: int(f[len("reward_predictor_"):-len(".pt")]),
+    )
+    for old_file in files[:-keep]:
+        os.remove(os.path.join(checkpoint_dir, old_file))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # A2C helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -141,8 +158,9 @@ def _policy_worker(
     )
     episode_dones = np.zeros(num_envs, dtype=bool)
 
-    # Segment accumulation for environment 0 only (mirrors run.py's Runner)
-    current_segment_frames = []
+    # Per-environment segment accumulators (all envs contribute for better
+    # trajectory diversity — unlike run.py which used env 0 only).
+    current_segment_frames = [[] for _ in range(num_envs)]
 
     rollout_steps         = config.policy.rollout_steps
     discount_factor       = config.policy.gamma
@@ -153,6 +171,7 @@ def _policy_worker(
 
     reward_predictor_ready = False
     training_step          = 0
+    total_policy_steps     = config.training.total_policy_steps   # 0 = unlimited
 
     while not shutdown_event.is_set():
 
@@ -216,17 +235,19 @@ def _policy_worker(
                 next_observations = next_observations[np.newaxis]
             episode_dones = np.asarray(dones_raw, dtype=bool)
 
-            # ── Segment generation (environment 0, mirrors run.py Runner) ─────
-            current_segment_frames.append(current_observations[0].copy())
-            if len(current_segment_frames) >= segment_length or episode_dones[0]:
-                while len(current_segment_frames) < segment_length:
-                    current_segment_frames.append(current_segment_frames[-1].copy())
-                completed_segment = Segment(current_segment_frames[:segment_length])
-                try:
-                    segment_pipe.put(completed_segment, block=False)
-                except Exception:
-                    pass
-                current_segment_frames = []
+            # ── Segment generation (all environments) ─────────────────────────
+            for env_idx in range(num_envs):
+                current_segment_frames[env_idx].append(current_observations[env_idx].copy())
+                if len(current_segment_frames[env_idx]) >= segment_length or episode_dones[env_idx]:
+                    frames = current_segment_frames[env_idx]
+                    while len(frames) < segment_length:
+                        frames.append(frames[-1].copy())
+                    completed_segment = Segment(frames[:segment_length])
+                    try:
+                        segment_pipe.put(completed_segment, block=False)
+                    except Exception:
+                        pass
+                    current_segment_frames[env_idx] = []
 
             current_observations = next_observations
 
@@ -322,6 +343,9 @@ def _policy_worker(
             )
 
         training_step += 1
+        if total_policy_steps > 0 and training_step >= total_policy_steps:
+            shutdown_event.set()
+            break
 
     # Final checkpoint before exit
     checkpoint_path = Path(policy_checkpoint_path)
@@ -343,20 +367,65 @@ def _sample_pair(segment_buffer):
     return segment_buffer[first_index], segment_buffer[second_index]
 
 
+def _disagreement_score(segment, reward_predictor):
+    """
+    Variance of per-ensemble-member total segment rewards.
+
+    Higher variance means the ensemble members disagree more about the value of
+    the segment — these are the most informative pairs to label (Section 3.2 of
+    Christiano et al.).
+    """
+    frames = np.array(segment.frames, dtype=np.float32)  # (segment_len, obs_dim)
+    raw    = reward_predictor.raw_rewards(frames)         # (n_preds, segment_len)
+    member_totals = raw.sum(axis=-1).flatten()            # (n_preds,)
+    return float(np.var(member_totals))
+
+
+def _sample_pair_by_disagreement(segment_buffer, reward_predictor, n_candidates: int):
+    """
+    Return the segment pair with highest ensemble disagreement from n_candidates
+    random candidates (Christiano et al. Section 3.2).
+
+    Disagreement is the sum of per-segment variances across ensemble members.
+    Pairs on which the ensemble disagrees most are the most informative to label.
+    Falls back to the best pair found even if disagreement is zero (untrained RP).
+    """
+    if len(segment_buffer) < 2:
+        return None
+    best_pair  = None
+    best_score = -1.0
+    for _ in range(n_candidates):
+        i, j   = random.sample(range(len(segment_buffer)), 2)
+        seg_a, seg_b = segment_buffer[i], segment_buffer[j]
+        score  = _disagreement_score(seg_a, reward_predictor) + _disagreement_score(seg_b, reward_predictor)
+        if score > best_score:
+            best_score = score
+            best_pair  = (seg_a, seg_b)
+    return best_pair
+
+
 def _preference_worker(
     config_dict,
     segment_pipe,
     preference_pipe,
+    reward_predictor_ready_event,
     shutdown_event,
+    reward_predictor_checkpoint_dir,
     log_directory,
 ):
     """
     Subprocess responsible for labeling segment pairs.
 
     Receives individual Segment objects from segment_pipe, accumulates them in
-    a circular buffer (mirrors PrefInterface.receive_segments), randomly
-    samples pairs (mirrors PrefInterface.sample_segment_pair), queries the
-    oracle, and forwards labeled triples to preference_pipe.
+    a circular buffer, then:
+      • Before the reward predictor is ready: samples pairs randomly.
+      • After the reward predictor is ready: samples the highest-disagreement
+        pair from `disagreement_candidates` random candidates (Section 3.2 of
+        Christiano et al.) and reloads the latest RP checkpoint periodically.
+
+    Query annealing: after `initial_prefs` labels the inter-query sleep grows
+    linearly so that the RL policy has time to explore before being judged
+    (Christiano et al. Section 3.2).
     """
     sys.stdin = os.fdopen(0)
 
@@ -364,6 +433,7 @@ def _preference_worker(
 
     if config.preferences.oracle == "expert":
         env, expert_model = build_env_and_expert(config)
+        observation_dim   = env.observation_space.shape[0]
         env.close()      # only q_net weights are needed for segment scoring
         interface = ExpertPrefInterface(
             expert_model=expert_model,
@@ -371,15 +441,45 @@ def _preference_worker(
             log_dir=log_directory,
         )
     else:
+        env = build_single_env(config)
+        observation_dim = env.observation_space.shape[0]
+        env.close()
         interface = HumanPrefInterface(
             max_segs=config.preferences.max_segs,
             log_dir=log_directory,
         )
 
-    segment_buffer    = []
+    # Inference-only reward predictor for disagreement-based pair selection.
+    # Weights come from checkpoints saved by the main process — never trained here.
+    rp_for_disagreement = RewardPredictorEnsemble(
+        core_network=functools.partial(SumoRewardNetwork, obs_dim=observation_dim),
+        log_dir=None,
+        device=config.resources.device,
+    )
+    rp_loaded = False
+
+    segment_buffer     = []
     buffer_write_index = 0
+    total_labeled      = 0
 
     while not shutdown_event.is_set():
+
+        # ── Load / refresh reward predictor for disagreement scoring ──────────
+        if not rp_loaded and reward_predictor_ready_event.is_set():
+            latest = RewardPredictorEnsemble.latest_checkpoint(reward_predictor_checkpoint_dir)
+            if latest:
+                try:
+                    rp_for_disagreement.load(latest)
+                    rp_loaded = True
+                except Exception:
+                    pass
+        elif rp_loaded and total_labeled % 50 == 0 and total_labeled > 0:
+            latest = RewardPredictorEnsemble.latest_checkpoint(reward_predictor_checkpoint_dir)
+            if latest:
+                try:
+                    rp_for_disagreement.load(latest)
+                except Exception:
+                    pass
 
         # Drain up to 8 new segments from segment_pipe
         for _ in range(8):
@@ -396,7 +496,16 @@ def _preference_worker(
         if len(segment_buffer) < 2:
             continue
 
-        pair = _sample_pair(segment_buffer)
+        # Disagreement-based selection when RP available, random otherwise
+        if rp_loaded:
+            pair = _sample_pair_by_disagreement(
+                segment_buffer,
+                rp_for_disagreement,
+                n_candidates=config.preferences.disagreement_candidates,
+            )
+        else:
+            pair = _sample_pair(segment_buffer)
+
         if pair is None:
             continue
 
@@ -404,6 +513,18 @@ def _preference_worker(
         preference = interface.ask_user(segment_1, segment_2)
         if preference is not None:
             preference_pipe.put((segment_1.frames, segment_2.frames, preference))
+            total_labeled += 1
+
+            # Query annealing: slow down after the initial burst so the RL
+            # policy has time to explore before more segments are judged.
+            if total_labeled > config.preferences.initial_prefs:
+                excess   = total_labeled - config.preferences.initial_prefs
+                sleep_s  = min(
+                    config.preferences.max_query_interval,
+                    config.preferences.query_annealing_rate * excess,
+                )
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -477,7 +598,9 @@ def main(cfg: DictConfig):
             config_dict,
             segment_pipe,
             preference_pipe,
+            reward_predictor_ready_event,
             shutdown_event,
+            reward_predictor_checkpoint_dir,
             preference_interface_log_dir,
         ),
     )
@@ -517,6 +640,7 @@ def main(cfg: DictConfig):
     print("\n[Phase 2] Pretraining reward predictor…")
     reward_predictor.train(train_db, val_db, val_interval=cfg.reward_predictor.val_interval)
     reward_predictor.save()
+    _keep_latest_checkpoints(reward_predictor_checkpoint_dir)
     reward_predictor_ready_event.set()
     print("  Reward predictor ready — A2C training with predicted rewards unlocked.")
 
@@ -535,7 +659,10 @@ def main(cfg: DictConfig):
         unit="iter",
         ncols=80,
     ) as progress_bar:
-        while completed_iterations < cfg.training.reward_predictor_iterations:
+        while (
+            not shutdown_event.is_set()
+            and completed_iterations < cfg.training.reward_predictor_iterations
+        ):
             train_db, val_db = preference_buffer.get_dbs()
             if len(train_db) == 0 or len(val_db) == 0:
                 progress_bar.set_postfix({"status": "waiting for data"})
@@ -546,6 +673,7 @@ def main(cfg: DictConfig):
                 train_db, val_db, val_interval=cfg.reward_predictor.val_interval
             )
             reward_predictor.save()
+            _keep_latest_checkpoints(reward_predictor_checkpoint_dir)
             completed_iterations += 1
             progress_bar.set_postfix({"train": len(train_db), "val": len(val_db)})
             progress_bar.update(1)

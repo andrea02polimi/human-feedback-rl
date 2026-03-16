@@ -10,33 +10,52 @@ resources:
 # ── Reward predictor ensemble (Christiano et al.) ────────────────────────────
 reward_predictor:
   lr: 2e-4
-  n_preds: 3          # ensemble size (paper: 3)
-  val_interval: 50    # steps between validation-loss logs
+  n_preds: 3          # ensemble size (paper uses 3)
+  val_interval: 50    # reward predictor training steps between validation logs
 
 # ── Preferences ───────────────────────────────────────────────────────────────
 preferences:
   oracle: "expert"        # "expert" → DQN synthetic | "human" → terminal L/R/E/S
-  initial_prefs: 200      # preferences collected before pretraining the reward predictor
+  initial_prefs: 500      # labeled pairs collected before pretraining (paper: 500)
   segment_len: 25         # steps per trajectory segment (paper default)
   max_segs: 1000          # max segments kept in preference-worker buffer
-  db_train_maxlen: 3000
-  db_val_maxlen: 750
+  db_train_maxlen: 3000   # max labeled pairs in training database
+  db_val_maxlen: 750      # max labeled pairs in validation database (~20%)
   seg_pipe_maxsize: 100   # individual segments buffered between processes
+  disagreement_candidates: 20   # candidate pairs evaluated per disagreement selection
+  query_annealing_rate: 0.002   # seconds added per label after the initial burst
+  max_query_interval: 5.0       # cap on inter-query sleep (seconds)
 
 # ── Policy (A2C — algorithm used in the paper) ────────────────────────────────
 policy:
   lr: 7e-4              # A2C learning rate
   gamma: 0.99           # discount factor
-  rollout_steps: 20     # steps collected per A2C update
-  entropy_coef: 0.01    # entropy bonus coefficient
-  value_coef: 0.5       # value loss coefficient
+  rollout_steps: 20     # environment steps collected per A2C update
+  entropy_coef: 0.01    # entropy bonus (encourages exploration)
+  value_coef: 0.5       # weight of the critic loss
   max_gradient_norm: 0.5
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 training:
-  reward_predictor_iterations: 500     # total reward predictor retrainings
-  reward_predictor_reload_interval: 10 # reload reward predictor checkpoint every N policy steps
-  policy_save_interval: 100            # save policy checkpoint every N A2C steps
+  # Each reward_predictor_iterations does a full pass over the preference DB.
+  # With ~3000 preferences at batch_size=32 this takes a few seconds on CPU.
+  # 500 iterations ≈ 30-60 minutes total training time.
+  # Safety cap on reward predictor retrainings (set high — training is driven
+  # by total_policy_steps, not by this counter).
+  reward_predictor_iterations: 10000
+
+  # How often the policy worker reloads the latest reward predictor checkpoint.
+  # 100 A2C steps × 20 rollout_steps × 4 envs = 8000 env steps between reloads.
+  reward_predictor_reload_interval: 50
+
+  # Save a policy checkpoint to disk every N A2C gradient steps.
+  policy_save_interval: 100
+
+  # Primary stop condition: training ends when the policy has completed this
+  # many A2C gradient steps (after the reward predictor becomes available).
+  # ~200 steps/min on CPU → 3000 steps ≈ 15 min of A2C training after Phase 2.
+  # Set to 0 to use reward_predictor_iterations as the stop condition instead.
+  total_policy_steps: 10000
 
 hydra:
   run:
