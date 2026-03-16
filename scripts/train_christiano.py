@@ -160,7 +160,8 @@ def _policy_worker(
 
     # Per-environment segment accumulators (all envs contribute for better
     # trajectory diversity — unlike run.py which used env 0 only).
-    current_segment_frames = [[] for _ in range(num_envs)]
+    current_segment_frames  = [[] for _ in range(num_envs)]
+    current_segment_rewards = [[] for _ in range(num_envs)]
 
     rollout_steps         = config.policy.rollout_steps
     discount_factor       = config.policy.gamma
@@ -227,27 +228,33 @@ def _policy_worker(
             rollout_values.append(state_values.numpy())
             rollout_dones.append(episode_dones.copy())
 
-            next_observations_raw, _env_rewards, dones_raw, _ = env.step(
+            next_observations_raw, env_rewards_raw, dones_raw, _ = env.step(
                 sampled_actions.numpy()
             )
             next_observations = np.asarray(next_observations_raw)
             if next_observations.ndim == 1:
                 next_observations = next_observations[np.newaxis]
             episode_dones = np.asarray(dones_raw, dtype=bool)
+            env_rewards   = np.asarray(env_rewards_raw, dtype=np.float32)  # (num_envs,)
 
             # ── Segment generation (all environments) ─────────────────────────
             for env_idx in range(num_envs):
                 current_segment_frames[env_idx].append(current_observations[env_idx].copy())
+                current_segment_rewards[env_idx].append(float(env_rewards[env_idx]))
                 if len(current_segment_frames[env_idx]) >= segment_length or episode_dones[env_idx]:
-                    frames = current_segment_frames[env_idx]
+                    frames  = current_segment_frames[env_idx]
+                    rewards = current_segment_rewards[env_idx]
                     while len(frames) < segment_length:
                         frames.append(frames[-1].copy())
+                        rewards.append(0.0)
                     completed_segment = Segment(frames[:segment_length])
+                    completed_segment.env_rewards = rewards[:segment_length]
                     try:
                         segment_pipe.put(completed_segment, block=False)
                     except Exception:
                         pass
-                    current_segment_frames[env_idx] = []
+                    current_segment_frames[env_idx]  = []
+                    current_segment_rewards[env_idx] = []
 
             current_observations = next_observations
 
@@ -432,11 +439,23 @@ def _preference_worker(
     config = OmegaConf.create(config_dict)
 
     if config.preferences.oracle == "expert":
-        env, expert_model = build_env_and_expert(config)
-        observation_dim   = env.observation_space.shape[0]
-        env.close()      # only q_net weights are needed for segment scoring
+        # Oracle uses true environment rewards (seg.env_rewards) — no DQN needed.
+        # To re-enable q-net scoring, uncomment the block below and comment out
+        # the two lines that follow it.
+        # ── Q-net oracle (DQN expert) — disabled ──────────────────────────────
+        # env, expert_model = build_env_and_expert(config)
+        # observation_dim   = env.observation_space.shape[0]
+        # env.close()
+        # interface = ExpertPrefInterface(
+        #     expert_model=expert_model,
+        #     max_segs=config.preferences.max_segs,
+        #     log_dir=log_directory,
+        # )
+        # ── Env-reward oracle (current) ───────────────────────────────────────
+        env = build_single_env(config)
+        observation_dim = env.observation_space.shape[0]
+        env.close()
         interface = ExpertPrefInterface(
-            expert_model=expert_model,
             max_segs=config.preferences.max_segs,
             log_dir=log_directory,
         )
