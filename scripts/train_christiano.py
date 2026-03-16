@@ -29,7 +29,7 @@ Communication:
                                   main → all     (time to stop)
   filesystem                  : reward_predictor_checkpoints/
                                   main → policy  (reward predictor weights)
-                                models/policy_christiano.pt
+                                models/policy_christiano.zip
                                   policy → eval / play
 """
 
@@ -47,11 +47,9 @@ from pathlib import Path
 import hydra
 import numpy as np
 import torch
-import torch.nn.functional as F
-import torch.optim as optim
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.tensorboard import SummaryWriter
+from stable_baselines3 import A2C as SB3A2C
 from tqdm import tqdm
 
 from learning_from_human_preferences.preferences.pref_db import PrefDB, PrefBuffer, Segment
@@ -59,10 +57,13 @@ from learning_from_human_preferences.reward_model.reward_predictor import (
     RewardPredictorEnsemble,
 )
 
-from human_feedback_rl.agents.policy_network import AgentPolicyNetwork
 from human_feedback_rl.christiano.expert_pref_interface import ExpertPrefInterface
 from human_feedback_rl.christiano.human_pref_interface import HumanPrefInterface
 from human_feedback_rl.christiano.reward_network import SumoRewardNetwork
+from human_feedback_rl.christiano.sb3_components import (
+    PredictedRewardVecWrapper,
+    SegmentCollectorCallback,
+)
 from human_feedback_rl.utils.env_setup import build_env_and_expert, build_single_env
 
 
@@ -84,27 +85,7 @@ def _keep_latest_checkpoints(checkpoint_dir: str, keep: int = 2) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# A2C helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _discount_with_dones(rewards, dones, discount_factor: float):
-    """
-    Compute discounted returns with episode-end masking.
-
-    When the last step did NOT end the episode, the caller should append the
-    bootstrap value to `rewards` and 0 to `dones`, then drop the last element
-    of the returned list.
-    """
-    returns = []
-    cumulative_return = 0.0
-    for reward, done in zip(reversed(rewards), reversed(dones)):
-        cumulative_return = reward + discount_factor * cumulative_return * (1.0 - float(done))
-        returns.append(cumulative_return)
-    return returns[::-1]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Worker: A2C policy training + segment generation
+# Worker: SB3 A2C policy training + segment generation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _policy_worker(
@@ -118,252 +99,146 @@ def _policy_worker(
     shared_env_steps,
 ):
     """
-    Subprocess responsible for:
-      1. Running A2C rollouts and sending individual Segment objects to
-         segment_pipe so that the preference process can label them.
-      2. Updating the policy with PREDICTED rewards from the reward predictor
-         — never with environment rewards (the paper assumes the environment
-         reward is unknown).  Policy gradient updates are skipped entirely
-         until reward_predictor_ready_event is set and a checkpoint is
-         available.
+    Subprocess responsible for policy training via SB3 A2C.
+
+    Phase 1 (before RP ready):
+      Runs random-action rollouts to generate Segment objects for initial
+      preference collection.  No gradient updates — the paper requires no RL
+      training before the reward predictor is pretrained.
+
+    Phase 2+ (after RP ready):
+      Wraps the VecEnv with PredictedRewardVecWrapper so SB3 A2C trains on
+      predicted rewards only (env rewards never exposed to the policy).
+      SegmentCollectorCallback handles segment generation, RP reloading,
+      checkpoint saving, and shared_env_steps updates.
     """
     config = OmegaConf.create(config_dict)
 
     env, _ = build_env_and_expert(config)
 
-    initial_observations = np.asarray(env.reset())
-    num_envs        = initial_observations.shape[0] if initial_observations.ndim > 1 else 1
-    observation_dim = initial_observations.shape[-1]
-    num_actions     = env.action_space.n
+    initial_obs     = np.asarray(env.reset())
+    num_envs        = initial_obs.shape[0] if initial_obs.ndim > 1 else 1
+    observation_dim = initial_obs.shape[-1]
 
-    policy    = AgentPolicyNetwork(observation_dim, num_actions)
-    optimizer = optim.Adam(policy.parameters(), lr=config.policy.lr)
-
-    # Inference-only reward predictor in this process (no checkpoint writes,
-    # no TensorBoard).  Rewards produced by reward_predictor.reward() are
-    # normalised to zero mean and constant standard deviation (× 0.05) as
-    # described in Section 2.3 of Christiano et al.
     reward_predictor = RewardPredictorEnsemble(
         core_network=functools.partial(SumoRewardNetwork, obs_dim=observation_dim),
         log_dir=None,
         device=config.resources.device,
     )
 
-    writer = SummaryWriter(os.path.join(log_directory, "policy"))
+    segment_length          = config.preferences.segment_len
+    total_env_steps_target  = config.training.total_env_steps
 
-    # Current observations: shape (num_envs, observation_dim)
-    current_observations = (
-        initial_observations
-        if initial_observations.ndim > 1
-        else initial_observations[np.newaxis]
-    )
-    episode_dones = np.zeros(num_envs, dtype=bool)
+    # ── Phase 1: random rollouts for segment generation (no A2C updates) ──────
+    print("[policy] Phase 1 — generating segments with random policy…", flush=True)
 
-    # Per-environment segment accumulators (all envs contribute for better
-    # trajectory diversity — unlike run.py which used env 0 only).
+    current_obs             = initial_obs if initial_obs.ndim > 1 else initial_obs[np.newaxis]
     current_segment_frames  = [[] for _ in range(num_envs)]
     current_segment_rewards = [[] for _ in range(num_envs)]
+    total_env_steps_phase1  = 0
 
-    rollout_steps         = config.policy.rollout_steps
-    discount_factor       = config.policy.gamma
-    entropy_coefficient   = config.policy.entropy_coef
-    value_coefficient     = config.policy.value_coef
-    max_gradient_norm     = config.policy.max_gradient_norm
-    segment_length        = config.preferences.segment_len
+    while not reward_predictor_ready_event.is_set() and not shutdown_event.is_set():
+        actions  = np.array([env.action_space.sample() for _ in range(num_envs)])
+        next_obs_raw, env_rewards_raw, dones_raw, _ = env.step(actions)
+        next_obs    = np.asarray(next_obs_raw)
+        if next_obs.ndim == 1:
+            next_obs = next_obs[np.newaxis]
+        dones       = np.asarray(dones_raw, dtype=bool)
+        env_rewards = np.asarray(env_rewards_raw, dtype=np.float32)
 
-    reward_predictor_ready  = False
-    training_step           = 0   # A2C gradient steps (used for reload/save intervals)
-    total_env_steps_taken   = 0
-    total_env_steps_target  = config.training.total_env_steps     # 0 = unlimited
+        total_env_steps_phase1 += num_envs
+        shared_env_steps.value  = total_env_steps_phase1
 
-    while not shutdown_event.is_set():
-
-        # ── Load / refresh reward predictor ───────────────────────────────────
-        if not reward_predictor_ready and reward_predictor_ready_event.is_set():
-            latest_checkpoint = RewardPredictorEnsemble.latest_checkpoint(
-                reward_predictor_checkpoint_dir
-            )
-            if latest_checkpoint:
+        for env_idx in range(num_envs):
+            current_segment_frames[env_idx].append(current_obs[env_idx].copy())
+            current_segment_rewards[env_idx].append(float(env_rewards[env_idx]))
+            if (
+                len(current_segment_frames[env_idx]) >= segment_length
+                or dones[env_idx]
+            ):
+                frames  = current_segment_frames[env_idx]
+                rewards = current_segment_rewards[env_idx]
+                while len(frames) < segment_length:
+                    frames.append(frames[-1].copy())
+                    rewards.append(0.0)
+                seg = Segment(frames[:segment_length])
+                seg.env_rewards = rewards[:segment_length]
                 try:
-                    reward_predictor.load(latest_checkpoint)
-                    reward_predictor_ready = True
-                    print(
-                        "[policy] reward predictor loaded — "
-                        "A2C training with predicted rewards started.",
-                        flush=True,
-                    )
-                except Exception as error:
-                    print(f"[policy] reward predictor load failed: {error}", flush=True)
-
-        if (
-            reward_predictor_ready
-            and training_step % config.training.reward_predictor_reload_interval == 0
-            and training_step > 0
-        ):
-            latest_checkpoint = RewardPredictorEnsemble.latest_checkpoint(
-                reward_predictor_checkpoint_dir
-            )
-            if latest_checkpoint:
-                try:
-                    reward_predictor.load(latest_checkpoint)
+                    segment_pipe.put(seg, block=False)
                 except Exception:
                     pass
+                current_segment_frames[env_idx]  = []
+                current_segment_rewards[env_idx] = []
 
-        # ── Collect rollout_steps of experience ───────────────────────────────
-        rollout_observations = []   # (rollout_steps, num_envs, observation_dim)
-        rollout_actions      = []   # (rollout_steps, num_envs)
-        rollout_values       = []   # (rollout_steps, num_envs)
-        rollout_dones        = []   # (rollout_steps, num_envs)
+        current_obs = next_obs
 
-        for _ in range(rollout_steps):
-            observations_tensor = torch.as_tensor(
-                current_observations, dtype=torch.float32
-            )
-            with torch.no_grad():
-                action_logits, state_values = policy(observations_tensor)
+    if shutdown_event.is_set():
+        env.close()
+        return
 
-            action_distribution = torch.distributions.Categorical(logits=action_logits)
-            sampled_actions     = action_distribution.sample()
+    # ── Phase 2+: RP ready — SB3 A2C with predicted rewards ──────────────────
+    latest = RewardPredictorEnsemble.latest_checkpoint(reward_predictor_checkpoint_dir)
+    if latest:
+        reward_predictor.load(latest)
 
-            rollout_observations.append(current_observations.copy())
-            rollout_actions.append(sampled_actions.numpy())
-            rollout_values.append(state_values.numpy())
-            rollout_dones.append(episode_dones.copy())
+    wrapped_env = PredictedRewardVecWrapper(
+        env, reward_predictor, reward_predictor_ready_event
+    )
 
-            next_observations_raw, env_rewards_raw, dones_raw, _ = env.step(
-                sampled_actions.numpy()
-            )
-            next_observations = np.asarray(next_observations_raw)
-            if next_observations.ndim == 1:
-                next_observations = next_observations[np.newaxis]
-            episode_dones           = np.asarray(dones_raw, dtype=bool)
-            env_rewards             = np.asarray(env_rewards_raw, dtype=np.float32)  # (num_envs,)
-            total_env_steps_taken  += num_envs
-            shared_env_steps.value  = total_env_steps_taken
+    remaining_steps = (
+        max(1, total_env_steps_target - total_env_steps_phase1)
+        if total_env_steps_target > 0
+        else int(1e9)
+    )
 
-            # ── Segment generation (all environments) ─────────────────────────
-            for env_idx in range(num_envs):
-                current_segment_frames[env_idx].append(current_observations[env_idx].copy())
-                current_segment_rewards[env_idx].append(float(env_rewards[env_idx]))
-                if len(current_segment_frames[env_idx]) >= segment_length or episode_dones[env_idx]:
-                    frames  = current_segment_frames[env_idx]
-                    rewards = current_segment_rewards[env_idx]
-                    while len(frames) < segment_length:
-                        frames.append(frames[-1].copy())
-                        rewards.append(0.0)
-                    completed_segment = Segment(frames[:segment_length])
-                    completed_segment.env_rewards = rewards[:segment_length]
-                    try:
-                        segment_pipe.put(completed_segment, block=False)
-                    except Exception:
-                        pass
-                    current_segment_frames[env_idx]  = []
-                    current_segment_rewards[env_idx] = []
+    callback = SegmentCollectorCallback(
+        segment_pipe=segment_pipe,
+        segment_length=segment_length,
+        n_envs=num_envs,
+        shutdown_event=shutdown_event,
+        reward_predictor_ready_event=reward_predictor_ready_event,
+        reward_predictor_wrapper=wrapped_env,
+        reward_predictor_checkpoint_dir=reward_predictor_checkpoint_dir,
+        reload_interval=config.training.reward_predictor_reload_interval,
+        save_interval=config.training.policy_save_interval,
+        policy_checkpoint_path=policy_checkpoint_path,
+        shared_env_steps=shared_env_steps,
+        env_steps_offset=total_env_steps_phase1,
+    )
 
-            current_observations = next_observations
+    a2c = SB3A2C(
+        "MlpPolicy",
+        wrapped_env,
+        learning_rate=config.policy.lr,
+        gamma=config.policy.gamma,
+        n_steps=config.policy.rollout_steps,
+        ent_coef=config.policy.entropy_coef,
+        vf_coef=config.policy.value_coef,
+        max_grad_norm=config.policy.max_gradient_norm,
+        policy_kwargs={"net_arch": [64, 64]},
+        tensorboard_log=log_directory,
+        device=config.resources.device,
+        verbose=0,
+    )
 
-        # ── A2C update — skipped until reward predictor is ready ──────────────
-        # The paper assumes the environment reward is unknown.  Policy gradient
-        # updates only start once the reward predictor has been pretrained.
-        if not reward_predictor_ready:
-            continue
+    print("[policy] SB3 A2C started — training with predicted rewards.", flush=True)
 
-        # ── Replace env rewards with normalised predicted rewards ─────────────
-        # reward_predictor.reward() normalises rewards to zero mean and constant
-        # standard deviation (scaled by 0.05) using running statistics, as
-        # described in Section 2.3 of Christiano et al. (2017).
-        observations_array = np.stack(rollout_observations, axis=0)   # (T, N, obs_dim)
-        flat_observations  = observations_array.reshape(-1, observation_dim)
-        predicted_rewards  = reward_predictor.reward(flat_observations)   # (T*N,)
-        if not np.all(np.isfinite(predicted_rewards)):
-            predicted_rewards = np.zeros_like(predicted_rewards)
-        predicted_rewards_grid = predicted_rewards.reshape(rollout_steps, num_envs)
+    a2c.learn(
+        total_timesteps=remaining_steps,
+        callback=callback,
+        tb_log_name="policy",
+        reset_num_timesteps=True,
+    )
 
-        # ── Bootstrap last state value ────────────────────────────────────────
-        with torch.no_grad():
-            _, last_state_values = policy(
-                torch.as_tensor(current_observations, dtype=torch.float32)
-            )
-        last_state_values_np = last_state_values.numpy()   # (num_envs,)
-
-        dones_array = np.stack(rollout_dones, axis=0)      # (rollout_steps, num_envs)
-
-        # ── Discounted returns per environment (mirrors run.py Runner.run) ────
-        discounted_returns = np.zeros((rollout_steps, num_envs), dtype=np.float32)
-        for env_index in range(num_envs):
-            rewards_for_env = predicted_rewards_grid[:, env_index].tolist()
-            dones_for_env   = dones_array[:, env_index].tolist()
-            if not dones_for_env[-1]:
-                rewards_for_env = rewards_for_env + [float(last_state_values_np[env_index])]
-                dones_for_env   = dones_for_env   + [0]
-                discounted_returns[:, env_index] = _discount_with_dones(
-                    rewards_for_env, dones_for_env, discount_factor
-                )[:-1]
-            else:
-                discounted_returns[:, env_index] = _discount_with_dones(
-                    rewards_for_env, dones_for_env, discount_factor
-                )
-
-        # ── A2C loss = policy loss + value loss − entropy bonus ───────────────
-        flat_observations_tensor = torch.as_tensor(
-            observations_array.reshape(-1, observation_dim), dtype=torch.float32
-        )
-        flat_actions_tensor  = torch.as_tensor(
-            np.concatenate(rollout_actions), dtype=torch.long
-        )
-        flat_returns_tensor  = torch.as_tensor(
-            discounted_returns.flatten(), dtype=torch.float32
-        )
-        flat_values_tensor   = torch.as_tensor(
-            np.concatenate(rollout_values), dtype=torch.float32
-        )
-
-        advantages = (flat_returns_tensor - flat_values_tensor).detach()
-
-        new_logits, new_values = policy(flat_observations_tensor)
-        action_distribution    = torch.distributions.Categorical(logits=new_logits)
-        log_probabilities      = action_distribution.log_prob(flat_actions_tensor)
-        entropy                = action_distribution.entropy().mean()
-
-        policy_loss = -(log_probabilities * advantages).mean()
-        value_loss  = F.mse_loss(new_values, flat_returns_tensor)
-        total_loss  = policy_loss + value_coefficient * value_loss - entropy_coefficient * entropy
-
-        if torch.isfinite(total_loss):
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_gradient_norm)
-            optimizer.step()
-
-        # ── TensorBoard ───────────────────────────────────────────────────────
-        writer.add_scalar("policy/policy_loss",  policy_loss.item(),                   training_step)
-        writer.add_scalar("policy/value_loss",   value_loss.item(),                    training_step)
-        writer.add_scalar("policy/entropy",      entropy.item(),                       training_step)
-        writer.add_scalar("policy/avg_return",   float(discounted_returns.mean()),     training_step)
-
-        if training_step % config.training.policy_save_interval == 0:
-            checkpoint_path = Path(policy_checkpoint_path)
-            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(policy.state_dict(), checkpoint_path)
-            print(
-                f"[policy] gradient_step={training_step}"
-                f"  env_steps={total_env_steps_taken}"
-                f"  avg_return={discounted_returns.mean():.3f}"
-                f"  policy_loss={policy_loss.item():.4f}"
-                f"  value_loss={value_loss.item():.4f}",
-                flush=True,
-            )
-
-        training_step += 1
-        if total_env_steps_target > 0 and total_env_steps_taken >= total_env_steps_target:
-            shutdown_event.set()
-            break
-
-    # Final checkpoint before exit
+    # Save final policy checkpoint (SB3 format, adds .zip automatically).
     checkpoint_path = Path(policy_checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(policy.state_dict(), checkpoint_path)
-    writer.close()
+    a2c.save(str(checkpoint_path))
+    print(f"[policy] Policy saved to {checkpoint_path}.zip", flush=True)
+
+    if not shutdown_event.is_set():
+        shutdown_event.set()
+
     env.close()
 
 
@@ -576,7 +451,7 @@ def main(cfg: DictConfig):
 
     run_directory                    = Path(HydraConfig.get().runtime.output_dir)
     reward_predictor_checkpoint_dir  = str(run_directory / "reward_predictor_checkpoints")
-    policy_checkpoint_path           = str(run_directory / "models" / "policy_christiano.pt")
+    policy_checkpoint_path           = str(run_directory / "models" / "policy_christiano")
     preference_interface_log_dir     = str(run_directory / "pref_interface")
 
     # ── Communication channels ────────────────────────────────────────────────

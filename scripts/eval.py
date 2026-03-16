@@ -4,20 +4,19 @@ Evaluate a policy trained with train_christiano.py.
 Usage:
     python scripts/eval.py \
         run.dir=experiments/christiano/2026-03-15/16-45-23 \
-        agent.model=experiments/christiano/2026-03-15/16-45-23/models/policy_christiano.pt
+        agent.model=experiments/christiano/2026-03-15/16-45-23/models/policy_christiano
 
     # override number of evaluation episodes
     python scripts/eval.py run.dir=... eval.episodes=100
 """
 
 import hydra
-import torch
 from tqdm import tqdm
 from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
 
 import sumo_rl_ego as sre
-from human_feedback_rl.agents.policy_network import AgentPolicyNetwork
+from stable_baselines3 import A2C as SB3A2C
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -49,10 +48,7 @@ def _run_episodes(env, policy, episodes: int):
         terminated = truncated = False
 
         while not (terminated or truncated):
-            state = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
-            with torch.no_grad():
-                logits, _ = policy(state)   # actor-critic: unpack (logits, values)
-            action = torch.argmax(logits, dim=1).item()
+            action, _ = policy.predict(obs, deterministic=True)
             obs, _, terminated, truncated, _ = env.step(action)
 
 
@@ -79,17 +75,11 @@ def main(cfg: DictConfig):
     # ── Build single (non-vectorized) environment ─────────────────────────────
     env = sre.make_env(train_cfg.env.scenario, seed=train_cfg.seed)
 
-    obs_dim   = env.observation_space.shape[0]
-    n_actions = env.action_space.n
-
-    # ── Load policy ───────────────────────────────────────────────────────────
-    policy = AgentPolicyNetwork(obs_dim, n_actions)
-
+    # ── Load policy (SB3 A2C .zip format) ────────────────────────────────────
     agent_path = PROJECT_ROOT / cfg.agent.model
     print(f"[eval] Policy path  : {agent_path}")
 
-    policy.load_state_dict(torch.load(agent_path, map_location="cpu"))
-    policy.eval()
+    policy = SB3A2C.load(str(agent_path), device="cpu")
 
     # ── Run evaluation ────────────────────────────────────────────────────────
     _run_episodes(env, policy, cfg.eval.episodes)

@@ -3,7 +3,7 @@ Visualise a policy trained with train_christiano.py in the SUMO GUI.
 
 Usage:
     python scripts/play.py \
-        agent.model=experiments/christiano/2026-03-15/HH-MM-SS/models/policy_christiano.pt \
+        agent.model=experiments/christiano/2026-03-15/HH-MM-SS/models/policy_christiano \
         run.dir=experiments/christiano/2026-03-15/HH-MM-SS
 
 Optional overrides:
@@ -15,13 +15,12 @@ Optional overrides:
 import time
 
 import hydra
-import torch
 import traci
 from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
 
 import sumo_rl_ego as sre
-from human_feedback_rl.agents.policy_network import AgentPolicyNetwork
+from stable_baselines3 import A2C as SB3A2C
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="play.yaml")
@@ -41,14 +40,9 @@ def main(cfg: DictConfig):
 
     env = sre.make_env(train_cfg.env.scenario, seed=train_cfg.seed, use_gui=True)
 
-    obs_dim   = env.observation_space.shape[0]
-    n_actions = env.action_space.n
-
-    # ── Load policy ───────────────────────────────────────────────────────────
-    policy = AgentPolicyNetwork(obs_dim, n_actions)
+    # ── Load policy (SB3 A2C .zip format) ────────────────────────────────────
     agent_path = PROJECT_ROOT / cfg.agent.model
-    policy.load_state_dict(torch.load(agent_path, map_location="cpu"))
-    policy.eval()
+    policy = SB3A2C.load(str(agent_path), device="cpu")
 
     # ── GUI setup ─────────────────────────────────────────────────────────────
     obs, _ = env.reset()
@@ -73,10 +67,7 @@ def main(cfg: DictConfig):
             if cfg.play.interactive:
                 input(f"  [ep={episode} step={step}] Press Enter to step…")
 
-            state = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
-            with torch.no_grad():
-                logits, _ = policy(state)
-            action = torch.argmax(logits, dim=1).item()
+            action, _ = policy.predict(obs, deterministic=True)
 
             obs, reward, terminated, truncated, info = env.step(action)
             ep_reward += reward

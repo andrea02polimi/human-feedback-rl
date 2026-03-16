@@ -4,7 +4,7 @@ run:
 
 agent:
   # Path to the policy checkpoint (relative to human-feedback-rl/)
-  model: "experiments/christiano/2026-03-15/23-29-04/models/policy_christiano.pt"
+  model: "experiments/christiano/2026-03-15/23-29-04/models/policy_christiano"
 
 eval:
   episodes: 100
