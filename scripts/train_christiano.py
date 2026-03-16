@@ -115,6 +115,7 @@ def _policy_worker(
     reward_predictor_checkpoint_dir,
     policy_checkpoint_path,
     log_directory,
+    shared_env_steps,
 ):
     """
     Subprocess responsible for:
@@ -235,9 +236,10 @@ def _policy_worker(
             next_observations = np.asarray(next_observations_raw)
             if next_observations.ndim == 1:
                 next_observations = next_observations[np.newaxis]
-            episode_dones         = np.asarray(dones_raw, dtype=bool)
-            env_rewards           = np.asarray(env_rewards_raw, dtype=np.float32)  # (num_envs,)
-            total_env_steps_taken += num_envs
+            episode_dones           = np.asarray(dones_raw, dtype=bool)
+            env_rewards             = np.asarray(env_rewards_raw, dtype=np.float32)  # (num_envs,)
+            total_env_steps_taken  += num_envs
+            shared_env_steps.value  = total_env_steps_taken
 
             # ── Segment generation (all environments) ─────────────────────────
             for env_idx in range(num_envs):
@@ -422,6 +424,7 @@ def _preference_worker(
     shutdown_event,
     reward_predictor_checkpoint_dir,
     log_directory,
+    shared_env_steps,
 ):
     """
     Subprocess responsible for labeling segment pairs.
@@ -537,14 +540,20 @@ def _preference_worker(
             preference_pipe.put((segment_1.frames, segment_2.frames, preference))
             total_labeled += 1
 
-            # Query annealing: slow down after the initial burst so the RL
-            # policy has time to explore before more segments are judged.
-            if total_labeled > config.preferences.initial_prefs:
-                excess   = total_labeled - config.preferences.initial_prefs
-                sleep_s  = min(
-                    config.preferences.max_query_interval,
-                    config.preferences.query_annealing_rate * excess,
+            # Query annealing: label rate decays linearly with environment steps
+            # (only after the RP is ready, i.e. Phase 3).  At 0 env steps the
+            # query rate is maximum; at total_env_steps it reaches max_query_interval
+            # seconds between queries — matching the paper's "label rate decays
+            # with environment steps" schedule.
+            if (
+                reward_predictor_ready_event.is_set()
+                and config.training.total_env_steps > 0
+            ):
+                fraction = min(
+                    1.0,
+                    shared_env_steps.value / config.training.total_env_steps,
                 )
+                sleep_s = config.preferences.max_query_interval * fraction
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 
@@ -602,6 +611,9 @@ def main(cfg: DictConfig):
     # ── Launch worker processes ───────────────────────────────────────────────
     config_dict = OmegaConf.to_container(cfg, resolve=True)
 
+    # Shared counter so the preference worker can read env steps for annealing.
+    shared_env_steps = mp.Value("l", 0)
+
     policy_process = Process(
         target=_policy_worker,
         args=(
@@ -612,6 +624,7 @@ def main(cfg: DictConfig):
             reward_predictor_checkpoint_dir,
             policy_checkpoint_path,
             str(run_directory),
+            shared_env_steps,
         ),
     )
     preference_process = Process(
@@ -624,6 +637,7 @@ def main(cfg: DictConfig):
             shutdown_event,
             reward_predictor_checkpoint_dir,
             preference_interface_log_dir,
+            shared_env_steps,
         ),
     )
 
@@ -635,9 +649,14 @@ def main(cfg: DictConfig):
         shutdown_event.set()
         policy_process.join(timeout=15)
         preference_process.join(timeout=15)
+        # Force-terminate any worker still alive after the grace period.
+        for proc in (policy_process, preference_process):
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=3)
         preference_buffer.stop_recv_thread()
         print(f"[main] Policy saved to {policy_checkpoint_path}")
-        sys.exit(0)
+        os._exit(0)   # bypass atexit so non-daemon workers don't block exit
 
     signal.signal(signal.SIGINT, _shutdown)
 
@@ -666,26 +685,15 @@ def main(cfg: DictConfig):
     reward_predictor_ready_event.set()
     print("  Reward predictor ready — A2C training with predicted rewards unlocked.")
 
-    # ── Phase 3: event-driven reward predictor retraining ─────────────────────
-    # The RP retrains whenever retrain_interval new labeled preferences have
-    # arrived since the last training.  It keeps running until the policy worker
-    # sets shutdown_event (i.e. total_env_steps reached).
-    print(
-        f"\n[Phase 3] Reward predictor retrains every"
-        f" {cfg.reward_predictor.retrain_interval} new preferences…"
-    )
+    # ── Phase 3: continuous reward predictor retraining ───────────────────────
+    # The RP retrains as fast as new preferences arrive and keeps running until
+    # the policy worker sets shutdown_event (i.e. total_env_steps reached).
+    print("\n[Phase 3] Reward predictor training continuously…")
 
-    # Baseline: number of preferences already used in Phase 2 pretraining.
-    train_db, val_db  = preference_buffer.get_dbs()
-    last_pref_count   = len(train_db) + len(val_db)
-    rp_retrain_count  = 0
-
+    rp_retrain_count = 0
     while not shutdown_event.is_set():
-        train_db, val_db  = preference_buffer.get_dbs()
-        current_pref_count = len(train_db) + len(val_db)
-
-        new_prefs = current_pref_count - last_pref_count
-        if new_prefs < cfg.reward_predictor.retrain_interval:
+        train_db, val_db = preference_buffer.get_dbs()
+        if len(train_db) == 0 or len(val_db) == 0:
             time.sleep(1.0)
             continue
 
@@ -694,12 +702,10 @@ def main(cfg: DictConfig):
         )
         reward_predictor.save()
         _keep_latest_checkpoints(reward_predictor_checkpoint_dir)
-        last_pref_count  = current_pref_count
         rp_retrain_count += 1
         print(
             f"[rp] retrain #{rp_retrain_count}"
-            f"  triggered by +{new_prefs} new prefs"
-            f"  (train={len(train_db)}  val={len(val_db)})",
+            f"  train={len(train_db)}  val={len(val_db)}",
             flush=True,
         )
 
