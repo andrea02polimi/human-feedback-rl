@@ -170,9 +170,10 @@ def _policy_worker(
     max_gradient_norm     = config.policy.max_gradient_norm
     segment_length        = config.preferences.segment_len
 
-    reward_predictor_ready = False
-    training_step          = 0
-    total_policy_steps     = config.training.total_policy_steps   # 0 = unlimited
+    reward_predictor_ready  = False
+    training_step           = 0   # A2C gradient steps (used for reload/save intervals)
+    total_env_steps_taken   = 0
+    total_env_steps_target  = config.training.total_env_steps     # 0 = unlimited
 
     while not shutdown_event.is_set():
 
@@ -234,8 +235,9 @@ def _policy_worker(
             next_observations = np.asarray(next_observations_raw)
             if next_observations.ndim == 1:
                 next_observations = next_observations[np.newaxis]
-            episode_dones = np.asarray(dones_raw, dtype=bool)
-            env_rewards   = np.asarray(env_rewards_raw, dtype=np.float32)  # (num_envs,)
+            episode_dones         = np.asarray(dones_raw, dtype=bool)
+            env_rewards           = np.asarray(env_rewards_raw, dtype=np.float32)  # (num_envs,)
+            total_env_steps_taken += num_envs
 
             # ── Segment generation (all environments) ─────────────────────────
             for env_idx in range(num_envs):
@@ -342,7 +344,8 @@ def _policy_worker(
             checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(policy.state_dict(), checkpoint_path)
             print(
-                f"[policy] step={training_step}"
+                f"[policy] gradient_step={training_step}"
+                f"  env_steps={total_env_steps_taken}"
                 f"  avg_return={discounted_returns.mean():.3f}"
                 f"  policy_loss={policy_loss.item():.4f}"
                 f"  value_loss={value_loss.item():.4f}",
@@ -350,7 +353,7 @@ def _policy_worker(
             )
 
         training_step += 1
-        if total_policy_steps > 0 and training_step >= total_policy_steps:
+        if total_env_steps_target > 0 and total_env_steps_taken >= total_env_steps_target:
             shutdown_event.set()
             break
 
@@ -663,39 +666,42 @@ def main(cfg: DictConfig):
     reward_predictor_ready_event.set()
     print("  Reward predictor ready — A2C training with predicted rewards unlocked.")
 
-    # ── Phase 3: continuous reward predictor retraining ───────────────────────
-    # Mirrors run.py: retrain as fast as new preferences arrive, no fixed sleep.
-    # Stops after reward_predictor_iterations completed retrainings.
+    # ── Phase 3: event-driven reward predictor retraining ─────────────────────
+    # The RP retrains whenever retrain_interval new labeled preferences have
+    # arrived since the last training.  It keeps running until the policy worker
+    # sets shutdown_event (i.e. total_env_steps reached).
     print(
-        f"\n[Phase 3] Reward predictor loop — "
-        f"{cfg.training.reward_predictor_iterations} iterations"
+        f"\n[Phase 3] Reward predictor retrains every"
+        f" {cfg.reward_predictor.retrain_interval} new preferences…"
     )
 
-    completed_iterations = 0
-    with tqdm(
-        total=cfg.training.reward_predictor_iterations,
-        desc="rp iterations",
-        unit="iter",
-        ncols=80,
-    ) as progress_bar:
-        while (
-            not shutdown_event.is_set()
-            and completed_iterations < cfg.training.reward_predictor_iterations
-        ):
-            train_db, val_db = preference_buffer.get_dbs()
-            if len(train_db) == 0 or len(val_db) == 0:
-                progress_bar.set_postfix({"status": "waiting for data"})
-                time.sleep(1.0)
-                continue
+    # Baseline: number of preferences already used in Phase 2 pretraining.
+    train_db, val_db  = preference_buffer.get_dbs()
+    last_pref_count   = len(train_db) + len(val_db)
+    rp_retrain_count  = 0
 
-            reward_predictor.train(
-                train_db, val_db, val_interval=cfg.reward_predictor.val_interval
-            )
-            reward_predictor.save()
-            _keep_latest_checkpoints(reward_predictor_checkpoint_dir)
-            completed_iterations += 1
-            progress_bar.set_postfix({"train": len(train_db), "val": len(val_db)})
-            progress_bar.update(1)
+    while not shutdown_event.is_set():
+        train_db, val_db  = preference_buffer.get_dbs()
+        current_pref_count = len(train_db) + len(val_db)
+
+        new_prefs = current_pref_count - last_pref_count
+        if new_prefs < cfg.reward_predictor.retrain_interval:
+            time.sleep(1.0)
+            continue
+
+        reward_predictor.train(
+            train_db, val_db, val_interval=cfg.reward_predictor.val_interval
+        )
+        reward_predictor.save()
+        _keep_latest_checkpoints(reward_predictor_checkpoint_dir)
+        last_pref_count  = current_pref_count
+        rp_retrain_count += 1
+        print(
+            f"[rp] retrain #{rp_retrain_count}"
+            f"  triggered by +{new_prefs} new prefs"
+            f"  (train={len(train_db)}  val={len(val_db)})",
+            flush=True,
+        )
 
     # ── Shutdown ───────────────────────────────────────────────────────────────
     _shutdown()

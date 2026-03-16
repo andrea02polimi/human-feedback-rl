@@ -12,6 +12,7 @@ reward_predictor:
   lr: 2e-4
   n_preds: 3          # ensemble size (paper uses 3)
   val_interval: 50    # reward predictor training steps between validation logs
+  retrain_interval: 50  # retrain RP after every k new labeled preferences arrive
 
 # ── Preferences ───────────────────────────────────────────────────────────────
 preferences:
@@ -37,25 +38,20 @@ policy:
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 training:
-  # Each reward_predictor_iterations does a full pass over the preference DB.
-  # With ~3000 preferences at batch_size=32 this takes a few seconds on CPU.
-  # 500 iterations ≈ 30-60 minutes total training time.
-  # Safety cap on reward predictor retrainings (set high — training is driven
-  # by total_policy_steps, not by this counter).
-  reward_predictor_iterations: 10000
+  # The reward predictor trains continuously in the background until the policy
+  # reaches total_env_steps (no fixed iteration cap — mirrors the paper).
 
-  # How often the policy worker reloads the latest reward predictor checkpoint.
-  # 100 A2C steps × 20 rollout_steps × 4 envs = 8000 env steps between reloads.
+  # How often the policy worker reloads the latest reward predictor checkpoint
+  # (in A2C gradient steps).
   reward_predictor_reload_interval: 50
 
   # Save a policy checkpoint to disk every N A2C gradient steps.
   policy_save_interval: 100
 
-  # Primary stop condition: training ends when the policy has completed this
-  # many A2C gradient steps (after the reward predictor becomes available).
-  # ~200 steps/min on CPU → 3000 steps ≈ 15 min of A2C training after Phase 2.
-  # Set to 0 to use reward_predictor_iterations as the stop condition instead.
-  total_policy_steps: 10000
+  # Primary stop condition: total environment steps across all parallel envs.
+  # 4 envs × 20 rollout_steps × 10 000 gradient steps = 800 000 env steps.
+  # Set to 0 for unlimited (Ctrl+C to stop).
+  total_env_steps: 800000
 
 hydra:
   run:
