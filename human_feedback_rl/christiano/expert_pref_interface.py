@@ -37,12 +37,12 @@ class ExpertPrefInterface(PrefInterface):
         Returns:
             (p1, p2) preference tuple, where p1 + p2 = 1.0
         """
-        score1 = self._score_by_env_reward(seg1)
-        score2 = self._score_by_env_reward(seg2)
+        # score1 = self._score_by_env_reward(seg1)
+        # score2 = self._score_by_env_reward(seg2)
 
         # ── Q-net scoring (DQN expert) — disabled, kept for future reference ──
-        # score1 = self._score_segment(seg1)
-        # score2 = self._score_segment(seg2)
+        score1 = self._score_segment(seg1)
+        score2 = self._score_segment(seg2)
 
         probs = torch.softmax(torch.tensor([score1, score2]), dim=0)
         p1, p2 = probs.tolist()
@@ -61,12 +61,12 @@ class ExpertPrefInterface(PrefInterface):
         return float(sum(getattr(seg, "env_rewards", [])))
 
     # ── Q-net scoring — disabled, kept for future reference ─────────────────
-    # def _score_segment(self, seg) -> float:
-    #     """Sum V(s) = max_a Q(s, a) over all frames in the segment."""
-    #     total = 0.0
-    #     for frame in seg.frames:
-    #         obs = torch.as_tensor(frame, dtype=torch.float32).unsqueeze(0)
-    #         with torch.no_grad():
-    #             q_vals = self.expert_model.q_net(obs)[0]
-    #         total += q_vals.max().item()
-    #     return total
+    def _score_segment(self, seg) -> float:
+        """Sum V(s) = max_a Q(s, a) over all frames in the segment."""
+        total = 0.0
+        for frame in seg.frames:
+            obs = torch.as_tensor(frame, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                q_vals = self.expert_model.q_net(obs)[0]
+            total += q_vals.max().item()
+        return total

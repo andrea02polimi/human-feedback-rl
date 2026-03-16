@@ -325,22 +325,22 @@ def _preference_worker(
         # To re-enable q-net scoring, uncomment the block below and comment out
         # the two lines that follow it.
         # ── Q-net oracle (DQN expert) — disabled ──────────────────────────────
-        # env, expert_model = build_env_and_expert(config)
-        # observation_dim   = env.observation_space.shape[0]
-        # env.close()
-        # interface = ExpertPrefInterface(
-        #     expert_model=expert_model,
-        #     max_segs=config.preferences.max_segs,
-        #     log_dir=log_directory,
-        # )
+        env, expert_model = build_env_and_expert(config)
+        observation_dim   = env.observation_space.shape[0]
+        env.close()
+        interface = ExpertPrefInterface(
+            expert_model=expert_model,
+            max_segs=config.preferences.max_segs,
+            log_dir=log_directory,
+        )
         # ── Env-reward oracle (current) ───────────────────────────────────────
-        env = build_single_env(config)
+        '''env = build_single_env(config)
         observation_dim = env.observation_space.shape[0]
         env.close()
         interface = ExpertPrefInterface(
             max_segs=config.preferences.max_segs,
             log_dir=log_directory,
-        )
+        )'''
     else:
         env = build_single_env(config)
         observation_dim = env.observation_space.shape[0]

@@ -49,7 +49,7 @@ training:
   # Primary stop condition: total environment steps across all parallel envs.
   # 4 envs × 20 rollout_steps × 10 000 gradient steps = 800 000 env steps.
   # Set to 0 for unlimited (Ctrl+C to stop).
-  total_env_steps: 1000000
+  total_env_steps: 100000
 
 hydra:
   run:
