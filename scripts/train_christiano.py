@@ -50,6 +50,7 @@ import torch
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from stable_baselines3 import A2C as SB3A2C
+from stable_baselines3.common.vec_env import VecMonitor
 from tqdm import tqdm
 
 from learning_from_human_preferences.preferences.pref_db import PrefDB, PrefBuffer, Segment
@@ -181,8 +182,8 @@ def _policy_worker(
     if latest:
         reward_predictor.load(latest)
 
-    wrapped_env = PredictedRewardVecWrapper(
-        env, reward_predictor, reward_predictor_ready_event
+    wrapped_env = VecMonitor(
+        PredictedRewardVecWrapper(env, reward_predictor, reward_predictor_ready_event)
     )
 
     remaining_steps = (
