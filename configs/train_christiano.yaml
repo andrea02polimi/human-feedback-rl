@@ -17,7 +17,16 @@ reward_predictor:
 
 # ── Preferences ───────────────────────────────────────────────────────────────
 preferences:
-  oracle: "expert"        # "expert" → DQN synthetic | "human" → terminal L/R/E/S
+  # ── Oracle for synthetic preferences ──────────────────────────────────────
+  # "env_reward" : sum of true environment rewards (Christiano et al. original)
+  # "qnet"       : sum of V(s) = max_a Q(s,a) from the expert DQN
+  # "human"      : terminal prompt (L / R / E / S keys)
+  oracle: "env_reward"
+
+  # ── Demonstration feedback ─────────────────────────────────────────────────
+  # Set true to activate the _demonstration_worker and add L_demo to RP training.
+  use_demonstrations: false
+
   initial_prefs: 500      # labeled pairs collected before pretraining (paper: 500)
   segment_len: 25         # steps per trajectory segment (paper default)
   max_segs: 1000          # max segments kept in preference-worker buffer

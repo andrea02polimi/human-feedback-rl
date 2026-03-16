@@ -325,34 +325,46 @@ def _preference_worker(
 
     config = OmegaConf.create(config_dict)
 
-    if config.preferences.oracle == "expert":
-        # Oracle uses true environment rewards (seg.env_rewards) — no DQN needed.
-        # To re-enable q-net scoring, uncomment the block below and comment out
-        # the two lines that follow it.
-        # ── Q-net oracle (DQN expert) — disabled ──────────────────────────────
+    oracle = config.preferences.oracle
+
+    if oracle == "env_reward":
+        # Synthetic oracle: prefer the segment with higher sum of environment
+        # rewards.  No DQN needed — env_rewards are attached by _policy_worker.
+        env = build_single_env(config)
+        observation_dim = env.observation_space.shape[0]
+        env.close()
+        interface = ExpertPrefInterface(
+            oracle="env_reward",
+            max_segs=config.preferences.max_segs,
+            log_dir=log_directory,
+        )
+
+    elif oracle == "qnet":
+        # Expert Q-net oracle: prefer the segment with higher sum of V(s).
+        # Loads the expert DQN — required for Q-net scoring.
         env, expert_model = build_env_and_expert(config)
         observation_dim   = env.observation_space.shape[0]
         env.close()
         interface = ExpertPrefInterface(
+            oracle="qnet",
             expert_model=expert_model,
             max_segs=config.preferences.max_segs,
             log_dir=log_directory,
         )
-        # ── Env-reward oracle (current) ───────────────────────────────────────
-        '''env = build_single_env(config)
-        observation_dim = env.observation_space.shape[0]
-        env.close()
-        interface = ExpertPrefInterface(
-            max_segs=config.preferences.max_segs,
-            log_dir=log_directory,
-        )'''
-    else:
+
+    elif oracle == "human":
         env = build_single_env(config)
         observation_dim = env.observation_space.shape[0]
         env.close()
         interface = HumanPrefInterface(
             max_segs=config.preferences.max_segs,
             log_dir=log_directory,
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown oracle {oracle!r}. "
+            "Valid values: 'env_reward', 'qnet', 'human'."
         )
 
     # Inference-only reward predictor for disagreement-based pair selection.
@@ -560,13 +572,18 @@ def main(cfg: DictConfig):
     policy_checkpoint_path           = str(run_directory / "models" / "policy_christiano")
     preference_interface_log_dir     = str(run_directory / "pref_interface")
 
+    use_demonstrations = cfg.preferences.use_demonstrations
+
     # ── Communication channels ────────────────────────────────────────────────
     segment_pipe                 = Queue(maxsize=cfg.preferences.seg_pipe_maxsize)
-    agent_demo_pipe              = Queue(maxsize=cfg.preferences.demo_seg_pipe_maxsize)
     preference_pipe              = Queue()
-    demo_pipe                    = Queue()   # (expert_frames, agent_frames, (1.0,0.0)) → main
     reward_predictor_ready_event = mp.Event()   # main → policy: reward predictor ready
     shutdown_event               = mp.Event()   # main → all:    time to stop
+
+    # Demo pipes/DB only created when demonstrations are enabled.
+    agent_demo_pipe = Queue(maxsize=cfg.preferences.demo_seg_pipe_maxsize) if use_demonstrations else None
+    demo_pipe       = Queue() if use_demonstrations else None
+    demo_db         = PrefDB(maxlen=cfg.preferences.demo_db_maxlen)        if use_demonstrations else None
 
     # ── Preference databases (owned by main process) ──────────────────────────
     train_database      = PrefDB(maxlen=cfg.preferences.db_train_maxlen)
@@ -577,11 +594,6 @@ def main(cfg: DictConfig):
         log_dir=str(run_directory / "pref_buffer"),
     )
     preference_buffer.start_recv_thread(preference_pipe)
-
-    # Demonstration DB: separate from preference DB so the two losses can be
-    # weighted independently.  No train/val split needed since L_demo is a
-    # margin ranking loss, not cross-entropy — no accuracy metric to monitor.
-    demo_db = PrefDB(maxlen=cfg.preferences.demo_db_maxlen)
 
     # ── Reward predictor (trained in main process) ────────────────────────────
     temp_env        = build_single_env(cfg)
@@ -629,28 +641,31 @@ def main(cfg: DictConfig):
             shared_env_steps,
         ),
     )
-    demo_process = Process(
-        target=_demonstration_worker,
-        args=(
-            config_dict,
-            agent_demo_pipe,
-            demo_pipe,
-            shutdown_event,
-        ),
-    )
+    if use_demonstrations:
+        demo_process = Process(
+            target=_demonstration_worker,
+            args=(
+                config_dict,
+                agent_demo_pipe,
+                demo_pipe,
+                shutdown_event,
+            ),
+        )
 
     policy_process.start()
     preference_process.start()
-    demo_process.start()
+    if use_demonstrations:
+        demo_process.start()
 
     def _shutdown(*_):
         print("\n[main] Shutting down…", flush=True)
         shutdown_event.set()
-        policy_process.join(timeout=15)
-        preference_process.join(timeout=15)
-        demo_process.join(timeout=15)
-        # Force-terminate any worker still alive after the grace period.
-        for proc in (policy_process, preference_process, demo_process):
+        workers = [policy_process, preference_process]
+        if use_demonstrations:
+            workers.append(demo_process)
+        for proc in workers:
+            proc.join(timeout=15)
+        for proc in workers:
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=3)
@@ -679,10 +694,11 @@ def main(cfg: DictConfig):
 
     # ── Phase 2: pretrain reward predictor ────────────────────────────────────
     print("\n[Phase 2] Pretraining reward predictor…")
-    _drain_demo_pipe(demo_pipe, demo_db)
+    if use_demonstrations:
+        _drain_demo_pipe(demo_pipe, demo_db)
     reward_predictor.train(
         train_db, val_db,
-        demo_db=demo_db if len(demo_db) > 0 else None,
+        demo_db=demo_db if (use_demonstrations and len(demo_db) > 0) else None,
         val_interval=cfg.reward_predictor.val_interval,
         demo_weight=cfg.reward_predictor.demo_weight,
         demo_margin=cfg.reward_predictor.demo_margin,
@@ -704,11 +720,12 @@ def main(cfg: DictConfig):
             time.sleep(1.0)
             continue
 
-        _drain_demo_pipe(demo_pipe, demo_db)
+        if use_demonstrations:
+            _drain_demo_pipe(demo_pipe, demo_db)
 
         reward_predictor.train(
             train_db, val_db,
-            demo_db=demo_db if len(demo_db) > 0 else None,
+            demo_db=demo_db if (use_demonstrations and len(demo_db) > 0) else None,
             val_interval=cfg.reward_predictor.val_interval,
             demo_weight=cfg.reward_predictor.demo_weight,
             demo_margin=cfg.reward_predictor.demo_margin,
@@ -716,10 +733,10 @@ def main(cfg: DictConfig):
         reward_predictor.save()
         _keep_latest_checkpoints(reward_predictor_checkpoint_dir)
         rp_retrain_count += 1
+        demo_info = f"  demo={len(demo_db)}" if use_demonstrations else ""
         print(
             f"[rp] retrain #{rp_retrain_count}"
-            f"  train={len(train_db)}  val={len(val_db)}"
-            f"  demo={len(demo_db)}",
+            f"  train={len(train_db)}  val={len(val_db)}{demo_info}",
             flush=True,
         )
 
