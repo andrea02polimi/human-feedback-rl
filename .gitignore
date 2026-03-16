@@ -214,3 +214,5 @@ expert_policies/
 *.zip
 *.pt
 *.pth
+
+wandb/

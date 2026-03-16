@@ -15,7 +15,7 @@ from threading import Lock, Thread
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,7 +146,6 @@ class PrefBuffer:
         self,
         db_train: PrefDB,
         db_val: PrefDB,
-        log_dir: Optional[str] = None,
     ):
         self.train_db = db_train
         self.val_db = db_val
@@ -154,7 +153,6 @@ class PrefBuffer:
         self._stop_flag = False
         self._thread: Optional[Thread] = None
         self.step = 0
-        self.writer = SummaryWriter(log_dir) if log_dir is not None else None
 
     # ------------------------------------------------------------------
 
@@ -199,16 +197,13 @@ class PrefBuffer:
                 else:
                     self.train_db.append(seg1, seg2, preference)
 
-                if self.writer is not None:
-                    self.writer.add_scalar(
-                        "preferences/train_db_size", len(self.train_db), self.step
-                    )
-                    self.writer.add_scalar(
-                        "preferences/val_db_size", len(self.val_db), self.step
-                    )
-                    self.writer.add_scalar(
-                        "preferences/total_received", received, self.step
-                    )
+                if wandb.run is not None:
+                    wandb.log({
+                        "prefs/train_db_size":   len(self.train_db),
+                        "prefs/val_db_size":     len(self.val_db),
+                        "prefs/total_received":  received,
+                        "pref_step":             self.step,
+                    })
 
     # ------------------------------------------------------------------
 

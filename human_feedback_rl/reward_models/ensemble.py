@@ -29,7 +29,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 from human_feedback_rl.utils.running_stats import RunningStat
 from human_feedback_rl.utils.itertools import batch_iter
@@ -64,13 +64,11 @@ class RewardPredictorEnsemble:
         self.optimizers = [optim.Adam(m.parameters(), lr=lr) for m in self.models]
 
         if log_dir is not None:
-            self.writer_train   = SummaryWriter(osp.join(log_dir, "reward_predictor", "train"))
-            self.writer_val     = SummaryWriter(osp.join(log_dir, "reward_predictor", "val"))
+            self._log           = True
             self.checkpoint_dir = osp.join(log_dir, "reward_predictor_checkpoints")
             os.makedirs(self.checkpoint_dir, exist_ok=True)
         else:
-            self.writer_train   = None
-            self.writer_val     = None
+            self._log           = False
             self.checkpoint_dir = None
 
     # ── Inference ─────────────────────────────────────────────────────────────
@@ -203,14 +201,11 @@ class RewardPredictorEnsemble:
             if val_interval > 0 and self.n_steps % val_interval == 0:
                 self._val_step(val_db)
 
-                if self.writer_train is not None:
-                    self.writer_train.add_scalar(
-                        "reward_predictor_loss", loss.item(), self.n_steps
-                    )
+                if self._log and wandb.run is not None:
+                    log_dict = {"rp/train/loss": loss.item(), "rp_step": self.n_steps}
                     if demo_batch:
-                        self.writer_train.add_scalar(
-                            "demo_margin_loss", L_demo.item(), self.n_steps
-                        )
+                        log_dict["rp/train/demo_margin_loss"] = L_demo.item()
+                    wandb.log(log_dict)
 
     def _extract_pairs(self, db) -> list:
         """Return [(seg1_frames, seg2_frames, pref), ...] from a PrefDB."""
@@ -249,13 +244,12 @@ class RewardPredictorEnsemble:
                 total_loss += loss.item()
                 total_acc  += acc.item()
 
-        if self.writer_val is not None:
-            self.writer_val.add_scalar(
-                "reward_predictor_val_loss", total_loss / self.n_preds, self.n_steps
-            )
-            self.writer_val.add_scalar(
-                "reward_predictor_val_accuracy", total_acc / self.n_preds, self.n_steps
-            )
+        if self._log and wandb.run is not None:
+            wandb.log({
+                "rp/val/loss":     total_loss / self.n_preds,
+                "rp/val/accuracy": total_acc  / self.n_preds,
+                "rp_step":         self.n_steps,
+            })
 
     # ── Checkpointing ──────────────────────────────────────────────────────────
 

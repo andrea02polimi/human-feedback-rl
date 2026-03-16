@@ -180,16 +180,33 @@ python scripts/play.py run.dir=... agent.model=... eval.episodes=5 play.step_del
 
 ---
 
-## TensorBoard
+## Weights & Biases
 
-```bash
-tensorboard --logdir experiments/christiano
+All metrics are logged to [wandb](https://wandb.ai). Configure the project in `configs/train.yaml`:
+
+```yaml
+wandb:
+  project: "sumo-rlhf"
+  entity: null   # your wandb username/org, or null for default
+  tags: []
 ```
 
-Tracks:
-- `policy/rollout/ep_rew_mean` — mean episode reward (predicted rewards)
-- `reward_predictor/train/reward_predictor_loss`
-- `reward_predictor/val/reward_predictor_val_loss`
-- `reward_predictor/val/reward_predictor_val_accuracy`
-- `reward_predictor/train/demo_margin_loss` (Config 3 only)
-- `pref_buffer/preferences/train_db_size`, `val_db_size`
+Override on the command line:
+
+```bash
+python scripts/train_christiano.py wandb.project=my-project wandb.entity=my-org
+```
+
+Tracked metrics:
+
+| Key | Description |
+|---|---|
+| `rollout/ep_rew_mean` | Mean episode reward (predicted rewards, from SB3) |
+| `train/loss` | A2C training loss (from SB3) |
+| `rp/train/loss` | Reward predictor training loss |
+| `rp/train/demo_margin_loss` | Margin ranking loss (Config 3 only) |
+| `rp/val/loss` | Reward predictor validation loss |
+| `rp/val/accuracy` | Reward predictor validation accuracy |
+| `prefs/train_db_size` | Number of preferences in the training database |
+| `prefs/val_db_size` | Number of preferences in the validation database |
+| `prefs/total_received` | Total labeled preferences received so far |

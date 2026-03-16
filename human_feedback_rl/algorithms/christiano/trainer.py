@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import wandb
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
@@ -49,7 +50,15 @@ class ChristianoTrainer(BaseTrainer):
         print("\nConfiguration:")
         print(OmegaConf.to_yaml(cfg))
 
-        run_directory                   = Path(HydraConfig.get().runtime.output_dir)
+        run_directory = Path(HydraConfig.get().runtime.output_dir)
+
+        wandb.init(
+            project=cfg.wandb.project,
+            entity=cfg.wandb.get("entity") or None,
+            name=run_directory.name,
+            tags=list(cfg.wandb.get("tags", [])),
+            config=OmegaConf.to_container(cfg, resolve=True),
+        )
         reward_predictor_checkpoint_dir = str(run_directory / "reward_predictor_checkpoints")
         policy_checkpoint_path          = str(run_directory / "models" / "policy_christiano")
         preference_interface_log_dir    = str(run_directory / "pref_interface")
@@ -73,7 +82,6 @@ class ChristianoTrainer(BaseTrainer):
         preference_buffer   = PrefBuffer(
             train_database,
             validation_database,
-            log_dir=str(run_directory / "pref_buffer"),
         )
         preference_buffer.start_recv_thread(preference_pipe)
 
@@ -108,6 +116,7 @@ class ChristianoTrainer(BaseTrainer):
                 str(run_directory),
                 shared_env_steps,
                 agent_demo_pipe,
+                wandb.run.id,
             ),
         )
         preference_process = Process(
@@ -153,6 +162,7 @@ class ChristianoTrainer(BaseTrainer):
                     proc.join(timeout=3)
             preference_buffer.stop_recv_thread()
             print(f"[main] Policy saved to {policy_checkpoint_path}")
+            wandb.finish()
             os._exit(0)   # bypass atexit so non-daemon workers don't block exit
 
         signal.signal(signal.SIGINT, _shutdown)

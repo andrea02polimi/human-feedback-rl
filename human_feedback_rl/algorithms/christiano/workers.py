@@ -40,6 +40,7 @@ def _policy_worker(
     log_directory,
     shared_env_steps,
     agent_demo_pipe=None,
+    wandb_run_id=None,
 ):
     """
     Subprocess responsible for policy training via SB3 A2C.
@@ -55,11 +56,16 @@ def _policy_worker(
       SegmentCollectorCallback handles segment generation, RP reloading,
       checkpoint saving, and shared_env_steps updates.
     """
+    import wandb
     from pathlib import Path
     from stable_baselines3 import A2C as SB3A2C
     from stable_baselines3.common.vec_env import VecMonitor
+    from wandb.integration.sb3 import WandbCallback
 
     config = OmegaConf.create(config_dict)
+
+    if wandb_run_id is not None:
+        wandb.init(id=wandb_run_id, resume="allow")
 
     env, _ = build_env_and_expert(config)
 
@@ -168,17 +174,19 @@ def _policy_worker(
         vf_coef=config.policy.value_coef,
         max_grad_norm=config.policy.max_gradient_norm,
         policy_kwargs={"net_arch": [64, 64]},
-        tensorboard_log=log_directory,
         device=config.resources.device,
         verbose=0,
     )
 
     print("[policy] SB3 A2C started — training with predicted rewards.", flush=True)
 
+    callbacks = [callback]
+    if wandb_run_id is not None:
+        callbacks.append(WandbCallback(gradient_save_freq=0, verbose=0))
+
     a2c.learn(
         total_timesteps=remaining_steps,
-        callback=callback,
-        tb_log_name="policy",
+        callback=callbacks,
         reset_num_timesteps=True,
     )
 
