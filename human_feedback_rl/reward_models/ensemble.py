@@ -31,7 +31,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
-from learning_from_human_preferences.envs.utils import RunningStat, batch_iter
+from human_feedback_rl.utils.running_stats import RunningStat
+from human_feedback_rl.utils.itertools import batch_iter
 
 
 class RewardPredictorEnsemble:

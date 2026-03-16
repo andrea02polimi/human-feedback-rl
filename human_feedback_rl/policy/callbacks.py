@@ -1,84 +1,16 @@
 """
-SB3-compatible components for the Christiano et al. RLHF pipeline.
+SB3 training callback for the Christiano et al. pipeline.
 
-  PredictedRewardVecWrapper  — VecEnvWrapper that replaces environment rewards
-                               with reward-predictor predictions.  The policy
-                               never sees the true environment reward (paper
-                               requirement, Section 2.2).  True rewards are
-                               forwarded through infos['true_reward'] so the
-                               SegmentCollectorCallback can attach them to
-                               Segment objects for the preference oracle.
-
-  SegmentCollectorCallback   — SB3 callback that:
-                                 1. collects trajectory segments from all envs
-                                    and forwards them to segment_pipe
-                                 2. reloads the reward predictor checkpoint
-                                    every reload_interval gradient updates
-                                 3. saves a policy checkpoint every
-                                    save_interval gradient updates
-                                 4. updates the shared env-steps counter used
-                                    by the preference worker for query annealing
+Extracted from human_feedback_rl/christiano/sb3_components.py.
 """
 
 import numpy as np
 from pathlib import Path
 
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import VecEnvWrapper
 
-from learning_from_human_preferences.preferences.pref_db import Segment
-from learning_from_human_preferences.reward_model.reward_predictor import (
-    RewardPredictorEnsemble,
-)
-
-
-class PredictedRewardVecWrapper(VecEnvWrapper):
-    """
-    VecEnv wrapper that replaces environment rewards with reward-predictor
-    predictions.
-
-    Before reward_predictor_ready_event is set, returns zero rewards so the
-    policy never observes the environment reward (Christiano et al. §2.2).
-
-    True environment rewards are stored in infos['true_reward'] so the
-    SegmentCollectorCallback can label each Segment correctly.
-    """
-
-    def __init__(self, venv, reward_predictor: RewardPredictorEnsemble,
-                 reward_predictor_ready_event):
-        super().__init__(venv)
-        self.reward_predictor             = reward_predictor
-        self.reward_predictor_ready_event = reward_predictor_ready_event
-
-    def reset(self):
-        return self.venv.reset()
-
-    def step_async(self, actions):
-        self.venv.step_async(actions)
-
-    def step_wait(self):
-        obs, true_rewards, dones, infos = self.venv.step_wait()
-
-        # Pass true reward through info so segments can be labelled correctly.
-        for i, info in enumerate(infos):
-            info["true_reward"] = float(true_rewards[i])
-
-        if self.reward_predictor_ready_event.is_set():
-            predicted = self.reward_predictor.reward(obs)
-            rewards   = predicted if np.all(np.isfinite(predicted)) else np.zeros(len(obs))
-        else:
-            rewards = np.zeros(len(obs), dtype=np.float32)
-
-        return obs, rewards.astype(np.float32), dones, infos
-
-    def reload(self, checkpoint_dir: str) -> None:
-        """Load the latest reward predictor checkpoint from disk."""
-        latest = RewardPredictorEnsemble.latest_checkpoint(checkpoint_dir)
-        if latest:
-            try:
-                self.reward_predictor.load(latest)
-            except Exception:
-                pass
+from human_feedback_rl.feedback.segment import Segment
+from human_feedback_rl.policy.wrappers import PredictedRewardVecWrapper
 
 
 class SegmentCollectorCallback(BaseCallback):

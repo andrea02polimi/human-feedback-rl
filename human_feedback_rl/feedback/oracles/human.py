@@ -1,5 +1,5 @@
 """
-Human preference interface with side-by-side visual comparison.
+Human preference oracle with side-by-side visual comparison.
 
 Since the SUMO environment uses vector observations (not images), each segment
 is rendered as a matplotlib time-series chart of the observation features.
@@ -7,11 +7,12 @@ The two segment charts are placed side-by-side and displayed in a pyglet window
 running in a dedicated subprocess (required by macOS Cocoa).
 
 The annotator types L / R / E / S in the terminal to label the pair.
+
+Moved and adapted from human_feedback_rl/christiano/human_pref_interface.py.
+Does NOT inherit from PrefInterface.
 """
 
 import queue
-import sys
-import os
 from multiprocessing import Process, Queue
 from typing import Optional, Tuple
 
@@ -21,18 +22,19 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 import numpy as np
 
-from learning_from_human_preferences.preferences.pref_interface import PrefInterface
+from .base import BaseOracle
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Frame generation from vector observations
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _segment_to_rgb(frames, title: str, w: int, h: int) -> np.ndarray:
     """
     Render the observation time series of one segment as an (H, W, 3) RGB image.
 
-    Each observation feature is drawn as a separate line.  Up to 10 features
+    Each observation feature is drawn as a separate line. Up to 10 features
     are shown (covers the full highway_discrete_v2 observation space).
     """
     data = np.array(frames, dtype=np.float32)   # (T, obs_dim)
@@ -64,7 +66,8 @@ def _segment_to_rgb(frames, title: str, w: int, h: int) -> np.ndarray:
 
 
 def _make_comparison_image(
-    seg1_frames, seg2_frames,
+    seg1_frames,
+    seg2_frames,
     frame_w: int = 360,
     frame_h: int = 420,
 ) -> np.ndarray:
@@ -74,7 +77,7 @@ def _make_comparison_image(
     """
     img_l = _segment_to_rgb(seg1_frames, "Segment  L", frame_w, frame_h)
     img_r = _segment_to_rgb(seg2_frames, "Segment  R", frame_w, frame_h)
-    sep   = np.full((frame_h, 4, 3), 180, dtype=np.uint8)
+    sep = np.full((frame_h, 4, 3), 180, dtype=np.uint8)
     return np.hstack([img_l, sep, img_r])   # (H, 2W+4, 3)
 
 
@@ -82,12 +85,13 @@ def _make_comparison_image(
 # Pyglet RGB renderer  (subprocess — macOS Cocoa requires main thread)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _rgb_render_worker(img_queue: Queue) -> None:
     """
     Top-level function (required for spawn pickling on macOS).
 
     Opens a pyglet window and keeps it updated with whatever RGB image arrives
-    on img_queue.  Sending None is the shutdown sentinel.
+    on img_queue. Sending None is the shutdown sentinel.
     """
     import pyglet
 
@@ -101,7 +105,7 @@ def _rgb_render_worker(img_queue: Queue) -> None:
                 window.dispatch_events()
             continue
 
-        if img is None:                     # shutdown sentinel
+        if img is None:  # shutdown sentinel
             if window is not None:
                 window.close()
             return
@@ -110,7 +114,8 @@ def _rgb_render_worker(img_queue: Queue) -> None:
 
         if window is None:
             window = pyglet.window.Window(
-                width=w, height=h,
+                width=w,
+                height=h,
                 caption="Preference — L / R / E / S",
             )
 
@@ -145,7 +150,7 @@ class _RGBRenderer:
 
     def close(self) -> None:
         if self._proc.is_alive():
-            self._queue.put(None)           # sentinel
+            self._queue.put(None)   # sentinel
             self._proc.join(timeout=3)
             if self._proc.is_alive():
                 self._proc.terminate()
@@ -155,12 +160,13 @@ class _RGBRenderer:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public preference interface
+# Public preference oracle
 # ─────────────────────────────────────────────────────────────────────────────
 
-class HumanPrefInterface(PrefInterface):
+
+class HumanOracle(BaseOracle):
     """
-    Preference interface for human annotation.
+    Preference oracle for human annotation.
 
     Displays a side-by-side matplotlib visualization of each segment's
     observation time series in a pyglet window, then reads the annotator's
@@ -173,28 +179,18 @@ class HumanPrefInterface(PrefInterface):
         S  — skip this pair
 
     Args:
-        max_segs:  maximum segments buffered (passed to PrefInterface)
-        log_dir:   TensorBoard log directory
-        frame_w:   width  of each individual segment panel in pixels
-        frame_h:   height of each individual segment panel in pixels
+        frame_w: width of each individual segment panel in pixels
+        frame_h: height of each individual segment panel in pixels
     """
 
-    def __init__(
-        self,
-        max_segs: int,
-        log_dir: str,
-        frame_w: int = 360,
-        frame_h: int = 420,
-    ):
-        # synthetic_prefs=True disables the parent's VideoRenderer
-        super().__init__(synthetic_prefs=True, max_segs=max_segs, log_dir=log_dir)
+    def __init__(self, frame_w: int = 360, frame_h: int = 420):
         self._renderer = _RGBRenderer()
-        self._frame_w  = frame_w
-        self._frame_h  = frame_h
+        self._frame_w = frame_w
+        self._frame_h = frame_h
 
     # ------------------------------------------------------------------
 
-    def ask_user(self, seg1, seg2) -> Optional[Tuple[float, float]]:
+    def label(self, seg1, seg2) -> Optional[Tuple[float, float]]:
         """
         Generate and display the comparison image, then prompt for input.
 
@@ -205,15 +201,19 @@ class HumanPrefInterface(PrefInterface):
             None        skip
         """
         img = _make_comparison_image(
-            seg1.frames, seg2.frames,
-            self._frame_w, self._frame_h,
+            seg1.frames,
+            seg2.frames,
+            self._frame_w,
+            self._frame_h,
         )
         self._renderer.show(img)
 
         print("\n" + "─" * 58)
         print("  Segment comparison displayed in window.")
-        print(f"  L — steps={len(seg1.frames):3d}"
-              f"  R — steps={len(seg2.frames):3d}")
+        print(
+            f"  L — steps={len(seg1.frames):3d}"
+            f"  R — steps={len(seg2.frames):3d}"
+        )
         print("─" * 58)
 
         while True:

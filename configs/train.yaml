@@ -1,0 +1,37 @@
+defaults:
+  - _self_
+  - algorithm: christiano_env_reward
+
+seed: 0
+
+env:
+  expert_model: "highway_discrete_dqn_v2_1"
+  scenario: "highway_discrete_v2"
+
+resources:
+  device: cpu
+
+reward_predictor:
+  lr: 2e-4
+  n_preds: 3
+  val_interval: 50
+  demo_weight: 1.0
+  demo_margin: 1.0
+
+policy:
+  lr: 7e-4
+  gamma: 0.99
+  rollout_steps: 20
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_gradient_norm: 0.5
+
+training:
+  reward_predictor_reload_interval: 50
+  policy_save_interval: 100
+  total_env_steps: 100000
+
+hydra:
+  run:
+    dir: experiments/christiano/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  output_subdir: config
