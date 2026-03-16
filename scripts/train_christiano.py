@@ -54,9 +54,8 @@ from stable_baselines3.common.vec_env import VecMonitor
 from tqdm import tqdm
 
 from learning_from_human_preferences.preferences.pref_db import PrefDB, PrefBuffer, Segment
-from learning_from_human_preferences.reward_model.reward_predictor import (
-    RewardPredictorEnsemble,
-)
+
+from human_feedback_rl.christiano.reward_predictor import RewardPredictorEnsemble
 
 from human_feedback_rl.christiano.expert_pref_interface import ExpertPrefInterface
 from human_feedback_rl.christiano.human_pref_interface import HumanPrefInterface
@@ -98,6 +97,7 @@ def _policy_worker(
     policy_checkpoint_path,
     log_directory,
     shared_env_steps,
+    agent_demo_pipe=None,
 ):
     """
     Subprocess responsible for policy training via SB3 A2C.
@@ -168,6 +168,11 @@ def _policy_worker(
                     segment_pipe.put(seg, block=False)
                 except Exception:
                     pass
+                if agent_demo_pipe is not None:
+                    try:
+                        agent_demo_pipe.put(seg, block=False)
+                    except Exception:
+                        pass
                 current_segment_frames[env_idx]  = []
                 current_segment_rewards[env_idx] = []
 
@@ -182,9 +187,8 @@ def _policy_worker(
     if latest:
         reward_predictor.load(latest)
 
-    wrapped_env = VecMonitor(
-        PredictedRewardVecWrapper(env, reward_predictor, reward_predictor_ready_event)
-    )
+    reward_wrapper = PredictedRewardVecWrapper(env, reward_predictor, reward_predictor_ready_event)
+    wrapped_env    = VecMonitor(reward_wrapper)
 
     remaining_steps = (
         max(1, total_env_steps_target - total_env_steps_phase1)
@@ -198,13 +202,14 @@ def _policy_worker(
         n_envs=num_envs,
         shutdown_event=shutdown_event,
         reward_predictor_ready_event=reward_predictor_ready_event,
-        reward_predictor_wrapper=wrapped_env,
+        reward_predictor_wrapper=reward_wrapper,
         reward_predictor_checkpoint_dir=reward_predictor_checkpoint_dir,
         reload_interval=config.training.reward_predictor_reload_interval,
         save_interval=config.training.policy_save_interval,
         policy_checkpoint_path=policy_checkpoint_path,
         shared_env_steps=shared_env_steps,
         env_steps_offset=total_env_steps_phase1,
+        agent_demo_pipe=agent_demo_pipe,
     )
 
     a2c = SB3A2C(
@@ -435,8 +440,108 @@ def _preference_worker(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Worker: expert demonstration pairs
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _demonstration_worker(
+    config_dict,
+    agent_demo_pipe,
+    demo_pipe,
+    shutdown_event,
+):
+    """
+    Subprocess responsible for generating expert-vs-agent demonstration pairs.
+
+    Runs the expert DQN to collect expert trajectory segments, then pairs each
+    incoming agent segment with a randomly chosen expert segment and sends
+    (expert_frames, agent_frames, (1.0, 0.0)) to demo_pipe.
+
+    The main process drains demo_pipe into demo_db and passes it to the reward
+    predictor's margin ranking loss (L_demo), keeping demonstrations separate
+    from preference pairs (L_pref).
+
+    Rate: one demo pair per agent segment received — naturally proportional to
+    the agent's rollout rate and controllable via demo_seg_pipe_maxsize.
+    """
+    config         = OmegaConf.create(config_dict)
+    segment_length = config.preferences.segment_len
+    max_expert_buf = config.preferences.max_segs
+
+    env, expert_model = build_env_and_expert(config)
+
+    obs      = np.asarray(env.reset())
+    num_envs = obs.shape[0]
+
+    current_frames      = [[] for _ in range(num_envs)]
+    expert_seg_buffer   = []
+
+    print("[demo] Demonstration worker started — collecting expert segments.", flush=True)
+
+    while not shutdown_event.is_set():
+
+        # ── Collect expert segments ───────────────────────────────────────────
+        actions, _ = expert_model.predict(obs, deterministic=True)
+        next_obs, _, dones, _ = env.step(actions)
+        next_obs = np.asarray(next_obs)
+        dones    = np.asarray(dones, dtype=bool)
+
+        for env_idx in range(num_envs):
+            current_frames[env_idx].append(obs[env_idx].copy())
+
+            if len(current_frames[env_idx]) >= segment_length or dones[env_idx]:
+                frames = current_frames[env_idx]
+                while len(frames) < segment_length:
+                    frames.append(frames[-1].copy())
+                expert_seg = Segment(frames[:segment_length])
+                expert_seg.env_rewards = [0.0] * segment_length  # unused for demo pairs
+
+                if len(expert_seg_buffer) < max_expert_buf:
+                    expert_seg_buffer.append(expert_seg)
+                else:
+                    expert_seg_buffer[random.randrange(max_expert_buf)] = expert_seg
+
+                current_frames[env_idx] = []
+
+        obs = next_obs
+
+        if not expert_seg_buffer:
+            continue
+
+        # ── Pair with incoming agent segments ─────────────────────────────────
+        # Drain up to 8 agent segments per expert step to keep up with rollout rate.
+        for _ in range(8):
+            try:
+                agent_seg  = agent_demo_pipe.get(block=False)
+            except queue.Empty:
+                break
+            expert_seg = random.choice(expert_seg_buffer)
+            try:
+                demo_pipe.put(
+                    (expert_seg.frames, agent_seg.frames, (1.0, 0.0)),
+                    block=False,
+                )
+            except Exception:
+                pass
+
+    env.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main process
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _drain_demo_pipe(demo_pipe, demo_db) -> int:
+    """Drain all pending demo pairs from demo_pipe into demo_db. Returns count added."""
+    added = 0
+    while True:
+        try:
+            exp_frames, ag_frames, pref = demo_pipe.get_nowait()
+            demo_db.append(exp_frames, ag_frames, pref)
+            added += 1
+        except Exception:
+            break
+    return added
+
 
 @hydra.main(
     version_base=None,
@@ -456,10 +561,12 @@ def main(cfg: DictConfig):
     preference_interface_log_dir     = str(run_directory / "pref_interface")
 
     # ── Communication channels ────────────────────────────────────────────────
-    segment_pipe                = Queue(maxsize=cfg.preferences.seg_pipe_maxsize)
-    preference_pipe             = Queue()
+    segment_pipe                 = Queue(maxsize=cfg.preferences.seg_pipe_maxsize)
+    agent_demo_pipe              = Queue(maxsize=cfg.preferences.demo_seg_pipe_maxsize)
+    preference_pipe              = Queue()
+    demo_pipe                    = Queue()   # (expert_frames, agent_frames, (1.0,0.0)) → main
     reward_predictor_ready_event = mp.Event()   # main → policy: reward predictor ready
-    shutdown_event              = mp.Event()    # main → all:    time to stop
+    shutdown_event               = mp.Event()   # main → all:    time to stop
 
     # ── Preference databases (owned by main process) ──────────────────────────
     train_database      = PrefDB(maxlen=cfg.preferences.db_train_maxlen)
@@ -470,6 +577,11 @@ def main(cfg: DictConfig):
         log_dir=str(run_directory / "pref_buffer"),
     )
     preference_buffer.start_recv_thread(preference_pipe)
+
+    # Demonstration DB: separate from preference DB so the two losses can be
+    # weighted independently.  No train/val split needed since L_demo is a
+    # margin ranking loss, not cross-entropy — no accuracy metric to monitor.
+    demo_db = PrefDB(maxlen=cfg.preferences.demo_db_maxlen)
 
     # ── Reward predictor (trained in main process) ────────────────────────────
     temp_env        = build_single_env(cfg)
@@ -501,6 +613,7 @@ def main(cfg: DictConfig):
             policy_checkpoint_path,
             str(run_directory),
             shared_env_steps,
+            agent_demo_pipe,
         ),
     )
     preference_process = Process(
@@ -516,17 +629,28 @@ def main(cfg: DictConfig):
             shared_env_steps,
         ),
     )
+    demo_process = Process(
+        target=_demonstration_worker,
+        args=(
+            config_dict,
+            agent_demo_pipe,
+            demo_pipe,
+            shutdown_event,
+        ),
+    )
 
     policy_process.start()
     preference_process.start()
+    demo_process.start()
 
     def _shutdown(*_):
         print("\n[main] Shutting down…", flush=True)
         shutdown_event.set()
         policy_process.join(timeout=15)
         preference_process.join(timeout=15)
+        demo_process.join(timeout=15)
         # Force-terminate any worker still alive after the grace period.
-        for proc in (policy_process, preference_process):
+        for proc in (policy_process, preference_process, demo_process):
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=3)
@@ -555,7 +679,14 @@ def main(cfg: DictConfig):
 
     # ── Phase 2: pretrain reward predictor ────────────────────────────────────
     print("\n[Phase 2] Pretraining reward predictor…")
-    reward_predictor.train(train_db, val_db, val_interval=cfg.reward_predictor.val_interval)
+    _drain_demo_pipe(demo_pipe, demo_db)
+    reward_predictor.train(
+        train_db, val_db,
+        demo_db=demo_db if len(demo_db) > 0 else None,
+        val_interval=cfg.reward_predictor.val_interval,
+        demo_weight=cfg.reward_predictor.demo_weight,
+        demo_margin=cfg.reward_predictor.demo_margin,
+    )
     reward_predictor.save()
     _keep_latest_checkpoints(reward_predictor_checkpoint_dir)
     reward_predictor_ready_event.set()
@@ -573,15 +704,22 @@ def main(cfg: DictConfig):
             time.sleep(1.0)
             continue
 
+        _drain_demo_pipe(demo_pipe, demo_db)
+
         reward_predictor.train(
-            train_db, val_db, val_interval=cfg.reward_predictor.val_interval
+            train_db, val_db,
+            demo_db=demo_db if len(demo_db) > 0 else None,
+            val_interval=cfg.reward_predictor.val_interval,
+            demo_weight=cfg.reward_predictor.demo_weight,
+            demo_margin=cfg.reward_predictor.demo_margin,
         )
         reward_predictor.save()
         _keep_latest_checkpoints(reward_predictor_checkpoint_dir)
         rp_retrain_count += 1
         print(
             f"[rp] retrain #{rp_retrain_count}"
-            f"  train={len(train_db)}  val={len(val_db)}",
+            f"  train={len(train_db)}  val={len(val_db)}"
+            f"  demo={len(demo_db)}",
             flush=True,
         )
 

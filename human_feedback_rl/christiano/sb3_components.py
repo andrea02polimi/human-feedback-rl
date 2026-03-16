@@ -112,6 +112,7 @@ class SegmentCollectorCallback(BaseCallback):
         policy_checkpoint_path: str,
         shared_env_steps,
         env_steps_offset: int = 0,
+        agent_demo_pipe=None,
         verbose: int = 0,
     ):
         super().__init__(verbose)
@@ -127,6 +128,8 @@ class SegmentCollectorCallback(BaseCallback):
         self.policy_checkpoint_path          = policy_checkpoint_path
         self.shared_env_steps                = shared_env_steps
         self.env_steps_offset                = env_steps_offset
+
+        self.agent_demo_pipe         = agent_demo_pipe
 
         self.current_segment_frames  = [[] for _ in range(n_envs)]
         self.current_segment_rewards = [[] for _ in range(n_envs)]
@@ -167,6 +170,11 @@ class SegmentCollectorCallback(BaseCallback):
                     self.segment_pipe.put(seg, block=False)
                 except Exception:
                     pass
+                if self.agent_demo_pipe is not None:
+                    try:
+                        self.agent_demo_pipe.put(seg, block=False)
+                    except Exception:
+                        pass
                 self.current_segment_frames[env_idx]  = []
                 self.current_segment_rewards[env_idx] = []
 

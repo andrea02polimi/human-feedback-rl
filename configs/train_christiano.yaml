@@ -12,6 +12,8 @@ reward_predictor:
   lr: 2e-4
   n_preds: 3          # ensemble size (paper uses 3)
   val_interval: 50    # reward predictor training steps between validation logs
+  demo_weight: 1.0    # weight of L_demo (margin ranking) relative to L_pref
+  demo_margin: 1.0    # margin for ranking loss: relu(margin - (r_expert - r_agent))
 
 # ── Preferences ───────────────────────────────────────────────────────────────
 preferences:
@@ -21,7 +23,9 @@ preferences:
   max_segs: 1000          # max segments kept in preference-worker buffer
   db_train_maxlen: 3000   # max labeled pairs in training database
   db_val_maxlen: 750      # max labeled pairs in validation database (~20%)
-  seg_pipe_maxsize: 100   # individual segments buffered between processes
+  seg_pipe_maxsize: 100       # individual segments buffered between processes
+  demo_seg_pipe_maxsize: 100  # agent segments buffered for demonstration worker
+  demo_db_maxlen: 1500        # max (expert, agent) pairs kept in demonstration DB
   disagreement_candidates: 20   # candidate pairs evaluated per disagreement selection
   max_query_interval: 5.0       # max sleep between queries (reached at total_env_steps)
 
