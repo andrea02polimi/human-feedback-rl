@@ -65,15 +65,21 @@ def main(cfg: DictConfig):
     # PROJECT_ROOT = human-feedback-rl/
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+    PROJECT_ROOT2 = Path(__file__).resolve().parents[2]
+
     # ── Load training config to reproduce the exact environment ──────────────
     run_dir = PROJECT_ROOT / cfg.run.dir
     train_cfg = OmegaConf.load(run_dir / "config" / "config.yaml")
 
+    expert_cfg = OmegaConf.load(
+        PROJECT_ROOT2 / train_cfg.env.expert_model / ".hydra" / "config.yaml"
+    )
+
     print(f"[eval] Training run : {run_dir}")
-    print(f"[eval] Scenario     : {train_cfg.env.scenario}")
+    print(f"[eval] Scenario     : {expert_cfg.env}")
 
     # ── Build single (non-vectorized) environment ─────────────────────────────
-    env = sre.make_env(train_cfg.env.scenario, seed=train_cfg.seed)
+    env = sre.make_env(expert_cfg.env, seed=train_cfg.seed)
 
     # ── Load policy (SB3 A2C .zip format) ────────────────────────────────────
     agent_path = PROJECT_ROOT / cfg.agent.model

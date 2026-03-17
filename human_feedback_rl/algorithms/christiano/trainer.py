@@ -102,7 +102,8 @@ class ChristianoTrainer(BaseTrainer):
         config_dict = OmegaConf.to_container(cfg, resolve=True)
 
         # Shared counter so the preference worker can read env steps for annealing.
-        shared_env_steps = mp.Value("l", 0)
+        shared_env_steps     = mp.Value("l", 0)
+        policy_metrics_queue = Queue()   # subprocess → main: A2C metrics for wandb
 
         policy_process = Process(
             target=_policy_worker,
@@ -116,7 +117,7 @@ class ChristianoTrainer(BaseTrainer):
                 str(run_directory),
                 shared_env_steps,
                 agent_demo_pipe,
-                wandb.run.id,
+                policy_metrics_queue,
             ),
         )
         preference_process = Process(
@@ -205,6 +206,14 @@ class ChristianoTrainer(BaseTrainer):
 
         rp_retrain_count = 0
         while not shutdown_event.is_set():
+            # Forward any pending A2C metrics from the policy subprocess to wandb.
+            while True:
+                try:
+                    metrics = policy_metrics_queue.get_nowait()
+                    wandb.log(metrics)
+                except Exception:
+                    break
+
             train_db, val_db = preference_buffer.get_dbs()
             if len(train_db) == 0 or len(val_db) == 0:
                 time.sleep(1.0)

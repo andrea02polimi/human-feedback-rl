@@ -35,7 +35,7 @@ def build_env_and_expert(cfg):
 
     expert_model = sre.load_model(
         env,
-        cfg=run_cfg,
+        cfg=run_cfg.algo,
         load_path=model_path,
         seed=run_cfg.seed,
         device=run_cfg.resources.device,

@@ -1,3 +1,4 @@
+# @package _global_
 # Config 1: Christiano et al. with environment reward oracle (original)
 preferences:
   oracle: "env_reward"

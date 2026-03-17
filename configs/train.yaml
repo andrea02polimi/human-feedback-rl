@@ -6,7 +6,6 @@ seed: 0
 
 env:
   expert_model: "highway_discrete_dqn_v2_1"
-  scenario: "highway_discrete_v2"
 
 resources:
   device: cpu

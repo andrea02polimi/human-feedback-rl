@@ -62,6 +62,7 @@ class SegmentCollectorCallback(BaseCallback):
         self.env_steps_offset                = env_steps_offset
 
         self.agent_demo_pipe         = agent_demo_pipe
+        self.metrics_queue           = None   # set by _policy_worker after construction
 
         self.current_segment_frames  = [[] for _ in range(n_envs)]
         self.current_segment_rewards = [[] for _ in range(n_envs)]
@@ -128,10 +129,24 @@ class SegmentCollectorCallback(BaseCallback):
             path = Path(self.policy_checkpoint_path)
             path.parent.mkdir(parents=True, exist_ok=True)
             self.model.save(str(path))
-            avg_reward = float(np.mean(self.model.rollout_buffer.rewards))
+            avg_predicted_reward = float(np.mean(self.model.rollout_buffer.rewards))
             print(
                 f"[policy] gradient_step={self._gradient_step_count}"
                 f"  env_steps={self.shared_env_steps.value}"
-                f"  avg_predicted_reward={avg_reward:.3f}",
+                f"  avg_predicted_reward={avg_predicted_reward:.3f}",
                 flush=True,
             )
+
+        # Forward episode metrics to the main process for wandb logging.
+        if self.metrics_queue is not None and self.model.ep_info_buffer:
+            ep_rews = [info["r"] for info in self.model.ep_info_buffer]
+            ep_lens = [info["l"] for info in self.model.ep_info_buffer]
+            try:
+                self.metrics_queue.put_nowait({
+                    "policy/ep_rew_mean":  float(np.mean(ep_rews)),
+                    "policy/ep_len_mean":  float(np.mean(ep_lens)),
+                    "policy/avg_predicted_reward": float(np.mean(self.model.rollout_buffer.rewards)),
+                    "env_steps":           self.shared_env_steps.value,
+                })
+            except Exception:
+                pass
