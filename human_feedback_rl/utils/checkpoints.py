@@ -1,7 +1,6 @@
 """
 Checkpoint management utilities for the RLHF training pipeline.
 
-Moved from scripts/train_christiano.py.
 """
 
 import os

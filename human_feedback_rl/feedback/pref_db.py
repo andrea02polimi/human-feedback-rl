@@ -1,8 +1,6 @@
 """
 Preference database — PrefDB and PrefBuffer.
 
-Implemented from scratch; does NOT import from learning_from_human_preferences.
-Behaviour mirrors the library version exactly.
 """
 
 import copy
@@ -146,6 +144,7 @@ class PrefBuffer:
         self,
         db_train: PrefDB,
         db_val: PrefDB,
+        shared_steps=None,
     ):
         self.train_db = db_train
         self.val_db = db_val
@@ -153,6 +152,7 @@ class PrefBuffer:
         self._stop_flag = False
         self._thread: Optional[Thread] = None
         self.step = 0
+        self._shared_steps = shared_steps
 
     # ------------------------------------------------------------------
 
@@ -198,12 +198,12 @@ class PrefBuffer:
                     self.train_db.append(seg1, seg2, preference)
 
                 if wandb.run is not None:
+                    a2c_step = self._shared_steps.value if self._shared_steps is not None else None
                     wandb.log({
-                        "prefs/train_db_size":   len(self.train_db),
-                        "prefs/val_db_size":     len(self.val_db),
-                        "prefs/total_received":  received,
-                        "pref_step":             self.step,
-                    })
+                        "prefs/train_db_size":  len(self.train_db),
+                        "prefs/val_db_size":    len(self.val_db),
+                        "prefs/total_received": received,
+                    }, step=a2c_step)
 
     # ------------------------------------------------------------------
 

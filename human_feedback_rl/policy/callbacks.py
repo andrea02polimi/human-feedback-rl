@@ -1,7 +1,6 @@
 """
 SB3 training callback for the Christiano et al. pipeline.
 
-Extracted from human_feedback_rl/christiano/sb3_components.py.
 """
 
 import numpy as np
@@ -63,7 +62,9 @@ class SegmentCollectorCallback(BaseCallback):
 
         self.agent_demo_pipe         = agent_demo_pipe
         self.metrics_queue           = None   # set by _policy_worker after construction
+        self.a2c_steps               = None   # set by _policy_worker after construction
 
+        # buffer oer costruire segmenti, uno per ogni ambiente
         self.current_segment_frames  = [[] for _ in range(n_envs)]
         self.current_segment_rewards = [[] for _ in range(n_envs)]
         self._gradient_step_count    = 0
@@ -76,6 +77,7 @@ class SegmentCollectorCallback(BaseCallback):
         self.shared_env_steps.value = self.env_steps_offset + self.num_timesteps
 
         # obs_tensor holds the pre-step observation (set by SB3 before env.step).
+        # self.locals è un dizionare interno di SB3 che contiene tutte le variabili locali del loop di training
         obs_tensor = self.locals.get("obs_tensor")
         if obs_tensor is None:
             return True
@@ -117,6 +119,10 @@ class SegmentCollectorCallback(BaseCallback):
         """Called once per A2C gradient update (after rollout collection)."""
         self._gradient_step_count += 1
 
+        # Keep the shared A2C step counter in sync (used as wandb X axis).
+        if self.a2c_steps is not None:
+            self.a2c_steps.value = self.num_timesteps
+
         # Reload the latest reward predictor checkpoint periodically.
         if (
             self.reward_predictor_ready_event.is_set()
@@ -143,10 +149,9 @@ class SegmentCollectorCallback(BaseCallback):
             ep_lens = [info["l"] for info in self.model.ep_info_buffer]
             try:
                 self.metrics_queue.put_nowait({
-                    "policy/ep_rew_mean":  float(np.mean(ep_rews)),
-                    "policy/ep_len_mean":  float(np.mean(ep_lens)),
-                    "policy/avg_predicted_reward": float(np.mean(self.model.rollout_buffer.rewards)),
-                    "env_steps":           self.shared_env_steps.value,
+                    "policy/ep_rew_mean":           float(np.mean(ep_rews)),
+                    "policy/ep_len_mean":           float(np.mean(ep_lens)),
+                    "policy/avg_predicted_reward":  float(np.mean(self.model.rollout_buffer.rewards)),
                 })
             except Exception:
                 pass

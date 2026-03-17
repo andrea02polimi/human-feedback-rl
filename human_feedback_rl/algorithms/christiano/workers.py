@@ -3,8 +3,6 @@ Worker functions for the Christiano et al. RLHF pipeline.
 
 These are top-level functions (not methods) because they are passed to
 multiprocessing.Process(target=...) and must be picklable.
-
-Extracted from scripts/train_christiano.py with updated imports.
 """
 
 import functools
@@ -19,8 +17,8 @@ from human_feedback_rl.reward_models.networks import SumoRewardNetwork
 from human_feedback_rl.policy.wrappers import PredictedRewardVecWrapper
 from human_feedback_rl.policy.callbacks import SegmentCollectorCallback
 from human_feedback_rl.feedback.segment import Segment
-from human_feedback_rl.feedback.collector import PreferenceCollector
-from human_feedback_rl.feedback.demonstrations import DemonstrationCollector
+from human_feedback_rl.feedback.preference_collector import PreferenceCollector
+from human_feedback_rl.feedback.demonstration_collector import DemonstrationCollector
 from human_feedback_rl.feedback.oracles.factory import build_oracle
 from human_feedback_rl.utils.env_setup import build_env_and_expert, build_single_env
 
@@ -41,6 +39,7 @@ def _policy_worker(
     shared_env_steps,
     agent_demo_pipe=None,
     policy_metrics_queue=None,
+    a2c_steps=None,
 ):
     """
     Subprocess responsible for policy training via SB3 A2C.
@@ -159,6 +158,7 @@ def _policy_worker(
         agent_demo_pipe=agent_demo_pipe,
     )
     callback.metrics_queue = policy_metrics_queue
+    callback.a2c_steps     = a2c_steps
 
     a2c = SB3A2C(
         "MlpPolicy",
@@ -206,7 +206,6 @@ def _preference_worker(
     reward_predictor_ready_event,
     shutdown_event,
     reward_predictor_checkpoint_dir,
-    log_directory,
     shared_env_steps,
 ):
     """
@@ -218,7 +217,7 @@ def _preference_worker(
     sys.stdin = os.fdopen(0)
 
     config = OmegaConf.create(config_dict)
-    oracle = build_oracle(config, log_directory)
+    oracle = build_oracle(config)
 
     # Need observation_dim to instantiate the RP for disagreement scoring.
     env = build_single_env(config)

@@ -1,7 +1,5 @@
 """
 Batch iterator utility.
-
-Replaces batch_iter from learning_from_human_preferences.envs.utils.
 """
 
 from typing import List, Iterator

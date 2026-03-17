@@ -2,7 +2,6 @@
 PreferenceCollector — encapsulates the segment buffer and pair-sampling logic
 used by the preference worker subprocess.
 
-Extracted from _preference_worker in scripts/train_christiano.py.
 """
 
 import functools

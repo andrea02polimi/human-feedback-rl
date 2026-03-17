@@ -10,7 +10,7 @@ from .human import HumanOracle
 from human_feedback_rl.utils.env_setup import build_env_and_expert
 
 
-def build_oracle(config: DictConfig, log_dir: str = None) -> BaseOracle:
+def build_oracle(config: DictConfig) -> BaseOracle:
     """
     Build the appropriate oracle based on config.preferences.oracle.
 
@@ -18,10 +18,6 @@ def build_oracle(config: DictConfig, log_dir: str = None) -> BaseOracle:
         "env_reward" — ExpertOracle using true environment rewards
         "qnet"       — ExpertOracle using expert DQN Q-values
         "human"      — HumanOracle (terminal prompt + pyglet window)
-
-    Args:
-        config:  Hydra DictConfig with a preferences.oracle field
-        log_dir: optional log directory (unused currently, kept for API symmetry)
     """
     oracle = config.preferences.oracle
 

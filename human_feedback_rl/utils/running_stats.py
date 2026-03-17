@@ -1,7 +1,6 @@
 """
 Welford's online algorithm for running mean and standard deviation.
 
-Replaces RunningStat from learning_from_human_preferences.envs.utils.
 """
 
 import numpy as np

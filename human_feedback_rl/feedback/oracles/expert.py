@@ -5,8 +5,6 @@ Supports two modes:
   "env_reward"  — prefer segment with higher sum of true environment rewards
   "qnet"        — prefer segment with higher sum of V(s) = max_a Q(s, a)
 
-Moved and adapted from human_feedback_rl/christiano/expert_pref_interface.py.
-Does NOT inherit from PrefInterface.
 """
 
 from typing import Optional, Tuple

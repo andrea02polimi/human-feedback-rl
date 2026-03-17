@@ -2,7 +2,6 @@
 SB3-compatible VecEnv wrapper that replaces environment rewards with
 reward-predictor predictions.
 
-Extracted from human_feedback_rl/christiano/sb3_components.py.
 """
 
 import numpy as np

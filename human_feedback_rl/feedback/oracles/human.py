@@ -1,15 +1,6 @@
 """
 Human preference oracle with side-by-side visual comparison.
 
-Since the SUMO environment uses vector observations (not images), each segment
-is rendered as a matplotlib time-series chart of the observation features.
-The two segment charts are placed side-by-side and displayed in a pyglet window
-running in a dedicated subprocess (required by macOS Cocoa).
-
-The annotator types L / R / E / S in the terminal to label the pair.
-
-Moved and adapted from human_feedback_rl/christiano/human_pref_interface.py.
-Does NOT inherit from PrefInterface.
 """
 
 import queue

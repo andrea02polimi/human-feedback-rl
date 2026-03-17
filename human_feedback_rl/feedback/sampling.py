@@ -1,7 +1,6 @@
 """
 Segment pair sampling strategies for preference collection.
 
-Moved from scripts/train_christiano.py (renamed, no underscore prefix).
 """
 
 import random

@@ -1,9 +1,5 @@
 """
 ChristianoTrainer — orchestrates the full Christiano et al. (2017) RLHF pipeline.
-
-Moved from the main() function in scripts/train_christiano.py.
-The @hydra.main decorator and mp.set_start_method live in the script entry point,
-not here.
 """
 
 import functools
@@ -62,7 +58,6 @@ class ChristianoTrainer(BaseTrainer):
         )
         reward_predictor_checkpoint_dir = str(run_directory / "reward_predictor_checkpoints")
         policy_checkpoint_path          = str(run_directory / "models" / "policy_christiano")
-        preference_interface_log_dir    = str(run_directory / "pref_interface")
 
         use_demonstrations = cfg.preferences.use_demonstrations
 
@@ -77,12 +72,20 @@ class ChristianoTrainer(BaseTrainer):
         demo_pipe       = Queue()                                               if use_demonstrations else None
         demo_db         = DemoDatabase(maxlen=cfg.preferences.demo_db_maxlen) if use_demonstrations else None
 
+        # Shared step counters.
+        # shared_env_steps: total steps across Phase 1 + Phase 2 (used for query annealing)
+        # a2c_steps:        A2C-only steps starting from 0 at Phase 2 (used as wandb X axis)
+        shared_env_steps     = mp.Value("l", 0)
+        a2c_steps            = mp.Value("l", 0)
+        policy_metrics_queue = Queue()   # subprocess → main: A2C metrics for wandb
+
         # ── Preference databases (owned by main process) ──────────────────────
         train_database      = PrefDB(maxlen=cfg.preferences.db_train_maxlen)
         validation_database = PrefDB(maxlen=cfg.preferences.db_val_maxlen)
         preference_buffer   = PrefBuffer(
             train_database,
             validation_database,
+            shared_steps=a2c_steps,
         )
         preference_buffer.start_recv_thread(preference_pipe)
 
@@ -102,10 +105,6 @@ class ChristianoTrainer(BaseTrainer):
         # ── Launch worker processes ───────────────────────────────────────────
         config_dict = OmegaConf.to_container(cfg, resolve=True)
 
-        # Shared counter so the preference worker can read env steps for annealing.
-        shared_env_steps     = mp.Value("l", 0)
-        policy_metrics_queue = Queue()   # subprocess → main: A2C metrics for wandb
-
         policy_process = Process(
             target=_policy_worker,
             args=(
@@ -119,6 +118,7 @@ class ChristianoTrainer(BaseTrainer):
                 shared_env_steps,
                 agent_demo_pipe,
                 policy_metrics_queue,
+                a2c_steps,
             ),
         )
         preference_process = Process(
@@ -130,7 +130,6 @@ class ChristianoTrainer(BaseTrainer):
                 reward_predictor_ready_event,
                 shutdown_event,
                 reward_predictor_checkpoint_dir,
-                preference_interface_log_dir,
                 shared_env_steps,
             ),
         )
@@ -196,6 +195,7 @@ class ChristianoTrainer(BaseTrainer):
             val_interval=cfg.reward_predictor.val_interval,
             demo_weight=cfg.reward_predictor.demo_weight,
             demo_margin=cfg.reward_predictor.demo_margin,
+            global_step=0,
         )
         reward_predictor.save()
         keep_latest_checkpoints(reward_predictor_checkpoint_dir)
@@ -211,7 +211,7 @@ class ChristianoTrainer(BaseTrainer):
             while True:
                 try:
                     metrics = policy_metrics_queue.get_nowait()
-                    wandb.log(metrics)
+                    wandb.log(metrics, step=a2c_steps.value)
                 except Exception:
                     break
 
@@ -229,6 +229,7 @@ class ChristianoTrainer(BaseTrainer):
                 val_interval=cfg.reward_predictor.val_interval,
                 demo_weight=cfg.reward_predictor.demo_weight,
                 demo_margin=cfg.reward_predictor.demo_margin,
+                global_step=a2c_steps.value,
             )
             reward_predictor.save()
             keep_latest_checkpoints(reward_predictor_checkpoint_dir)

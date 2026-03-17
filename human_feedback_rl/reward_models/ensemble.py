@@ -111,6 +111,7 @@ class RewardPredictorEnsemble:
         val_interval: int  = 50,
         demo_weight: float = 1.0,
         demo_margin: float = 1.0,
+        global_step: int   = None,
     ) -> None:
         """
         One pass over pref_db (and optionally demo_db).
@@ -199,15 +200,15 @@ class RewardPredictorEnsemble:
             self.n_steps += 1
 
             if val_interval > 0 and self.n_steps % val_interval == 0:
-                self._val_step(val_db)
+                self._val_step(val_db, global_step)
 
                 if self._log and wandb.run is not None:
-                    log_dict = {"rp/train/loss": loss.item(), "rp_step": self.n_steps}
+                    log_dict = {"rp/train/loss": loss.item()}
                     if demo_batch:
                         log_dict["rp/train/demo_margin_loss"] = L_demo.item()
-                    wandb.log(log_dict)
+                    wandb.log(log_dict, step=global_step)
 
-    def _val_step(self, val_db) -> None:
+    def _val_step(self, val_db, global_step: int = None) -> None:
         if len(val_db) == 0:
             return
         batch_size = min(32, len(val_db.preferences))
@@ -244,8 +245,7 @@ class RewardPredictorEnsemble:
             wandb.log({
                 "rp/val/loss":     total_loss / self.n_preds,
                 "rp/val/accuracy": total_acc  / self.n_preds,
-                "rp_step":         self.n_steps,
-            })
+            }, step=global_step)
 
     # ── Checkpointing ──────────────────────────────────────────────────────────
 
