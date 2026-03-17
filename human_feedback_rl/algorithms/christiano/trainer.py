@@ -62,8 +62,8 @@ class ChristianoTrainer(BaseTrainer):
         use_demonstrations = cfg.preferences.use_demonstrations
 
         # ── Communication channels ────────────────────────────────────────────
-        segment_pipe                 = Queue(maxsize=cfg.preferences.seg_pipe_maxsize)
-        preference_pipe              = Queue()
+        segment_pipe                 = Queue(maxsize=cfg.preferences.seg_pipe_maxsize) # segmenti generati ad alta velocità, consumo lento, scarto i meno recenti
+        preference_pipe              = Queue() # non voglio scartare nulla
         reward_predictor_ready_event = mp.Event()   # main → policy: reward predictor ready
         shutdown_event               = mp.Event()   # main → all:    time to stop
 

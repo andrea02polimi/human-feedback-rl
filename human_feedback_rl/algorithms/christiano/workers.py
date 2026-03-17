@@ -136,11 +136,9 @@ def _policy_worker(
     reward_wrapper = PredictedRewardVecWrapper(env, reward_predictor, reward_predictor_ready_event)
     wrapped_env    = VecMonitor(reward_wrapper)
 
-    remaining_steps = (
-        max(1, total_env_steps_target - total_env_steps_phase1)
-        if total_env_steps_target > 0
-        else int(1e9)
-    )
+    # total_env_steps_target is the budget for A2C training only.
+    # Phase 1 random rollouts are not counted against it.
+    remaining_steps = total_env_steps_target if total_env_steps_target > 0 else int(1e9)
 
     callback = SegmentCollectorCallback(
         segment_pipe=segment_pipe,
