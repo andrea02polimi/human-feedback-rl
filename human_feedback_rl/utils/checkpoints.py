@@ -28,8 +28,8 @@ def drain_demo_pipe(demo_pipe, demo_db) -> int:
     added = 0
     while True:
         try:
-            exp_frames, ag_frames, pref = demo_pipe.get_nowait()
-            demo_db.append(exp_frames, ag_frames, pref)
+            exp_frames, ag_frames = demo_pipe.get_nowait()
+            demo_db.append(exp_frames, ag_frames)
             added += 1
         except Exception:
             break

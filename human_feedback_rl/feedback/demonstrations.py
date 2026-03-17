@@ -73,7 +73,7 @@ class DemonstrationCollector:
     def try_pair(self, agent_demo_pipe, demo_pipe, max_pairs: int = 8) -> None:
         """
         Drain up to max_pairs agent segments from agent_demo_pipe; for each,
-        pick a random expert segment and put (expert_frames, agent_frames, (1.0, 0.0))
+        pick a random expert segment and put (expert_frames, agent_frames)
         into demo_pipe.
         """
         for _ in range(max_pairs):
@@ -84,7 +84,7 @@ class DemonstrationCollector:
             expert_seg = random.choice(self._expert_buffer)
             try:
                 demo_pipe.put(
-                    (expert_seg.frames, agent_seg.frames, (1.0, 0.0)),
+                    (expert_seg.frames, agent_seg.frames),
                     block=False,
                 )
             except Exception:

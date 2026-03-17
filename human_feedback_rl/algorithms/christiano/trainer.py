@@ -28,6 +28,7 @@ from human_feedback_rl.algorithms.christiano.workers import (
     _demonstration_worker,
 )
 from human_feedback_rl.feedback.pref_db import PrefDB, PrefBuffer
+from human_feedback_rl.feedback.demo_db import DemoDatabase
 from human_feedback_rl.reward_models.ensemble import RewardPredictorEnsemble
 from human_feedback_rl.reward_models.networks import SumoRewardNetwork
 from human_feedback_rl.utils.env_setup import build_single_env
@@ -74,7 +75,7 @@ class ChristianoTrainer(BaseTrainer):
         # Demo pipes/DB only created when demonstrations are enabled.
         agent_demo_pipe = Queue(maxsize=cfg.preferences.demo_seg_pipe_maxsize) if use_demonstrations else None
         demo_pipe       = Queue()                                               if use_demonstrations else None
-        demo_db         = PrefDB(maxlen=cfg.preferences.demo_db_maxlen)        if use_demonstrations else None
+        demo_db         = DemoDatabase(maxlen=cfg.preferences.demo_db_maxlen) if use_demonstrations else None
 
         # ── Preference databases (owned by main process) ──────────────────────
         train_database      = PrefDB(maxlen=cfg.preferences.db_train_maxlen)

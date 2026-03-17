@@ -16,7 +16,7 @@ from human_feedback_rl.algorithms.christiano.trainer import ChristianoTrainer
 
 @hydra.main(version_base=None, config_path="../configs", config_name="train.yaml")
 def main(cfg: DictConfig) -> None:
-    mp.set_start_method("spawn", force=True)
+    mp.set_start_method("spawn", force=True) # Questo impone che i processi figli vengano creati con spawn.
     ChristianoTrainer().train(cfg)
 
 

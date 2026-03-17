@@ -127,7 +127,7 @@ class RewardPredictorEnsemble:
             return
 
         # Pre-fetch demo pairs once per training pass for efficient sampling.
-        demo_pairs = self._extract_pairs(demo_db) if (demo_db is not None and len(demo_db) > 0) else []
+        demo_pairs = list(demo_db) if (demo_db is not None and len(demo_db) > 0) else []
         random.shuffle(demo_pairs)
         demo_idx = [0]   # list so the inner closure can mutate it
 
@@ -179,11 +179,11 @@ class RewardPredictorEnsemble:
                 L_demo = torch.tensor(0.0, device=self.device)
                 if demo_batch:
                     exp_t = torch.tensor(
-                        [e for e, a, _ in demo_batch],
+                        [e for e, a in demo_batch],
                         dtype=torch.float32,
                     ).to(self.device)   # (B, T, obs_dim)
                     ag_t  = torch.tensor(
-                        [a for e, a, _ in demo_batch],
+                        [a for e, a in demo_batch],
                         dtype=torch.float32,
                     ).to(self.device)
 
@@ -206,10 +206,6 @@ class RewardPredictorEnsemble:
                     if demo_batch:
                         log_dict["rp/train/demo_margin_loss"] = L_demo.item()
                     wandb.log(log_dict)
-
-    def _extract_pairs(self, db) -> list:
-        """Return [(seg1_frames, seg2_frames, pref), ...] from a PrefDB."""
-        return [(db.segments[k1], db.segments[k2], p) for k1, k2, p in db.preferences]
 
     def _val_step(self, val_db) -> None:
         if len(val_db) == 0:
