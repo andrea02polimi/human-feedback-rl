@@ -44,6 +44,38 @@ def build_env_and_expert(cfg):
     return env, expert_model
 
 
+def build_demo_env_and_expert(cfg):
+    """
+    Create a 1-env VecEnv + expert model for the demonstration worker.
+
+    Uses a different seed from the policy worker to avoid duplicate episodes.
+    A single env is sufficient because the demo worker processes one agent
+    segment at a time (no need for parallelism).
+
+    Returns:
+        env          — SB3 VecEnv with n_envs=1
+        expert_model — SB3 DQN with a .q_net attribute
+    """
+    run_cfg = _load_expert_run_cfg(cfg)
+    model_path = PROJECT_ROOT / cfg.env.expert_model / "model.zip"
+
+    env = sre.make_vec_env(
+        run_cfg.env,
+        n_envs=1,
+        base_seed=cfg.seed + 1000,
+    )
+
+    expert_model = sre.load_model(
+        env,
+        cfg=run_cfg.algo,
+        load_path=model_path,
+        seed=run_cfg.seed,
+        device=run_cfg.resources.device,
+    )
+
+    return env, expert_model
+
+
 def build_single_env(cfg):
     """
     Create a single (non-vectorized) gymnasium environment.

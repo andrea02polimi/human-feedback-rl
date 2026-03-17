@@ -20,7 +20,7 @@ from human_feedback_rl.feedback.segment import Segment
 from human_feedback_rl.feedback.preference_collector import PreferenceCollector
 from human_feedback_rl.feedback.demonstration_collector import DemonstrationCollector
 from human_feedback_rl.feedback.oracles.factory import build_oracle
-from human_feedback_rl.utils.env_setup import build_env_and_expert, build_single_env
+from human_feedback_rl.utils.env_setup import build_env_and_expert, build_single_env, build_demo_env_and_expert
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -253,36 +253,37 @@ def _demonstration_worker(
     shutdown_event,
 ):
     """
-    Subprocess responsible for generating expert-vs-agent demonstration pairs.
+    Subprocess responsible for generating expert-correction demonstration pairs.
 
-    Thin wrapper: delegates segment collection and pairing to
-    DemonstrationCollector.
+    For each agent segment received, queries the expert policy on each agent
+    observation to get the expert's action, steps the demo environment, and
+    collects the resulting observations as the expert-correction segment.
+
+    Sends (expert_correction_frames, agent_frames) to demo_pipe.
     """
-    config = OmegaConf.create(config_dict)
-    env, expert_model = build_env_and_expert(config)
-    obs = np.asarray(env.reset())
-    num_envs = obs.shape[0]
+    import queue as _queue
 
-    collector = DemonstrationCollector(
-        config.preferences.segment_len,
-        config.preferences.max_segs,
-        num_envs,
-    )
+    config = OmegaConf.create(config_dict)
+    env, expert_model = build_demo_env_and_expert(config)
+    env.reset()
+
+    collector = DemonstrationCollector(config.preferences.segment_len)
 
     print("[demo] Demonstration worker started.", flush=True)
 
     while not shutdown_event.is_set():
-        actions, _ = expert_model.predict(obs, deterministic=True)
-        next_obs, _, dones, _ = env.step(actions)
-        next_obs = np.asarray(next_obs)
-        dones    = np.asarray(dones, dtype=bool)
+        try:
+            agent_seg = agent_demo_pipe.get(timeout=1.0)
+        except _queue.Empty:
+            continue
 
-        for seg in collector.process_step(obs, dones):
-            collector.add_to_buffer(seg)
+        expert_frames = collector.create_expert_correction(
+            agent_seg.frames, expert_model, env
+        )
 
-        if collector.has_expert_segments():
-            collector.try_pair(agent_demo_pipe, demo_pipe)
-
-        obs = next_obs
+        try:
+            demo_pipe.put((expert_frames, agent_seg.frames), block=False)
+        except Exception:
+            pass
 
     env.close()
