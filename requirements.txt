@@ -9,11 +9,5 @@ omegaconf>=2.3.0
 # Utilities
 tqdm>=4.65.0
 
-# Environment (private repo — install separately)
-# git+https://github.com/<your-org>/sumo-rl-ego.git
-
-# Learning from human preferences library
-git+https://github.com/andrea02polimi/learning-from-human-preferences.git@master
-
 pyglet
 scipy
