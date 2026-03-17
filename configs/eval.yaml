@@ -1,10 +1,10 @@
 run:
   # Path to the training run directory (relative to human-feedback-rl/)
-  dir: "experiments/christiano/2026-03-17/11-50-32"
+  dir: "experiments/christiano/2026-03-17/12-12-35"
 
 agent:
   # Path to the policy checkpoint (relative to human-feedback-rl/)
-  model: "experiments/christiano/2026-03-17/11-50-32/models/policy_christiano"
+  model: "experiments/christiano/2026-03-17/12-12-35/models/policy_christiano"
 
 eval:
   episodes: 100

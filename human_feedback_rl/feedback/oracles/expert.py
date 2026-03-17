@@ -1,9 +1,13 @@
 """
 Expert oracle for synthetic preference labeling.
 
-Supports two modes:
+Supports two scoring modes:
   "env_reward"  — prefer segment with higher sum of true environment rewards
   "qnet"        — prefer segment with higher sum of V(s) = max_a Q(s, a)
+
+Supports two labeling modes:
+  "hard"  — (1,0) / (0,1) / (0.5,0.5)  [original Christiano et al.]
+  "soft"  — softmax over scores
 
 """
 
@@ -16,25 +20,36 @@ from .base import BaseOracle
 
 class ExpertOracle(BaseOracle):
     """
-    Synthetic preference oracle supporting two scoring modes.
+    Synthetic preference oracle supporting two scoring modes and two label modes.
 
     Args:
         mode:         "env_reward" | "qnet"
+        label_mode:   "hard" | "soft"
         expert_model: SB3 DQN with a .q_net attribute — required when mode="qnet"
     """
 
-    def __init__(self, mode: str = "env_reward", expert_model=None):
-        self.mode = mode
-        self.expert_model = expert_model
-
+    def __init__(
+        self,
+        mode: str = "env_reward",
+        label_mode: str = "hard",
+        expert_model=None,
+    ):
         if mode == "qnet" and expert_model is None:
             raise ValueError("mode='qnet' requires expert_model to be provided")
+        if label_mode not in ("soft", "hard"):
+            raise ValueError(f"label_mode must be 'soft' or 'hard', got {label_mode!r}")
+        self.mode         = mode
+        self.label_mode   = label_mode
+        self.expert_model = expert_model
 
     # ------------------------------------------------------------------
 
     def label(self, seg1, seg2) -> Optional[Tuple[float, float]]:
         """
-        Score both segments and return a soft preference (p1, p2) where p1+p2=1.0.
+        Score both segments and return a preference (p1, p2) where p1+p2=1.0.
+
+        hard mode: (1,0) / (0,1) / (0.5,0.5) — original Christiano et al.
+        soft mode: softmax over raw scores.
         """
         if self.mode == "qnet":
             score1 = self._score_qnet(seg1)
@@ -43,9 +58,14 @@ class ExpertOracle(BaseOracle):
             score1 = self._score_env_reward(seg1)
             score2 = self._score_env_reward(seg2)
 
-        probs = torch.softmax(torch.tensor([score1, score2]), dim=0)
-        p1, p2 = probs.tolist()
-        return (p1, p2)
+        if self.label_mode == "soft":
+            probs = torch.softmax(torch.tensor([score1, score2]), dim=0)
+            return tuple(probs.tolist())
+
+        # hard labels
+        if abs(score1 - score2) < 1e-6:
+            return (0.5, 0.5)
+        return (1.0, 0.0) if score1 > score2 else (0.0, 1.0)
 
     # ------------------------------------------------------------------
 

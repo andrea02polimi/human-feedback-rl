@@ -2,6 +2,7 @@
 # Config 2: Christiano et al. with expert Q-net oracle
 preferences:
   oracle: "qnet"
+  label_mode: "soft"
   use_demonstrations: false
   initial_prefs: 500
   segment_len: 25

@@ -2,6 +2,7 @@
 # Config 3: Christiano et al. with environment reward oracle + demonstrations
 preferences:
   oracle: "env_reward"
+  label_mode: "soft"
   use_demonstrations: true
   initial_prefs: 500
   segment_len: 25

@@ -143,15 +143,25 @@ class SegmentCollectorCallback(BaseCallback):
                 flush=True,
             )
 
-        # Forward episode metrics to the main process for wandb logging.
-        if self.metrics_queue is not None and self.model.ep_info_buffer:
-            ep_rews = [info["r"] for info in self.model.ep_info_buffer]
-            ep_lens = [info["l"] for info in self.model.ep_info_buffer]
+        # Forward metrics to the main process for wandb logging.
+        if self.metrics_queue is not None:
+            metrics = {
+                "policy/avg_predicted_reward": float(np.mean(self.model.rollout_buffer.rewards)),
+            }
+
+            # Episode metrics (available once at least one episode has completed).
+            if self.model.ep_info_buffer:
+                ep_rews = [info["r"] for info in self.model.ep_info_buffer]
+                ep_lens = [info["l"] for info in self.model.ep_info_buffer]
+                metrics["policy/ep_rew_mean"] = float(np.mean(ep_rews))
+                metrics["policy/ep_len_mean"] = float(np.mean(ep_lens))
+
+            # Training loss metrics logged by SB3 (value_loss, policy_gradient_loss, etc.)
+            for key, value in self.model.logger.name_to_value.items():
+                if key.startswith("train/"):
+                    metrics[f"policy/{key}"] = float(value)
+
             try:
-                self.metrics_queue.put_nowait({
-                    "policy/ep_rew_mean":           float(np.mean(ep_rews)),
-                    "policy/ep_len_mean":           float(np.mean(ep_lens)),
-                    "policy/avg_predicted_reward":  float(np.mean(self.model.rollout_buffer.rewards)),
-                })
+                self.metrics_queue.put_nowait(metrics)
             except Exception:
                 pass
