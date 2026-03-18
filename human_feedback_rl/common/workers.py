@@ -16,6 +16,16 @@ import time
 import torch
 from omegaconf import OmegaConf
 
+
+def _set_thread_limits(n: int) -> None:
+    """Pin all CPU thread pools to n threads to prevent oversubscription."""
+    s = str(n)
+    os.environ["OMP_NUM_THREADS"]     = s
+    os.environ["MKL_NUM_THREADS"]     = s
+    os.environ["OPENBLAS_NUM_THREADS"] = s
+    os.environ["NUMEXPR_NUM_THREADS"] = s
+    torch.set_num_threads(n)
+
 from human_feedback_rl.common.preference_collector import PreferenceCollector
 from human_feedback_rl.common.demonstration_collector import DemonstrationCollector
 from human_feedback_rl.common.oracles.factory import build_oracle
@@ -49,8 +59,8 @@ def _preference_worker(
 
     config = OmegaConf.create(config_dict)
 
-    # Limit PyTorch threads so multiple spawned processes don't saturate the CPU.
-    torch.set_num_threads(config.resources.torch_num_threads)
+    # Limit all CPU thread pools so multiple spawned processes don't saturate the CPU.
+    _set_thread_limits(config.resources.torch_num_threads)
 
     oracle = build_oracle(config)
 
@@ -103,8 +113,8 @@ def _demonstration_worker(
 
     config = OmegaConf.create(config_dict)
 
-    # Limit PyTorch threads (used for expert model inference).
-    torch.set_num_threads(config.resources.torch_num_threads)
+    # Limit all CPU thread pools (used for expert model inference).
+    _set_thread_limits(config.resources.torch_num_threads)
 
     env, expert_model = build_demo_env_and_expert(config)
     env.reset()
@@ -161,8 +171,8 @@ def _demo_preference_worker(
 
     config = OmegaConf.create(config_dict)
 
-    # Limit PyTorch threads (used for expert model inference).
-    torch.set_num_threads(config.resources.torch_num_threads)
+    # Limit all CPU thread pools (used for expert model inference).
+    _set_thread_limits(config.resources.torch_num_threads)
 
     env, expert_model = build_demo_env_and_expert(config)
     env.reset()

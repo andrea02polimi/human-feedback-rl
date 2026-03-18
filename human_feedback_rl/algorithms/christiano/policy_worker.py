@@ -29,6 +29,7 @@ from human_feedback_rl.common.workers import (          # noqa: F401
     _preference_worker,
     _demonstration_worker,
     _demo_preference_worker,
+    _set_thread_limits,
 )
 
 
@@ -71,8 +72,8 @@ def _policy_worker(
 
     config = OmegaConf.create(config_dict)
 
-    # Limit PyTorch threads so multiple spawned processes don't saturate the CPU.
-    torch.set_num_threads(config.resources.torch_num_threads)
+    # Limit all CPU thread pools so multiple spawned processes don't saturate the CPU.
+    _set_thread_limits(config.resources.torch_num_threads)
 
     env, _ = build_env_and_expert(config)
 

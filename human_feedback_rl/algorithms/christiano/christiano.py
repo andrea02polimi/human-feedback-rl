@@ -24,6 +24,7 @@ from human_feedback_rl.algorithms.christiano.policy_worker import (
     _preference_worker,
     _demonstration_worker,
     _demo_preference_worker,
+    _set_thread_limits,
 )
 from human_feedback_rl.common.pref_db import PrefDB, PrefBuffer
 from human_feedback_rl.common.demo_db import DemoDatabase
@@ -226,9 +227,9 @@ class ChristianoRLHF:
     def train(self, output_dir: str) -> None:
         """Run the full training pipeline."""
 
-        # Limit PyTorch intra-op threads in the main process to avoid competing
+        # Limit all CPU thread pools in the main process to avoid competing
         # with worker subprocesses for the same CPU cores.
-        torch.set_num_threads(self.torch_num_threads)
+        _set_thread_limits(self.torch_num_threads)
 
         config_dict = self._build_config_dict()
 
@@ -410,7 +411,12 @@ class ChristianoRLHF:
         # ── Phase 3: continuous reward predictor retraining ───────────────────
         print("\n[Phase 3] Reward predictor training continuously…")
 
+        # Retrain RP only when enough new preferences have arrived.
+        # This avoids both busy-wait and unnecessary retraining on stale data.
+        _rp_retrain_min_new_prefs = self.rp_val_interval  # same cadence as val_interval
         rp_retrain_count = 0
+        _prefs_at_last_retrain = 0
+
         while not shutdown_event.is_set():
             while True:
                 try:
@@ -420,8 +426,15 @@ class ChristianoRLHF:
                     break
 
             train_db, val_db = preference_buffer.get_dbs()
-            if len(train_db) == 0 or len(val_db) == 0:
+            current_prefs = len(train_db) + len(val_db)
+
+            if current_prefs == 0 or len(val_db) == 0:
                 time.sleep(1.0)
+                continue
+
+            # Skip retrain if not enough new preferences have arrived.
+            if current_prefs - _prefs_at_last_retrain < _rp_retrain_min_new_prefs:
+                time.sleep(0.5)
                 continue
 
             if use_demonstrations:
@@ -438,9 +451,7 @@ class ChristianoRLHF:
             reward_predictor.save()
             keep_latest_checkpoints(reward_predictor_checkpoint_dir)
             rp_retrain_count += 1
-
-            # Yield CPU to worker subprocesses between RP retraining rounds.
-            time.sleep(0.5)
+            _prefs_at_last_retrain = current_prefs
 
             db_metrics = {
                 "train_db_size": len(train_db),
