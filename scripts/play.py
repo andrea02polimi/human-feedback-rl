@@ -30,13 +30,14 @@ def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
 
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    PROJECT_ROOT2 = Path(__file__).resolve().parents[2]
 
     # ── Reproduce training environment ───────────────────────────────────────
     run_dir    = PROJECT_ROOT / cfg.run.dir
     train_cfg  = OmegaConf.load(run_dir / "config" / "config.yaml")
 
     expert_cfg = OmegaConf.load(
-        PROJECT_ROOT / train_cfg.env.expert_model / ".hydra" / "config.yaml"
+        PROJECT_ROOT2 / train_cfg.env.expert_model / ".hydra" / "config.yaml"
     )
 
     print(f"[play] Scenario : {expert_cfg.env}")
