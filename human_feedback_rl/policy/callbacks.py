@@ -64,10 +64,14 @@ class SegmentCollectorCallback(BaseCallback):
         self.metrics_queue           = None   # set by _policy_worker after construction
         self.a2c_steps               = None   # set by _policy_worker after construction
 
-        # buffer oer costruire segmenti, uno per ogni ambiente
+        # buffer per costruire segmenti, uno per ogni ambiente
         self.current_segment_frames  = [[] for _ in range(n_envs)]
         self.current_segment_rewards = [[] for _ in range(n_envs)]
         self._gradient_step_count    = 0
+
+        # per-episode true reward tracking (env reward, not predicted)
+        self._ep_true_reward_accum      = [0.0] * n_envs   # running sum per env
+        self._completed_ep_true_rewards = []                # finished episodes this rollout
 
     def _on_step(self) -> bool:
         if self.shutdown_event.is_set():
@@ -89,6 +93,11 @@ class SegmentCollectorCallback(BaseCallback):
             true_reward = float(infos[env_idx].get("true_reward", 0.0))
             self.current_segment_frames[env_idx].append(obs_np[env_idx].copy())
             self.current_segment_rewards[env_idx].append(true_reward)
+
+            self._ep_true_reward_accum[env_idx] += true_reward
+            if dones[env_idx]:
+                self._completed_ep_true_rewards.append(self._ep_true_reward_accum[env_idx])
+                self._ep_true_reward_accum[env_idx] = 0.0
 
             if (
                 len(self.current_segment_frames[env_idx]) >= self.segment_length
@@ -145,16 +154,25 @@ class SegmentCollectorCallback(BaseCallback):
 
         # Forward metrics to the main process for wandb logging.
         if self.metrics_queue is not None:
+            rollout_rewards = self.model.rollout_buffer.rewards
             metrics = {
-                "policy/avg_predicted_reward": float(np.mean(self.model.rollout_buffer.rewards)),
+                "policy/mean_predicted_rew": float(np.mean(rollout_rewards)),
+                "policy/std_predicted_rew":  float(np.std(rollout_rewards)),
             }
 
             # Episode metrics (available once at least one episode has completed).
             if self.model.ep_info_buffer:
                 ep_rews = [info["r"] for info in self.model.ep_info_buffer]
                 ep_lens = [info["l"] for info in self.model.ep_info_buffer]
-                metrics["policy/ep_rew_mean"] = float(np.mean(ep_rews))
-                metrics["policy/ep_len_mean"] = float(np.mean(ep_lens))
+                metrics["policy/mean_episode_avg_rew"]    = float(np.mean(ep_rews))
+                metrics["policy/mean_episode_length"]     = float(np.mean(ep_lens))
+
+            # True environment reward per episode (not visible to policy).
+            if self._completed_ep_true_rewards:
+                metrics["policy/mean_episode_avg_true_rew"] = float(
+                    np.mean(self._completed_ep_true_rewards)
+                )
+                self._completed_ep_true_rewards = []
 
             # Training loss metrics logged by SB3 (value_loss, policy_gradient_loss, etc.)
             for key, value in self.model.logger.name_to_value.items():

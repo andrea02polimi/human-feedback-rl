@@ -254,6 +254,16 @@ class ChristianoTrainer(BaseTrainer):
             reward_predictor.save()
             keep_latest_checkpoints(reward_predictor_checkpoint_dir)
             rp_retrain_count += 1
+
+            db_metrics = {
+                "train_db_size": len(train_db),
+                "val_db_size":   len(val_db),
+                "pref_db_size":  len(train_db) + len(val_db),
+            }
+            if use_demonstrations:
+                db_metrics["demo_db_size"] = len(demo_db)
+            wandb.log(db_metrics, step=a2c_steps.value)
+
             demo_info = f"  demo={len(demo_db)}" if use_demonstrations else ""
             print(
                 f"[rp] retrain #{rp_retrain_count}"

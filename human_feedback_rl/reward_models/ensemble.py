@@ -203,9 +203,9 @@ class RewardPredictorEnsemble:
                 self._val_step(val_db, global_step)
 
                 if self._log and wandb.run is not None:
-                    log_dict = {"rp/train/loss": loss.item()}
+                    log_dict = {"rp/train_loss": loss.item()}
                     if demo_batch:
-                        log_dict["rp/train/demo_margin_loss"] = L_demo.item()
+                        log_dict["rp/train_demo_margin_loss"] = L_demo.item()
                     wandb.log(log_dict, step=global_step)
 
     def _val_step(self, val_db, global_step: int = None) -> None:
@@ -217,6 +217,11 @@ class RewardPredictorEnsemble:
 
         total_loss = 0.0
         total_acc  = 0.0
+
+        # Collect per-model segment rewards for disagreement computation.
+        # all_obs: concatenation of s1 and s2 frames → (2*B*T, obs_dim)
+        per_model_seg_rewards = []   # list of (2*B,) tensors, one per model
+
         for model in self.models:
             model.eval()
             with torch.no_grad():
@@ -231,20 +236,30 @@ class RewardPredictorEnsemble:
                 ).to(self.device)
 
                 B, T = s1s.shape[:2]
-                r1 = model(s1s.view(B * T, -1)).view(B, T).sum(dim=1)
-                r2 = model(s2s.view(B * T, -1)).view(B, T).sum(dim=1)
+                r1 = model(s1s.view(B * T, -1)).view(B, T).sum(dim=1)   # (B,)
+                r2 = model(s2s.view(B * T, -1)).view(B, T).sum(dim=1)   # (B,)
 
-                log_probs  = F.log_softmax(torch.stack([r1, r2], dim=1), dim=1)
-                loss       = -(prefs * log_probs).sum(dim=1).mean()
-                acc        = (torch.stack([r1, r2], dim=1).argmax(dim=1) == prefs.argmax(dim=1)).float().mean()
+                log_probs = F.log_softmax(torch.stack([r1, r2], dim=1), dim=1)
+                loss      = -(prefs * log_probs).sum(dim=1).mean()
+                acc       = (torch.stack([r1, r2], dim=1).argmax(dim=1) == prefs.argmax(dim=1)).float().mean()
 
                 total_loss += loss.item()
                 total_acc  += acc.item()
 
+                per_model_seg_rewards.append(torch.cat([r1, r2], dim=0))   # (2*B,)
+
+        # Mean disagreement: std of segment-sum rewards across ensemble members,
+        # averaged over all segments in the batch. High → ensemble uncertain.
+        mean_disagreement = 0.0
+        if self.n_preds > 1:
+            stacked = torch.stack(per_model_seg_rewards, dim=0)   # (n_preds, 2*B)
+            mean_disagreement = stacked.std(dim=0).mean().item()
+
         if self._log and wandb.run is not None:
             wandb.log({
-                "rp/val/loss":     total_loss / self.n_preds,
-                "rp/val/accuracy": total_acc  / self.n_preds,
+                "rp/val_loss":          total_loss / self.n_preds,
+                "rp/accuracy":          total_acc  / self.n_preds,
+                "rp/mean_disagreement": mean_disagreement,
             }, step=global_step)
 
     # ── Checkpointing ──────────────────────────────────────────────────────────
