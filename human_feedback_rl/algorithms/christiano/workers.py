@@ -193,6 +193,62 @@ def _policy_worker(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Demo preference worker
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _demo_preference_worker(
+    config_dict,
+    agent_demo_pipe,
+    preference_pipe,
+    shutdown_event,
+):
+    """
+    Subprocess responsible for turning expert-correction pairs into preferences.
+
+    For each agent segment received from agent_demo_pipe:
+      1. Builds an expert-correction segment via DemonstrationCollector.
+      2. Sends (expert_frames, agent_frames, (1.0, 0.0)) to preference_pipe.
+
+    The label (1.0, 0.0) encodes that the expert correction is always preferred
+    over the agent segment. PrefBuffer routes these into train/val PrefDB
+    identically to oracle-labeled pairs, so reward model training uses only
+    the standard Christiano MLE loss — no separate margin loss.
+
+    Runs continuously through Phase 1 and Phase 3, so demo-based preferences
+    keep flowing alongside oracle preferences at all times.
+    """
+    import queue as _queue
+
+    config = OmegaConf.create(config_dict)
+    env, expert_model = build_demo_env_and_expert(config)
+    env.reset()
+
+    collector = DemonstrationCollector(config.preferences.segment_len)
+
+    print("[demo_pref] Demo preference worker started.", flush=True)
+
+    while not shutdown_event.is_set():
+        try:
+            agent_seg = agent_demo_pipe.get(timeout=1.0)
+        except _queue.Empty:
+            continue
+
+        expert_frames = collector.create_expert_correction(
+            agent_seg.frames, expert_model, env
+        )
+
+        try:
+            # Always prefer expert correction over agent segment.
+            preference_pipe.put(
+                (expert_frames, agent_seg.frames, (1.0, 0.0)),
+                block=False,
+            )
+        except Exception:
+            pass
+
+    env.close()
+# ─────────────────────────────────────────────────────────────────────────────
 # Preference worker
 # ─────────────────────────────────────────────────────────────────────────────
 

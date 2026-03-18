@@ -22,6 +22,7 @@ from human_feedback_rl.algorithms.christiano.workers import (
     _policy_worker,
     _preference_worker,
     _demonstration_worker,
+    _demo_preference_worker,
 )
 from human_feedback_rl.feedback.pref_db import PrefDB, PrefBuffer
 from human_feedback_rl.feedback.demo_db import DemoDatabase
@@ -59,7 +60,8 @@ class ChristianoTrainer(BaseTrainer):
         reward_predictor_checkpoint_dir = str(run_directory / "reward_predictor_checkpoints")
         policy_checkpoint_path          = str(run_directory / "models" / "policy_christiano")
 
-        use_demonstrations = cfg.preferences.use_demonstrations
+        use_demonstrations   = cfg.preferences.use_demonstrations
+        use_demo_preferences = cfg.preferences.get("use_demo_preferences", False) # default false
 
         # ── Communication channels ────────────────────────────────────────────
         segment_pipe                 = Queue(maxsize=cfg.preferences.seg_pipe_maxsize) # segmenti generati ad alta velocità, consumo lento, scarto i meno recenti
@@ -67,10 +69,14 @@ class ChristianoTrainer(BaseTrainer):
         reward_predictor_ready_event = mp.Event()   # main → policy: reward predictor ready
         shutdown_event               = mp.Event()   # main → all:    time to stop
 
-        # Demo pipes/DB only created when demonstrations are enabled.
+        # Demo pipes/DB only created when demonstrations are enabled (margin loss path).
         agent_demo_pipe = Queue(maxsize=cfg.preferences.demo_seg_pipe_maxsize) if use_demonstrations else None
         demo_pipe       = Queue()                                               if use_demonstrations else None
-        demo_db         = DemoDatabase(maxlen=cfg.preferences.demo_db_maxlen) if use_demonstrations else None
+        demo_db         = DemoDatabase(maxlen=cfg.preferences.demo_db_maxlen)  if use_demonstrations else None
+
+        # Demo preference path: needs agent_demo_pipe but no demo_pipe/demo_db.
+        if use_demo_preferences and not use_demonstrations:
+            agent_demo_pipe = Queue(maxsize=cfg.preferences.demo_seg_pipe_maxsize)
 
         # Shared step counters.
         # shared_env_steps: total steps across Phase 1 + Phase 2 (used for query annealing)
@@ -143,11 +149,23 @@ class ChristianoTrainer(BaseTrainer):
                     shutdown_event,
                 ),
             )
+        if use_demo_preferences:
+            demo_pref_process = Process(
+                target=_demo_preference_worker,
+                args=(
+                    config_dict,
+                    agent_demo_pipe,
+                    preference_pipe,
+                    shutdown_event,
+                ),
+            )
 
         policy_process.start()
         preference_process.start()
         if use_demonstrations:
             demo_process.start()
+        if use_demo_preferences:
+            demo_pref_process.start()
 
         def _shutdown(*_):
             print("\n[main] Shutting down…", flush=True)
@@ -155,6 +173,8 @@ class ChristianoTrainer(BaseTrainer):
             workers = [policy_process, preference_process]
             if use_demonstrations:
                 workers.append(demo_process)
+            if use_demo_preferences:
+                workers.append(demo_pref_process)
             for proc in workers:
                 proc.join(timeout=15)
             for proc in workers:
