@@ -11,7 +11,9 @@ multiprocessing.Process(target=...) and must be picklable.
 
 import os
 import sys
+import time
 
+import torch
 from omegaconf import OmegaConf
 
 from human_feedback_rl.common.preference_collector import PreferenceCollector
@@ -46,6 +48,10 @@ def _preference_worker(
     sys.stdin = os.fdopen(0)
 
     config = OmegaConf.create(config_dict)
+
+    # Limit PyTorch threads so multiple spawned processes don't saturate the CPU.
+    torch.set_num_threads(config.resources.torch_num_threads)
+
     oracle = build_oracle(config)
 
     # Need observation_dim to instantiate the RP for disagreement scoring.
@@ -62,6 +68,8 @@ def _preference_worker(
         collector.refresh_rp(reward_predictor_ready_event)
         pair = collector.sample_pair()
         if pair is None:
+            # No segments available yet — yield CPU instead of spinning.
+            time.sleep(0.05)
             continue
         seg1, seg2 = pair
         pref = oracle.label(seg1, seg2)
@@ -94,6 +102,10 @@ def _demonstration_worker(
     import queue as _queue
 
     config = OmegaConf.create(config_dict)
+
+    # Limit PyTorch threads (used for expert model inference).
+    torch.set_num_threads(config.resources.torch_num_threads)
+
     env, expert_model = build_demo_env_and_expert(config)
     env.reset()
 
@@ -148,6 +160,10 @@ def _demo_preference_worker(
     import queue as _queue
 
     config = OmegaConf.create(config_dict)
+
+    # Limit PyTorch threads (used for expert model inference).
+    torch.set_num_threads(config.resources.torch_num_threads)
+
     env, expert_model = build_demo_env_and_expert(config)
     env.reset()
 

@@ -130,6 +130,11 @@ class ChristianoRLHF:
         total_env_steps: int = 1_000_000,
         rp_reload_interval: int = 50,
         policy_save_interval: int = 100,
+        # Performance: max PyTorch intra-op threads per process.
+        # Each spawned subprocess (policy, preference, demo) uses this limit,
+        # preventing thread-pool contention when multiple processes share few cores.
+        # Rule of thumb: floor(n_cores / n_processes). With 9 cores and 3 processes: 3.
+        torch_num_threads: int = 2,
         # wandb
         wandb_project: str = "sumo-rlhf",
         wandb_entity: str = None,
@@ -167,6 +172,7 @@ class ChristianoRLHF:
         self.total_env_steps      = total_env_steps
         self.rp_reload_interval   = rp_reload_interval
         self.policy_save_interval = policy_save_interval
+        self.torch_num_threads    = torch_num_threads
         self.wandb_project        = wandb_project
         self.wandb_entity         = wandb_entity
         self.wandb_tags           = wandb_tags or []
@@ -178,7 +184,7 @@ class ChristianoRLHF:
                 "expert_model": self.expert_model_path,
                 "n_envs": self.n_envs,
             },
-            "resources": {"device": self.device},
+            "resources": {"device": self.device, "torch_num_threads": self.torch_num_threads},
             "reward_predictor": {
                 "lr": self.rp_lr,
                 "n_preds": self.n_reward_predictors,
@@ -219,6 +225,10 @@ class ChristianoRLHF:
 
     def train(self, output_dir: str) -> None:
         """Run the full training pipeline."""
+
+        # Limit PyTorch intra-op threads in the main process to avoid competing
+        # with worker subprocesses for the same CPU cores.
+        torch.set_num_threads(self.torch_num_threads)
 
         config_dict = self._build_config_dict()
 
@@ -428,6 +438,9 @@ class ChristianoRLHF:
             reward_predictor.save()
             keep_latest_checkpoints(reward_predictor_checkpoint_dir)
             rp_retrain_count += 1
+
+            # Yield CPU to worker subprocesses between RP retraining rounds.
+            time.sleep(0.5)
 
             db_metrics = {
                 "train_db_size": len(train_db),

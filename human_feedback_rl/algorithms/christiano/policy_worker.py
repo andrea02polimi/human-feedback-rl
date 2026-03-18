@@ -64,11 +64,15 @@ def _policy_worker(
       SegmentCollectorCallback handles segment generation, RP reloading,
       checkpoint saving, and shared_env_steps updates.
     """
+    import torch
     from pathlib import Path
     from stable_baselines3 import A2C as SB3A2C
     from stable_baselines3.common.vec_env import VecMonitor
 
     config = OmegaConf.create(config_dict)
+
+    # Limit PyTorch threads so multiple spawned processes don't saturate the CPU.
+    torch.set_num_threads(config.resources.torch_num_threads)
 
     env, _ = build_env_and_expert(config)
 
