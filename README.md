@@ -8,73 +8,91 @@ An A2C policy is trained entirely on rewards predicted by a learned reward model
 
 ## Repository structure
 
+This package is designed as a library modelled after [Stable Baselines3](https://github.com/DLR-RM/stable-baselines3): algorithm-agnostic code lives in `common/`, algorithm-specific code lives in `algorithms/<name>/`. Scripts and configs live in the **parent repository** (`sumo-human-feedback-rl/`).
+
 ```
 human-feedback-rl/
 ├── human_feedback_rl/
 │   ├── algorithms/
-│   │   ├── base_trainer.py          # BaseTrainer ABC
+│   │   ├── base_trainer.py              # BaseTrainer ABC
 │   │   └── christiano/
-│   │       ├── trainer.py           # ChristianoTrainer — main orchestration
-│   │       └── workers.py           # Three async worker functions (policy, preference, demo)
-│   ├── feedback/
-│   │   ├── segment.py               # Segment dataclass
-│   │   ├── pref_db.py               # PrefDB (circular DB) + PrefBuffer (async recv thread)
-│   │   ├── sampling.py              # Random and disagreement-based pair selection
-│   │   ├── collector.py             # PreferenceCollector — segment buffer + pair sampling
-│   │   ├── demonstrations.py        # DemonstrationCollector — expert segment pairing
-│   │   └── oracles/
-│   │       ├── base.py              # BaseOracle ABC
-│   │       ├── expert.py            # ExpertOracle (env_reward | qnet modes)
-│   │       ├── human.py             # HumanOracle (terminal + pyglet visualisation)
-│   │       └── factory.py           # build_oracle(config) factory
-│   ├── reward_models/
-│   │   ├── networks.py              # SumoRewardNetwork (MLP backbone)
-│   │   └── ensemble.py              # RewardPredictorEnsemble (training + inference)
-│   ├── policy/
-│   │   ├── wrappers.py              # PredictedRewardVecWrapper (replaces env rewards)
-│   │   └── callbacks.py             # SegmentCollectorCallback (SB3 training callback)
-│   └── utils/
-│       ├── env_setup.py             # build_env_and_expert, build_single_env
-│       ├── running_stats.py         # RunningStat (Welford's online mean/std)
-│       ├── itertools.py             # batch_iter
-│       └── checkpoints.py           # keep_latest_checkpoints, drain_demo_pipe
+│   │       ├── christiano.py            # ChristianoRLHF — SB3-like class, train(output_dir)
+│   │       └── policy_worker.py         # _policy_worker (SB3 A2C, Christiano-specific)
+│   └── common/
+│       ├── workers.py                   # _preference_worker, _demonstration_worker,
+│       │                                #   _demo_preference_worker (algorithm-agnostic)
+│       ├── segment.py                   # Segment dataclass
+│       ├── pref_db.py                   # PrefDB (circular DB) + PrefBuffer (async recv thread)
+│       ├── demo_db.py                   # DemoDatabase (circular DB for margin ranking loss)
+│       ├── sampling.py                  # Random and disagreement-based pair selection
+│       ├── preference_collector.py      # PreferenceCollector — segment buffer + pair sampling
+│       ├── demonstration_collector.py   # DemonstrationCollector — expert segment pairing
+│       ├── callbacks.py                 # SegmentCollectorCallback (SB3 training callback)
+│       ├── wrappers.py                  # PredictedRewardVecWrapper (replaces env rewards)
+│       ├── oracles/
+│       │   ├── base.py                  # BaseOracle ABC
+│       │   ├── expert.py                # ExpertOracle (env_reward | qnet, hard | soft labels)
+│       │   ├── human.py                 # HumanOracle (terminal + pyglet visualisation)
+│       │   └── factory.py              # build_oracle(config) factory
+│       ├── reward_predictor/
+│       │   ├── networks.py              # SumoRewardNetwork (MLP backbone)
+│       │   └── ensemble.py             # RewardPredictorEnsemble (training + inference + wandb)
+│       └── utils/
+│           ├── env_setup.py             # build_env_and_expert, build_single_env, build_demo_env_and_expert
+│           ├── running_stats.py         # RunningStat (Welford's online mean/std)
+│           ├── itertools.py             # batch_iter
+│           └── checkpoints.py          # keep_latest_checkpoints, drain_demo_pipe
+├── pyproject.toml
+├── requirements.txt
+└── README.md
+```
+
+Scripts and configs (entry points, Hydra configs, experiment launcher) are in the parent repo:
+
+```
+sumo-human-feedback-rl/
+├── scripts/
+│   ├── train.py          # Hydra entry point — instantiates ChristianoRLHF and calls train()
+│   ├── eval.py           # Headless evaluation with matplotlib plots
+│   └── play.py           # SUMO GUI visualisation
 ├── configs/
-│   ├── train.yaml                   # Base training config (Hydra)
-│   ├── eval.yaml                    # Evaluation config
-│   ├── play.yaml                    # GUI playback config
-│   └── algorithm/
-│       ├── christiano_env_reward.yaml   # Config 1: env reward oracle
-│       ├── christiano_qnet.yaml         # Config 2: expert Q-net oracle
-│       └── christiano_demo.yaml         # Config 3: env reward oracle + demonstrations
-└── scripts/
-    ├── train_christiano.py          # Training entry point
-    ├── eval.py                      # Headless evaluation
-    └── play.py                      # SUMO GUI visualisation
+│   └── train.yaml        # Full flat config (all ChristianoRLHF params + wandb + hydra)
+└── run_experiments.sh    # Batch launcher for remote server (taskset + numactl)
 ```
 
 ---
 
 ## Algorithm
 
-The pipeline runs three concurrent activities:
+The pipeline runs three concurrent processes:
 
-1. **Policy process** — Generates trajectory segments with a random policy (Phase 1), then trains an SB3 A2C agent using rewards predicted by the reward model (Phase 2).
-2. **Preference process** — Samples segment pairs from the policy process, labels them via an oracle, and sends labeled pairs to the main process.
-3. **Main process** — Maintains the preference databases, trains the reward predictor ensemble, and saves checkpoints.
+1. **Policy process** — Generates trajectory segments with a random policy (Phase 1), then trains an SB3 A2C agent using rewards predicted by the reward model (Phase 2+). Sends segments to the preference worker.
+2. **Preference process** — Samples segment pairs, labels them via an oracle, and sends labeled pairs to the main process via `preference_pipe`.
+3. **Main process** — Maintains `PrefDB` train/val databases, retrains the reward predictor ensemble when enough new preferences have arrived, saves checkpoints, and logs metrics to wandb.
 
-When demonstrations are enabled a fourth **demonstration process** runs the expert DQN in parallel, collects expert segments, pairs them with agent segments, and feeds them into a separate demonstration database used to compute an additional margin ranking loss.
+When `use_demonstrations=True`, a fourth **demonstration process** runs the expert DQN, pairs its segments with agent segments, and feeds them into `DemoDatabase` for an additional margin ranking loss.
+
+When `use_demo_preferences=True`, a fourth **demo-preference process** runs the expert DQN, builds expert-correction segments, and injects `(expert_frames, agent_frames, (1.0, 0.0))` directly into `preference_pipe` — expert corrections treated as hard preferences, no separate loss term needed.
 
 ### Reward predictor loss
 
 ```
-L_total = L_pref + demo_weight × L_demo
+use_demonstrations=True:
+  L_total = L_pref + demo_weight × L_demo
 
-L_pref  — soft cross-entropy on (seg1, seg2, p1, p2) preference pairs
-          (soft labels preserve oracle confidence, e.g. 0.7/0.3)
+  L_pref  — soft cross-entropy on (seg1, seg2, p1, p2) preference pairs
+  L_demo  — margin ranking loss: mean( relu( margin − (Σr_expert − Σr_agent) ) )
 
-L_demo  — margin ranking loss: mean( relu( margin − (Σr_expert − Σr_agent) ) )
-          (gradient is zero once expert already beats agent by `margin`)
+use_demo_preferences=True:
+  L_total = L_pref  (expert corrections enter as (1.0, 0.0) preference pairs)
 ```
+
+### Preference labeling modes (`label_mode`)
+
+| `label_mode` | Label format | Description |
+|---|---|---|
+| `hard` | `(1,0)`, `(0,1)`, `(0.5,0.5)` | Original Christiano et al. — discrete preference |
+| `soft` | `(p, 1−p)` with `p = softmax(score)` | Preserves oracle confidence as soft label |
 
 ### Oracles
 
@@ -82,7 +100,7 @@ L_demo  — margin ranking loss: mean( relu( margin − (Σr_expert − Σr_agen
 |---|---|
 | `env_reward` | Prefers the segment with higher sum of true environment rewards |
 | `qnet` | Prefers the segment with higher sum of V(s) = max_a Q(s,a) from the expert DQN |
-| `human` | Interactive: shows segments in a pyglet window and prompts for human input |
+| `human` | Interactive: shows segments in a terminal/pyglet window and prompts for human input |
 
 ---
 
@@ -100,68 +118,72 @@ pip install -e human-feedback-rl/
 
 ## Training
 
-All scripts are run from `human-feedback-rl/`.
-
-### Three experimental configurations
+All training commands are run from the **parent repo root** (`sumo-human-feedback-rl/`).
 
 ```bash
-# Config 1 — Christiano et al. original: preferences labeled by environment reward
-python scripts/train_christiano.py
+# Default: env_reward oracle, hard labels
+python scripts/train.py
 
-# Config 2 — Preferences labeled by expert Q-net value V(s) = max_a Q(s,a)
-python scripts/train_christiano.py algorithm=christiano_qnet
+# Soft labels
+python scripts/train.py christiano.label_mode=soft
 
-# Config 3 — Preferences + expert demonstration pairs (margin ranking loss)
-python scripts/train_christiano.py algorithm=christiano_demo
+# Expert Q-net oracle
+python scripts/train.py christiano.oracle=qnet
+
+# Demo preferences (expert corrections injected as hard preference pairs)
+python scripts/train.py \
+    christiano.use_demo_preferences=true \
+    christiano.db_train_maxlen=6000 \
+    christiano.db_val_maxlen=1500
+
+# Expert demo margin ranking loss (original demo path)
+python scripts/train.py christiano.use_demonstrations=true
+
+# Soft labels + wandb tags
+python scripts/train.py christiano.label_mode=soft "wandb.tags=[soft,env_reward]"
 ```
 
-Hydra saves the run to `experiments/christiano/YYYY-MM-DD/HH-MM-SS/`:
+Hydra saves the run output to `output/christiano/YYYY-MM-DD_HH-MM-SS/`:
 
 ```
-experiments/christiano/2026-03-16/17-05-21/
-├── config/config.yaml               # Full resolved config
+output/christiano/2026-03-18_14-30-00/
+├── config.yaml                      # Full resolved config (reused by eval/play)
 ├── models/policy_christiano.zip     # Final A2C policy (SB3 format)
-├── reward_predictor_checkpoints/    # RP .pt checkpoints (latest 2 kept)
-├── reward_predictor/                # TensorBoard logs for RP
-│   ├── train/
-│   └── val/
-└── policy/                          # TensorBoard logs for A2C
+└── reward_predictor_checkpoints/    # RP .pt checkpoints (latest 2 kept)
 ```
 
 ### Key config parameters
 
+All parameters can be overridden on the command line as `christiano.<param>=<value>`.
+
 | Parameter | Default | Description |
 |---|---|---|
-| `preferences.initial_prefs` | 500 | Preferences collected before RP pretraining |
-| `preferences.segment_len` | 25 | Frames per segment |
-| `preferences.oracle` | `env_reward` | Preference oracle (set by algorithm config) |
-| `preferences.use_demonstrations` | `false` | Enable demonstration loss (set by algorithm config) |
-| `reward_predictor.n_preds` | 3 | Ensemble size |
-| `reward_predictor.demo_weight` | 1.0 | Weight of L_demo relative to L_pref |
-| `reward_predictor.demo_margin` | 1.0 | Margin for ranking loss |
-| `training.total_env_steps` | 100000 | Total A2C environment steps |
-| `env.expert_model` | `highway_discrete_dqn_v2_1` | Expert model directory (relative to repo root) |
-
-Override any parameter on the command line:
-
-```bash
-python scripts/train_christiano.py training.total_env_steps=500000 reward_predictor.n_preds=5
-```
+| `christiano.oracle` | `env_reward` | Preference oracle |
+| `christiano.label_mode` | `hard` | `hard` or `soft` preference labels |
+| `christiano.use_demonstrations` | `false` | Enable expert demo margin ranking loss |
+| `christiano.use_demo_preferences` | `false` | Inject expert corrections as preference pairs |
+| `christiano.n_reward_predictors` | `3` | Ensemble size |
+| `christiano.initial_prefs` | `500` | Preferences collected before RP pretraining |
+| `christiano.segment_len` | `25` | Frames per segment |
+| `christiano.db_train_maxlen` | `3000` | Circular buffer size for train PrefDB |
+| `christiano.db_val_maxlen` | `750` | Circular buffer size for val PrefDB |
+| `christiano.total_env_steps` | `1000000` | Total A2C environment steps (Phase 2+) |
+| `christiano.rp_val_interval` | `50` | Validate RP every N gradient steps; also controls Phase 3 retrain cadence |
+| `christiano.torch_num_threads` | `2` | Max PyTorch intra-op threads per process |
+| `expert_model` | `highway_discrete_dqn_v2_1` | Expert DQN directory (relative to parent repo root) |
 
 ---
 
 ## Evaluation
 
 ```bash
-python scripts/eval.py \
-    run.dir=experiments/christiano/2026-03-16/17-05-21 \
-    agent.model=experiments/christiano/2026-03-16/17-05-21/models/policy_christiano
+python scripts/eval.py run_dir=output/christiano/2026-03-18_14-30-00
 
 # Override number of episodes
-python scripts/eval.py run.dir=... agent.model=... eval.episodes=200
+python scripts/eval.py run_dir=output/christiano/... eval.episodes=200
 ```
 
-Prints per-episode metrics from the environment's `metrics_tracker` at the end.
+Generates matplotlib plots (reward per episode, episode length, aggregate bar plot) saved to `<run_dir>/eval_plots/`.
 
 ---
 
@@ -170,43 +192,55 @@ Prints per-episode metrics from the environment's `metrics_tracker` at the end.
 Requires a SUMO installation with `traci`.
 
 ```bash
-python scripts/play.py \
-    run.dir=experiments/christiano/2026-03-16/17-05-21 \
-    agent.model=experiments/christiano/2026-03-16/17-05-21/models/policy_christiano
+python scripts/play.py run_dir=output/christiano/2026-03-18_14-30-00
 
 # Optional overrides
-python scripts/play.py run.dir=... agent.model=... eval.episodes=5 play.step_delay=0.05
+python scripts/play.py run_dir=... eval.episodes=5 play.step_delay=0.05
 ```
+
+---
+
+## Batch experiments (remote server)
+
+```bash
+bash run_experiments.sh
+```
+
+Launches 3 experiments in background, pinned to CPU cores 18-26 via `taskset` and `numactl`, with all output to `/storage/fis3`.
 
 ---
 
 ## Weights & Biases
 
-All metrics are logged to [wandb](https://wandb.ai). Configure the project in `configs/train.yaml`:
-
-```yaml
-wandb:
-  project: "sumo-rlhf"
-  entity: null   # your wandb username/org, or null for default
-  tags: []
-```
-
-Override on the command line:
+All metrics are logged to [wandb](https://wandb.ai). Configure in `configs/train.yaml` or override on the command line:
 
 ```bash
-python scripts/train_christiano.py wandb.project=my-project wandb.entity=my-org
+python scripts/train.py wandb.project=my-project wandb.entity=my-org "wandb.tags=[exp1]"
 ```
 
-Tracked metrics:
+### Tracked metrics
 
 | Key | Description |
 |---|---|
-| `rollout/ep_rew_mean` | Mean episode reward (predicted rewards, from SB3) |
-| `train/loss` | A2C training loss (from SB3) |
-| `rp/train/loss` | Reward predictor training loss |
-| `rp/train/demo_margin_loss` | Margin ranking loss (Config 3 only) |
-| `rp/val/loss` | Reward predictor validation loss |
-| `rp/val/accuracy` | Reward predictor validation accuracy |
-| `prefs/train_db_size` | Number of preferences in the training database |
-| `prefs/val_db_size` | Number of preferences in the validation database |
-| `prefs/total_received` | Total labeled preferences received so far |
+| `policy/mean_predicted_rew` | Mean predicted reward over the last rollout |
+| `policy/std_predicted_rew` | Std of predicted rewards over the last rollout |
+| `policy/mean_episode_avg_true_rew` | Mean true env reward per completed episode (reward hacking signal: should rise together with `mean_predicted_rew`) |
+| `rp/train_loss` | Reward predictor MLE training loss |
+| `rp/train_demo_margin_loss` | Margin ranking loss (`use_demonstrations` only) |
+| `rp/val_loss` | Reward predictor validation loss |
+| `rp/accuracy` | Reward predictor preference accuracy on validation set |
+| `rp/mean_disagreement` | Mean std of per-segment rewards across ensemble members (high = uncertain RP) |
+| `train_db_size` | Number of preferences in train PrefDB |
+| `val_db_size` | Number of preferences in val PrefDB |
+| `pref_db_size` | Total preferences (train + val) |
+| `demo_db_size` | Number of demo pairs in DemoDatabase (`use_demonstrations` only) |
+
+**Diagnosing reward hacking:** if `policy/mean_predicted_rew` rises but `policy/mean_episode_avg_true_rew` does not, the policy has found a reward model exploit. High `rp/mean_disagreement` indicates the reward model is uncertain and more preferences are needed.
+
+---
+
+## Performance notes (multi-core servers)
+
+- `torch_num_threads` controls `torch.set_num_threads()` **and** `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `OPENBLAS_NUM_THREADS` for all subprocesses. Set to `floor(n_assigned_cores / n_processes)`.
+- On Linux, `forkserver` is used instead of `spawn` for faster subprocess startup without the deadlock risk of `fork` (wandb and PyTorch create threads before workers are spawned).
+- Phase 3 RP retraining is data-driven: retrain only when `rp_val_interval` new preferences have arrived since the last retrain, preventing both busy-wait and redundant retraining on stale data.
