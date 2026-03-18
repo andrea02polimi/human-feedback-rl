@@ -15,5 +15,5 @@ play:
 
 hydra:
   run:
-    dir: experiments/play/${now:%Y-%m-%d}/${now:%H-%M-%S}
-  output_subdir: config
+    dir: /tmp/hydra_play/${now:%Y-%m-%d_%H-%M-%S}
+  output_subdir: null

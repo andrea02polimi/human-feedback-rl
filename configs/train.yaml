@@ -5,7 +5,7 @@ defaults:
 seed: 0
 
 env:
-  expert_model: "highway_discrete_dqn_v2_1"
+  expert_model: "experts/highway_discrete_dqn_v2_1"
 
 resources:
   device: cpu
