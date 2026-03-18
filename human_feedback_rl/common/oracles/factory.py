@@ -7,7 +7,7 @@ from omegaconf import DictConfig
 from .base import BaseOracle
 from .expert import ExpertOracle
 from .human import HumanOracle
-from human_feedback_rl.utils.env_setup import build_env_and_expert
+from human_feedback_rl.common.utils.env_setup import build_env_and_expert
 
 
 def build_oracle(config: DictConfig) -> BaseOracle:

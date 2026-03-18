@@ -8,7 +8,7 @@ import numpy as np
 
 from stable_baselines3.common.vec_env import VecEnvWrapper
 
-from human_feedback_rl.reward_models.ensemble import RewardPredictorEnsemble
+from human_feedback_rl.common.reward_predictor.ensemble import RewardPredictorEnsemble
 
 
 class PredictedRewardVecWrapper(VecEnvWrapper):

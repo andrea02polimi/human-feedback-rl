@@ -31,8 +31,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 import wandb
 
-from human_feedback_rl.utils.running_stats import RunningStat
-from human_feedback_rl.utils.itertools import batch_iter
+from human_feedback_rl.common.utils.running_stats import RunningStat
+from human_feedback_rl.common.utils.itertools import batch_iter
 
 
 class RewardPredictorEnsemble:

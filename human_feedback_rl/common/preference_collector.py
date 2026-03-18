@@ -10,12 +10,12 @@ import time
 
 import numpy as np
 
-from human_feedback_rl.feedback.sampling import (
+from human_feedback_rl.common.sampling import (
     sample_pair_random,
     sample_pair_by_disagreement,
 )
-from human_feedback_rl.reward_models.ensemble import RewardPredictorEnsemble
-from human_feedback_rl.reward_models.networks import SumoRewardNetwork
+from human_feedback_rl.common.reward_predictor.ensemble import RewardPredictorEnsemble
+from human_feedback_rl.common.reward_predictor.networks import SumoRewardNetwork
 
 
 class PreferenceCollector:

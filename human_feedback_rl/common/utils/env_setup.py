@@ -3,7 +3,7 @@ from omegaconf import OmegaConf
 import sumo_rl_ego as sre
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 
 def _load_expert_run_cfg(cfg):

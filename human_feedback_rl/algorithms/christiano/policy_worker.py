@@ -1,30 +1,39 @@
 """
 Worker functions for the Christiano et al. RLHF pipeline.
 
+_policy_worker is defined here because it is tightly coupled to SB3 A2C
+(SegmentCollectorCallback, PredictedRewardVecWrapper, VecMonitor).
+
+The algorithm-agnostic workers (_preference_worker, _demonstration_worker,
+_demo_preference_worker) live in human_feedback_rl.common.workers and are
+re-exported here for convenience so christiano.py has a single import point.
+
 These are top-level functions (not methods) because they are passed to
 multiprocessing.Process(target=...) and must be picklable.
 """
 
 import functools
-import os
-import sys
 
 import numpy as np
 from omegaconf import OmegaConf
 
-from human_feedback_rl.reward_models.ensemble import RewardPredictorEnsemble
-from human_feedback_rl.reward_models.networks import SumoRewardNetwork
-from human_feedback_rl.policy.wrappers import PredictedRewardVecWrapper
-from human_feedback_rl.policy.callbacks import SegmentCollectorCallback
-from human_feedback_rl.feedback.segment import Segment
-from human_feedback_rl.feedback.preference_collector import PreferenceCollector
-from human_feedback_rl.feedback.demonstration_collector import DemonstrationCollector
-from human_feedback_rl.feedback.oracles.factory import build_oracle
-from human_feedback_rl.utils.env_setup import build_env_and_expert, build_single_env, build_demo_env_and_expert
+from human_feedback_rl.common.reward_predictor.ensemble import RewardPredictorEnsemble
+from human_feedback_rl.common.reward_predictor.networks import SumoRewardNetwork
+from human_feedback_rl.common.wrappers import PredictedRewardVecWrapper
+from human_feedback_rl.common.callbacks import SegmentCollectorCallback
+from human_feedback_rl.common.segment import Segment
+from human_feedback_rl.common.utils.env_setup import build_env_and_expert
+
+# Re-export common workers so christiano.py imports from a single location.
+from human_feedback_rl.common.workers import (          # noqa: F401
+    _preference_worker,
+    _demonstration_worker,
+    _demo_preference_worker,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Policy worker
+# Policy worker  (SB3 A2C — Christiano-specific)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -188,156 +197,5 @@ def _policy_worker(
 
     if not shutdown_event.is_set():
         shutdown_event.set()
-
-    env.close()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Demo preference worker
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _demo_preference_worker(
-    config_dict,
-    agent_demo_pipe,
-    preference_pipe,
-    shutdown_event,
-):
-    """
-    Subprocess responsible for turning expert-correction pairs into preferences.
-
-    For each agent segment received from agent_demo_pipe:
-      1. Builds an expert-correction segment via DemonstrationCollector.
-      2. Sends (expert_frames, agent_frames, (1.0, 0.0)) to preference_pipe.
-
-    The label (1.0, 0.0) encodes that the expert correction is always preferred
-    over the agent segment. PrefBuffer routes these into train/val PrefDB
-    identically to oracle-labeled pairs, so reward model training uses only
-    the standard Christiano MLE loss — no separate margin loss.
-
-    Runs continuously through Phase 1 and Phase 3, so demo-based preferences
-    keep flowing alongside oracle preferences at all times.
-    """
-    import queue as _queue
-
-    config = OmegaConf.create(config_dict)
-    env, expert_model = build_demo_env_and_expert(config)
-    env.reset()
-
-    collector = DemonstrationCollector(config.preferences.segment_len)
-
-    print("[demo_pref] Demo preference worker started.", flush=True)
-
-    while not shutdown_event.is_set():
-        try:
-            agent_seg = agent_demo_pipe.get(timeout=1.0)
-        except _queue.Empty:
-            continue
-
-        expert_frames = collector.create_expert_correction(
-            agent_seg.frames, expert_model, env
-        )
-
-        try:
-            # Always prefer expert correction over agent segment.
-            preference_pipe.put(
-                (expert_frames, agent_seg.frames, (1.0, 0.0)),
-                block=False,
-            )
-        except Exception:
-            pass
-
-    env.close()
-# ─────────────────────────────────────────────────────────────────────────────
-# Preference worker
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _preference_worker(
-    config_dict,
-    segment_pipe,
-    preference_pipe,
-    reward_predictor_ready_event,
-    shutdown_event,
-    reward_predictor_checkpoint_dir,
-    shared_env_steps,
-):
-    """
-    Subprocess responsible for labeling segment pairs.
-
-    Thin wrapper: delegates buffer management and RP loading to
-    PreferenceCollector, and oracle labeling to the configured oracle.
-    """
-    sys.stdin = os.fdopen(0)
-
-    config = OmegaConf.create(config_dict)
-    oracle = build_oracle(config)
-
-    # Need observation_dim to instantiate the RP for disagreement scoring.
-    env = build_single_env(config)
-    observation_dim = env.observation_space.shape[0]
-    env.close()
-
-    collector = PreferenceCollector(
-        config, reward_predictor_checkpoint_dir, observation_dim
-    )
-
-    while not shutdown_event.is_set():
-        collector.drain_pipe(segment_pipe)
-        collector.refresh_rp(reward_predictor_ready_event)
-        pair = collector.sample_pair()
-        if pair is None:
-            continue
-        seg1, seg2 = pair
-        pref = oracle.label(seg1, seg2)
-        if pref is not None:
-            preference_pipe.put((seg1.frames, seg2.frames, pref))
-            collector.on_labeled(shared_env_steps, reward_predictor_ready_event)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Demonstration worker
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _demonstration_worker(
-    config_dict,
-    agent_demo_pipe,
-    demo_pipe,
-    shutdown_event,
-):
-    """
-    Subprocess responsible for generating expert-correction demonstration pairs.
-
-    For each agent segment received, queries the expert policy on each agent
-    observation to get the expert's action, steps the demo environment, and
-    collects the resulting observations as the expert-correction segment.
-
-    Sends (expert_correction_frames, agent_frames) to demo_pipe.
-    """
-    import queue as _queue
-
-    config = OmegaConf.create(config_dict)
-    env, expert_model = build_demo_env_and_expert(config)
-    env.reset()
-
-    collector = DemonstrationCollector(config.preferences.segment_len)
-
-    print("[demo] Demonstration worker started.", flush=True)
-
-    while not shutdown_event.is_set():
-        try:
-            agent_seg = agent_demo_pipe.get(timeout=1.0)
-        except _queue.Empty:
-            continue
-
-        expert_frames = collector.create_expert_correction(
-            agent_seg.frames, expert_model, env
-        )
-
-        try:
-            demo_pipe.put((expert_frames, agent_seg.frames), block=False)
-        except Exception:
-            pass
 
     env.close()

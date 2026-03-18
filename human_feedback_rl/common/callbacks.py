@@ -8,8 +8,8 @@ from pathlib import Path
 
 from stable_baselines3.common.callbacks import BaseCallback
 
-from human_feedback_rl.feedback.segment import Segment
-from human_feedback_rl.policy.wrappers import PredictedRewardVecWrapper
+from human_feedback_rl.common.segment import Segment
+from human_feedback_rl.common.wrappers import PredictedRewardVecWrapper
 
 
 class SegmentCollectorCallback(BaseCallback):
