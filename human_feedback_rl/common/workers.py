@@ -84,7 +84,7 @@ def _preference_worker(
         seg1, seg2 = pair
         pref = oracle.label(seg1, seg2)
         if pref is not None:
-            preference_pipe.put((seg1.frames, seg2.frames, pref))
+            preference_pipe.put((seg1.frames, seg2.frames, pref, "oracle"))
             collector.on_labeled(shared_env_steps, reward_predictor_ready_event)
 
 
@@ -194,7 +194,7 @@ def _demo_preference_worker(
         try:
             # Always prefer expert correction over agent segment.
             preference_pipe.put(
-                (expert_frames, agent_seg.frames, (1.0, 0.0)),
+                (expert_frames, agent_seg.frames, (1.0, 0.0), "demo"),
                 block=False,
             )
         except Exception:

@@ -153,6 +153,8 @@ class PrefBuffer:
         self._thread: Optional[Thread] = None
         self.step = 0
         self._shared_steps = shared_steps
+        self._oracle_received = 0
+        self._demo_received = 0
 
     # ------------------------------------------------------------------
 
@@ -179,12 +181,16 @@ class PrefBuffer:
 
         while not self._stop_flag:
             try:
-                seg1, seg2, preference = pref_queue.get(timeout=1)
+                seg1, seg2, preference, source = pref_queue.get(timeout=1)
             except queue.Empty:
                 continue
 
             received += 1
             self.step += 1
+            if source == "demo":
+                self._demo_received += 1
+            else:
+                self._oracle_received += 1
 
             # 80 / 20 train / val split based on configured maxlens
             validation_fraction = self.val_db.maxlen / (
@@ -200,9 +206,11 @@ class PrefBuffer:
                 if wandb.run is not None:
                     a2c_step = self._shared_steps.value if self._shared_steps is not None else None
                     wandb.log({
-                        "prefs/train_db_size":  len(self.train_db),
-                        "prefs/val_db_size":    len(self.val_db),
-                        "prefs/total_received": received,
+                        "prefs/train_db_size":   len(self.train_db),
+                        "prefs/val_db_size":     len(self.val_db),
+                        "prefs/total_received":  received,
+                        "prefs/oracle_received": self._oracle_received,
+                        "prefs/demo_received":   self._demo_received,
                     }, step=a2c_step)
 
     # ------------------------------------------------------------------
