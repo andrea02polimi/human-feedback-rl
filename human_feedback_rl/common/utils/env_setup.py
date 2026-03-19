@@ -1,5 +1,6 @@
 from pathlib import Path
 from omegaconf import OmegaConf
+from stable_baselines3 import DQN
 import sumo_rl_ego as sre
 
 
@@ -33,13 +34,7 @@ def build_env_and_expert(cfg):
         base_seed=cfg.seed,
     )
 
-    expert_model = sre.load_model(
-        env,
-        cfg=run_cfg.algo,
-        load_path=model_path,
-        seed=run_cfg.seed,
-        device=run_cfg.resources.device,
-    )
+    expert_model = DQN.load(str(model_path), env=env, device=run_cfg.resources.device)
 
     return env, expert_model
 
@@ -65,13 +60,7 @@ def build_demo_env_and_expert(cfg):
         base_seed=cfg.seed + 1000,
     )
 
-    expert_model = sre.load_model(
-        env,
-        cfg=run_cfg.algo,
-        load_path=model_path,
-        seed=run_cfg.seed,
-        device=run_cfg.resources.device,
-    )
+    expert_model = DQN.load(str(model_path), env=env, device=run_cfg.resources.device)
 
     return env, expert_model
 
