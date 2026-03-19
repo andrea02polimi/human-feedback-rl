@@ -425,8 +425,12 @@ class ChristianoRLHF:
                 except Exception:
                     break
 
+            # Use total-ever-received count (monotonically increasing) as the
+            # retrain trigger, NOT DB sizes which plateau at maxlen and would
+            # permanently stall retraining once the DB is full.
+            current_prefs = preference_buffer.step
+
             train_db, val_db = preference_buffer.get_dbs()
-            current_prefs = len(train_db) + len(val_db)
 
             if current_prefs == 0 or len(val_db) == 0:
                 time.sleep(1.0)

@@ -20,6 +20,7 @@ Training loss
               `margin`, making training stable and scale-agnostic.
 """
 
+import math
 import os
 import os.path as osp
 import random
@@ -128,29 +129,42 @@ class RewardPredictorEnsemble:
             return
 
         # Pre-fetch demo pairs once per training pass for efficient sampling.
-        demo_pairs = list(demo_db) if (demo_db is not None and len(demo_db) > 0) else []
-        random.shuffle(demo_pairs)
-        demo_idx = [0]   # list so the inner closure can mutate it
+        all_demo_pairs = list(demo_db) if (demo_db is not None and len(demo_db) > 0) else []
 
-        def _next_demo_batch(size: int):
-            """Return `size` demo pairs, cycling through the shuffled list."""
-            if not demo_pairs:
-                return []
-            out = []
-            for _ in range(size):
-                if demo_idx[0] >= len(demo_pairs):
-                    random.shuffle(demo_pairs)
-                    demo_idx[0] = 0
-                out.append(demo_pairs[demo_idx[0]])
-                demo_idx[0] += 1
-            return out
+        n_total = len(pref_db.preferences)
+        # Bootstrap: each ensemble member trains on ~1/e of the data sampled
+        # without replacement (Christiano et al. 2017, Appendix A).
+        # This ensures diversity across members, which is critical for
+        # disagreement-based active learning to work correctly.
+        n_subset = max(1, int(n_total / math.e))
 
-        for batch in batch_iter(pref_db.preferences, 32, shuffle=True):
+        for model, optimizer in zip(self.models, self.optimizers):
 
-            # Same demo batch shared across all ensemble members for this step.
-            demo_batch = _next_demo_batch(len(batch))
+            # Independent subset per member.
+            subset_idxs = np.random.choice(n_total, n_subset, replace=False)
+            member_prefs = [pref_db.preferences[i] for i in subset_idxs]
 
-            for model, optimizer in zip(self.models, self.optimizers):
+            # Independent demo cycling per member.
+            demo_pairs = list(all_demo_pairs)
+            random.shuffle(demo_pairs)
+            demo_cursor = 0
+
+            def _next_demo_batch(size: int) -> list:
+                nonlocal demo_cursor
+                if not demo_pairs:
+                    return []
+                out = []
+                for _ in range(size):
+                    if demo_cursor >= len(demo_pairs):
+                        random.shuffle(demo_pairs)
+                        demo_cursor = 0
+                    out.append(demo_pairs[demo_cursor])
+                    demo_cursor += 1
+                return out
+
+            for batch in batch_iter(member_prefs, 32, shuffle=True):
+                demo_batch = _next_demo_batch(len(batch))
+
                 model.train()
                 optimizer.zero_grad()
 
@@ -197,16 +211,16 @@ class RewardPredictorEnsemble:
                 loss.backward()
                 optimizer.step()
 
-            self.n_steps += 1
+                self.n_steps += 1
 
-            if val_interval > 0 and self.n_steps % val_interval == 0:
-                self._val_step(val_db, global_step)
+                if val_interval > 0 and self.n_steps % val_interval == 0:
+                    self._val_step(val_db, global_step)
 
-                if self._log and wandb.run is not None:
-                    log_dict = {"rp/train_loss": loss.item()}
-                    if demo_batch:
-                        log_dict["rp/train_demo_margin_loss"] = L_demo.item()
-                    wandb.log(log_dict, step=global_step)
+                    if self._log and wandb.run is not None:
+                        log_dict = {"rp/train_loss": loss.item()}
+                        if demo_batch:
+                            log_dict["rp/train_demo_margin_loss"] = L_demo.item()
+                        wandb.log(log_dict, step=global_step)
 
     def _val_step(self, val_db, global_step: int = None) -> None:
         if len(val_db) == 0:
