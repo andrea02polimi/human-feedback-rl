@@ -65,9 +65,10 @@ class SegmentCollectorCallback(BaseCallback):
         self.a2c_steps               = None   # set by _policy_worker after construction
 
         # buffer per costruire segmenti, uno per ogni ambiente
-        self.current_segment_frames  = [[] for _ in range(n_envs)]
-        self.current_segment_rewards = [[] for _ in range(n_envs)]
-        self._gradient_step_count    = 0
+        self.current_segment_frames   = [[] for _ in range(n_envs)]
+        self.current_segment_rewards  = [[] for _ in range(n_envs)]
+        self.current_segment_actions  = [[] for _ in range(n_envs)]
+        self._gradient_step_count     = 0
 
         # per-episode true reward tracking (env reward, not predicted)
         self._ep_true_reward_accum      = [0.0] * n_envs   # running sum per env
@@ -85,14 +86,17 @@ class SegmentCollectorCallback(BaseCallback):
         obs_tensor = self.locals.get("obs_tensor")
         if obs_tensor is None:
             return True
-        obs_np = obs_tensor.cpu().numpy()                              # (n_envs, obs_dim)
-        dones  = self.locals.get("dones", np.zeros(self.n_envs, dtype=bool))
-        infos  = self.locals.get("infos", [{} for _ in range(self.n_envs)])
+        obs_np   = obs_tensor.cpu().numpy()                            # (n_envs, obs_dim)
+        actions  = self.locals.get("actions")                          # (n_envs,) int
+        dones    = self.locals.get("dones", np.zeros(self.n_envs, dtype=bool))
+        infos    = self.locals.get("infos", [{} for _ in range(self.n_envs)])
 
         for env_idx in range(self.n_envs):
             true_reward = float(infos[env_idx].get("true_reward", 0.0))
             self.current_segment_frames[env_idx].append(obs_np[env_idx].copy())
             self.current_segment_rewards[env_idx].append(true_reward)
+            if actions is not None:
+                self.current_segment_actions[env_idx].append(int(actions[env_idx]))
 
             self._ep_true_reward_accum[env_idx] += true_reward
             if dones[env_idx]:
@@ -105,11 +109,16 @@ class SegmentCollectorCallback(BaseCallback):
             ):
                 frames  = self.current_segment_frames[env_idx]
                 rewards = self.current_segment_rewards[env_idx]
+                acts    = self.current_segment_actions[env_idx]
                 while len(frames) < self.segment_length:
                     frames.append(frames[-1].copy())
                     rewards.append(0.0)
+                    if acts:
+                        acts.append(acts[-1])
                 seg = Segment(frames[:self.segment_length])
                 seg.env_rewards = rewards[:self.segment_length]
+                if acts:
+                    seg.actions = acts[:self.segment_length]
                 try:
                     self.segment_pipe.put(seg, block=False)
                 except Exception:
@@ -119,8 +128,9 @@ class SegmentCollectorCallback(BaseCallback):
                         self.agent_demo_pipe.put(seg, block=False)
                     except Exception:
                         pass
-                self.current_segment_frames[env_idx]  = []
-                self.current_segment_rewards[env_idx] = []
+                self.current_segment_frames[env_idx]   = []
+                self.current_segment_rewards[env_idx]  = []
+                self.current_segment_actions[env_idx]  = []
 
         return True
 

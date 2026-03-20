@@ -29,12 +29,12 @@ def build_env_and_expert(cfg):
     model_path = PROJECT_ROOT / cfg.env.expert_model / "model.zip"
 
     env = sre.make_vec_env(
-        run_cfg.env,
-        n_envs=run_cfg.resources.n_envs,
+        run_cfg.env.id,
+        n_envs=run_cfg.env.n_envs,
         base_seed=cfg.seed,
     )
 
-    expert_model = DQN.load(str(model_path), env=env, device=run_cfg.resources.device)
+    expert_model = DQN.load(str(model_path), env=env, device=run_cfg.algo.algo_kwargs.device)
 
     return env, expert_model
 
@@ -55,12 +55,39 @@ def build_demo_env_and_expert(cfg):
     model_path = PROJECT_ROOT / cfg.env.expert_model / "model.zip"
 
     env = sre.make_vec_env(
-        run_cfg.env,
+        run_cfg.env.id,
         n_envs=1,
         base_seed=cfg.seed + 1000,
     )
 
-    expert_model = DQN.load(str(model_path), env=env, device=run_cfg.resources.device)
+    expert_model = DQN.load(str(model_path), env=env, device=run_cfg.algo.algo_kwargs.device)
+
+    return env, expert_model
+
+
+def build_expert_only(cfg):
+    """
+    Load the expert DQN using a minimal 1-env VecEnv (opened and immediately
+    usable for inference only — the env is returned so the caller can close it).
+
+    Use this instead of build_env_and_expert when the env is not needed after
+    loading (e.g. preference worker oracle), to avoid spawning n_envs SUMO
+    instances that would be closed right away.
+
+    Returns:
+        env          — SB3 VecEnv with n_envs=1  (caller must close)
+        expert_model — SB3 DQN with a .q_net attribute
+    """
+    run_cfg = _load_expert_run_cfg(cfg)
+    model_path = PROJECT_ROOT / cfg.env.expert_model / "model.zip"
+
+    env = sre.make_vec_env(
+        run_cfg.env.id,
+        n_envs=1,
+        base_seed=cfg.seed,
+    )
+
+    expert_model = DQN.load(str(model_path), env=env, device=run_cfg.algo.algo_kwargs.device)
 
     return env, expert_model
 
@@ -76,4 +103,4 @@ def build_single_env(cfg):
         (reset → (obs, info), step → (obs, rew, term, trunc, info)).
     """
     run_cfg = _load_expert_run_cfg(cfg)
-    return sre.make_env(run_cfg.env, seed=cfg.seed)
+    return sre.make_env(run_cfg.env.id, seed=cfg.seed)

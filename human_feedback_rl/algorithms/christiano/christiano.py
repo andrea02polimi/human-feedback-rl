@@ -1,7 +1,7 @@
 """
 ChristianoRLHF — Christiano et al. (2017) RLHF algorithm.
 
-Like SB3 algorithms, all configuration is passed to __init__.
+Like SB3 algorithms, all configuration parameters is passed to __init__ constructor.
 Call train(output_dir) to start the full asynchronous pipeline.
 """
 
@@ -13,8 +13,6 @@ import time
 from multiprocessing import Process, Queue
 from pathlib import Path
 
-import numpy as np
-import torch
 import wandb
 from omegaconf import OmegaConf
 from tqdm import tqdm
@@ -38,7 +36,7 @@ class ChristianoRLHF:
     """
     Christiano et al. (2017) RLHF algorithm.
 
-    Like SB3 algorithms, all configuration is passed to __init__.
+    Like SB3 algorithms, all configuration parameters is passed to __init__ constructor.
     Call train(output_dir) to start the full asynchronous pipeline.
 
     Three concurrent processes:
@@ -100,6 +98,7 @@ class ChristianoRLHF:
         # Oracle
         oracle: str = "env_reward",
         label_mode: str = "hard",
+        oracle_temperature: float = 1.0,
         # Demo modes
         use_demonstrations: bool = False,
         use_demo_preferences: bool = False,
@@ -147,6 +146,7 @@ class ChristianoRLHF:
         self.device               = device
         self.oracle               = oracle
         self.label_mode           = label_mode
+        self.oracle_temperature   = oracle_temperature
         self.use_demonstrations   = use_demonstrations
         self.use_demo_preferences = use_demo_preferences
         self.n_reward_predictors  = n_reward_predictors
@@ -209,6 +209,7 @@ class ChristianoRLHF:
             "preferences": {
                 "oracle": self.oracle,
                 "label_mode": self.label_mode,
+                "oracle_temperature": self.oracle_temperature,
                 "use_demonstrations": self.use_demonstrations,
                 "use_demo_preferences": self.use_demo_preferences,
                 "initial_prefs": self.initial_prefs,

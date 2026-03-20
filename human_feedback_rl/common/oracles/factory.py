@@ -7,7 +7,8 @@ from omegaconf import DictConfig
 from .base import BaseOracle
 from .expert import ExpertOracle
 from .human import HumanOracle
-from human_feedback_rl.common.utils.env_setup import build_env_and_expert
+from .logprob import LogProbOracle
+from human_feedback_rl.common.utils.env_setup import build_expert_only
 
 
 def build_oracle(config: DictConfig) -> BaseOracle:
@@ -17,21 +18,27 @@ def build_oracle(config: DictConfig) -> BaseOracle:
     Supported values:
         "env_reward" — ExpertOracle using true environment rewards
         "qnet"       — ExpertOracle using expert DQN Q-values
+        "log_prob"   — LogProbOracle using average log π_exp(a_agent | s)
         "human"      — HumanOracle (terminal prompt + pyglet window)
     """
     oracle = config.preferences.oracle
 
-    label_mode = config.preferences.get("label_mode", "hard")
+    label_mode  = config.preferences.get("label_mode", "hard")
+    temperature = config.preferences.get("oracle_temperature", 1.0)
 
     if oracle == "env_reward":
         return ExpertOracle(mode="env_reward", label_mode=label_mode)
     elif oracle == "qnet":
-        env, expert_model = build_env_and_expert(config)
+        env, expert_model = build_expert_only(config)
         env.close()
         return ExpertOracle(mode="qnet", label_mode=label_mode, expert_model=expert_model)
+    elif oracle == "log_prob":
+        env, expert_model = build_expert_only(config)
+        env.close()
+        return LogProbOracle(label_mode=label_mode, expert_model=expert_model, temperature=temperature)
     elif oracle == "human":
         return HumanOracle()
     else:
         raise ValueError(
-            f"Unknown oracle {oracle!r}. Use 'env_reward', 'qnet', or 'human'."
+            f"Unknown oracle {oracle!r}. Use 'env_reward', 'qnet', 'log_prob', or 'human'."
         )

@@ -93,10 +93,11 @@ def _policy_worker(
     # ── Phase 1: random rollouts for segment generation (no A2C updates) ──────
     print("[policy] Phase 1 — generating segments with random policy…", flush=True)
 
-    current_obs             = initial_obs if initial_obs.ndim > 1 else initial_obs[np.newaxis]
-    current_segment_frames  = [[] for _ in range(num_envs)]
-    current_segment_rewards = [[] for _ in range(num_envs)]
-    total_env_steps_phase1  = 0
+    current_obs              = initial_obs if initial_obs.ndim > 1 else initial_obs[np.newaxis]
+    current_segment_frames   = [[] for _ in range(num_envs)]
+    current_segment_rewards  = [[] for _ in range(num_envs)]
+    current_segment_actions  = [[] for _ in range(num_envs)]
+    total_env_steps_phase1   = 0
 
     while not reward_predictor_ready_event.is_set() and not shutdown_event.is_set():
         actions  = np.array([env.action_space.sample() for _ in range(num_envs)])
@@ -113,17 +114,21 @@ def _policy_worker(
         for env_idx in range(num_envs):
             current_segment_frames[env_idx].append(current_obs[env_idx].copy())
             current_segment_rewards[env_idx].append(float(env_rewards[env_idx]))
+            current_segment_actions[env_idx].append(int(actions[env_idx]))
             if (
                 len(current_segment_frames[env_idx]) >= segment_length
                 or dones[env_idx]
             ):
                 frames  = current_segment_frames[env_idx]
                 rewards = current_segment_rewards[env_idx]
+                acts    = current_segment_actions[env_idx]
                 while len(frames) < segment_length:
                     frames.append(frames[-1].copy())
                     rewards.append(0.0)
+                    acts.append(acts[-1])
                 seg = Segment(frames[:segment_length])
                 seg.env_rewards = rewards[:segment_length]
+                seg.actions     = acts[:segment_length]
                 try:
                     segment_pipe.put(seg, block=False)
                 except Exception:
@@ -133,8 +138,9 @@ def _policy_worker(
                         agent_demo_pipe.put(seg, block=False)
                     except Exception:
                         pass
-                current_segment_frames[env_idx]  = []
-                current_segment_rewards[env_idx] = []
+                current_segment_frames[env_idx]   = []
+                current_segment_rewards[env_idx]  = []
+                current_segment_actions[env_idx]  = []
 
         current_obs = next_obs
 
