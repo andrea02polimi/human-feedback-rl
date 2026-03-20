@@ -32,6 +32,10 @@ def build_oracle(config: DictConfig) -> BaseOracle:
         env, expert_model = build_expert_only(config)
         env.close()
         return ExpertOracle(mode="qnet", label_mode=label_mode, expert_model=expert_model)
+    elif oracle == "q_action":
+        env, expert_model = build_expert_only(config)
+        env.close()
+        return ExpertOracle(mode="q_action", label_mode=label_mode, expert_model=expert_model)
     elif oracle == "log_prob":
         env, expert_model = build_expert_only(config)
         env.close()
@@ -40,5 +44,5 @@ def build_oracle(config: DictConfig) -> BaseOracle:
         return HumanOracle()
     else:
         raise ValueError(
-            f"Unknown oracle {oracle!r}. Use 'env_reward', 'qnet', 'log_prob', or 'human'."
+            f"Unknown oracle {oracle!r}. Use 'env_reward', 'qnet', 'q_action', 'log_prob', or 'human'."
         )

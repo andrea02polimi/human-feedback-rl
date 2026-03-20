@@ -1,9 +1,11 @@
 """
 Expert oracle for synthetic preference labeling.
 
-Supports two scoring modes:
+Supports three scoring modes:
   "env_reward"  — prefer segment with higher sum of true environment rewards
   "qnet"        — prefer segment with higher sum of V(s) = max_a Q(s, a)
+  "q_action"    — prefer segment with higher mean Q_exp(s, a_agent)
+                  (captures both state quality and action quality)
 
 Supports two labeling modes:
   "hard"  — (1,0) / (0,1) / (0.5,0.5)  [original Christiano et al.]
@@ -34,8 +36,8 @@ class ExpertOracle(BaseOracle):
         label_mode: str = "hard",
         expert_model=None,
     ):
-        if mode == "qnet" and expert_model is None:
-            raise ValueError("mode='qnet' requires expert_model to be provided")
+        if mode in ("qnet", "q_action") and expert_model is None:
+            raise ValueError(f"mode={mode!r} requires expert_model to be provided")
         if label_mode not in ("soft", "hard"):
             raise ValueError(f"label_mode must be 'soft' or 'hard', got {label_mode!r}")
         self.mode         = mode
@@ -54,6 +56,9 @@ class ExpertOracle(BaseOracle):
         if self.mode == "qnet":
             score1 = self._score_qnet(seg1)
             score2 = self._score_qnet(seg2)
+        elif self.mode == "q_action":
+            score1 = self._score_q_action(seg1)
+            score2 = self._score_q_action(seg2)
         else:  # "env_reward"
             score1 = self._score_env_reward(seg1)
             score2 = self._score_env_reward(seg2)
@@ -82,3 +87,22 @@ class ExpertOracle(BaseOracle):
                 q_vals = self.expert_model.q_net(obs)[0]
             total += q_vals.max().item()
         return total
+
+    def _score_q_action(self, seg) -> float:
+        """Mean of Q_exp(s_t, a_agent_t) over the segment.
+
+        Captures both state quality (via Q-values) and action quality
+        (which action the agent actually took). Unlike qnet, sub-optimal
+        actions in a given state are penalised because Q(s,a) < max_a Q(s,a).
+        Requires seg.actions to be set.
+        """
+        if not hasattr(seg, "actions") or not seg.actions:
+            return 0.0
+        total = 0.0
+        T = len(seg.frames)
+        for frame, action in zip(seg.frames, seg.actions):
+            obs = torch.as_tensor(frame, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                q_vals = self.expert_model.q_net(obs)[0]
+            total += q_vals[int(action)].item()
+        return total / T
