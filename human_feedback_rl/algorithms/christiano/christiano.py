@@ -249,6 +249,10 @@ class ChristianoRLHF:
             tags=list(self.wandb_tags),
             config=config_dict,
         )
+        # Give reward-predictor metrics their own x-axis so they don't
+        # conflict with the policy's a2c_steps x-axis (wandb drops
+        # out-of-order steps otherwise).
+        wandb.define_metric("rp/*", step_metric="rp_step")
 
         reward_predictor_checkpoint_dir = str(run_directory / "reward_predictor_checkpoints")
         policy_checkpoint_path          = str(run_directory / "models" / "policy_christiano")
