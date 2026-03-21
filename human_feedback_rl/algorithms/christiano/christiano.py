@@ -462,14 +462,8 @@ class ChristianoRLHF:
             rp_retrain_count += 1
             _prefs_at_last_retrain = current_prefs
 
-            db_metrics = {
-                "train_db_size": len(train_db),
-                "val_db_size":   len(val_db),
-                "pref_db_size":  len(train_db) + len(val_db),
-            }
-            if use_demonstrations:
-                db_metrics["demo_db_size"] = len(demo_db)
-            wandb.log(db_metrics, step=a2c_steps.value)
+            if use_demonstrations and wandb.run is not None:
+                wandb.log({"prefs/demo_db_size": len(demo_db)}, step=a2c_steps.value)
 
             demo_info = f"  demo={len(demo_db)}" if use_demonstrations else ""
             print(

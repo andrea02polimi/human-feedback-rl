@@ -208,6 +208,7 @@ class PrefBuffer:
                     wandb.log({
                         "prefs/train_db_size":   len(self.train_db),
                         "prefs/val_db_size":     len(self.val_db),
+                        "prefs/pref_db_size":    len(self.train_db) + len(self.val_db),
                         "prefs/total_received":  received,
                         "prefs/oracle_received": self._oracle_received,
                         "prefs/demo_received":   self._demo_received,
