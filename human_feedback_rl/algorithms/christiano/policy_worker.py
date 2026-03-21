@@ -68,7 +68,7 @@ def _policy_worker(
     import torch
     from pathlib import Path
     from stable_baselines3 import A2C as SB3A2C
-    from stable_baselines3.common.vec_env import VecMonitor
+    from stable_baselines3.common.vec_env import VecMonitor, VecNormalize
 
     config = OmegaConf.create(config_dict)
 
@@ -154,7 +154,18 @@ def _policy_worker(
         reward_predictor.load(latest)
 
     reward_wrapper = PredictedRewardVecWrapper(env, reward_predictor, reward_predictor_ready_event)
-    wrapped_env    = VecMonitor(reward_wrapper)
+    # Normalise predicted rewards online (running return variance, per-rollout).
+    # Isolates the value function from RP scale changes between checkpoint reloads.
+    # norm_obs=False: observations are already structured for the RP — don't touch them.
+    # clip_reward: prevents extreme values during early RP training.
+    norm_wrapper   = VecNormalize(
+        reward_wrapper,
+        norm_obs=False,
+        norm_reward=True,
+        clip_reward=10.0,
+        gamma=config.policy.gamma,
+    )
+    wrapped_env    = VecMonitor(norm_wrapper)
 
     # total_env_steps_target is the budget for A2C training only.
     # Phase 1 random rollouts are not counted against it.
