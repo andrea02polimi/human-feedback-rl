@@ -14,13 +14,15 @@ class SumoRewardNetwork(nn.Module):
         hidden_dim: width of the two hidden layers (default 64)
     """
 
-    def __init__(self, obs_dim: int, hidden_dim: int = 64):
+    def __init__(self, obs_dim: int, hidden_dim: int = 64, dropout: float = 0.2):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
             nn.Tanh(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
 

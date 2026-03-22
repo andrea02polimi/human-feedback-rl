@@ -62,7 +62,7 @@ class RewardPredictorEnsemble:
         self.r_norm  = RunningStat(shape=n_preds)   # running mean/std for reward normalisation
 
         self.models     = [core_network().to(device) for _ in range(n_preds)]
-        self.optimizers = [optim.Adam(m.parameters(), lr=lr) for m in self.models]
+        self.optimizers = [optim.Adam(m.parameters(), lr=lr, weight_decay=1e-4) for m in self.models]
 
         if log_dir is not None:
             self._log           = True
