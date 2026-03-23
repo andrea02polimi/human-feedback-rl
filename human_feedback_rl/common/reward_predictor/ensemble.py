@@ -287,8 +287,9 @@ class RewardPredictorEnsemble:
             raise RuntimeError("Cannot save: log_dir was not set")
         path = osp.join(self.checkpoint_dir, f"reward_predictor_{self.n_steps}.pt")
         torch.save({
-            "step":   self.n_steps,
-            "models": [m.state_dict() for m in self.models],
+            "step":     self.n_steps,
+            "models":   [m.state_dict() for m in self.models],
+            "r_norm":   {"mean": self.r_norm.mean.tolist(), "std": self.r_norm.std.tolist(), "count": self.r_norm.n},
         }, path)
         print(f"Saved reward predictor checkpoint to {path}")
         return path
@@ -298,6 +299,13 @@ class RewardPredictorEnsemble:
         for m, s in zip(self.models, state["models"]):
             m.load_state_dict(s)
         self.n_steps = state["step"]
+        if "r_norm" in state:
+            rn = state["r_norm"]
+            self.r_norm._n = rn["count"]
+            self.r_norm._M = np.array(rn["mean"])
+            # Reconstruct _S from saved std: S = std² * (n-1)
+            std = np.array(rn["std"])
+            self.r_norm._S = std ** 2 * max(rn["count"] - 1, 0)
         print(f"Loaded reward predictor checkpoint from {path}")
 
     @staticmethod

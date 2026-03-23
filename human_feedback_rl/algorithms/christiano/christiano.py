@@ -129,6 +129,7 @@ class ChristianoRLHF:
         # Training
         total_env_steps: int = 1_000_000,
         rp_reload_interval: int = 50,
+        rp_retrain_min_new_prefs: int = 50,
         policy_save_interval: int = 100,
         # Performance: max PyTorch intra-op threads per process.
         # Each spawned subprocess (policy, preference, demo) uses this limit,
@@ -170,9 +171,10 @@ class ChristianoRLHF:
         self.demo_db_maxlen       = demo_db_maxlen
         self.disagreement_candidates = disagreement_candidates
         self.max_query_interval   = max_query_interval
-        self.total_env_steps      = total_env_steps
-        self.rp_reload_interval   = rp_reload_interval
-        self.policy_save_interval = policy_save_interval
+        self.total_env_steps             = total_env_steps
+        self.rp_reload_interval          = rp_reload_interval
+        self.rp_retrain_min_new_prefs    = rp_retrain_min_new_prefs
+        self.policy_save_interval        = policy_save_interval
         self.torch_num_threads    = torch_num_threads
         self.wandb_project        = wandb_project
         self.wandb_entity         = wandb_entity
@@ -203,6 +205,7 @@ class ChristianoRLHF:
             },
             "training": {
                 "reward_predictor_reload_interval": self.rp_reload_interval,
+                "rp_retrain_min_new_prefs": self.rp_retrain_min_new_prefs,
                 "policy_save_interval": self.policy_save_interval,
                 "total_env_steps": self.total_env_steps,
             },
@@ -418,7 +421,7 @@ class ChristianoRLHF:
 
         # Retrain RP only when enough new preferences have arrived.
         # This avoids both busy-wait and unnecessary retraining on stale data.
-        _rp_retrain_min_new_prefs = self.rp_val_interval  # same cadence as val_interval
+        _rp_retrain_min_new_prefs = self.rp_retrain_min_new_prefs
         rp_retrain_count = 0
         _prefs_at_last_retrain = 0
 

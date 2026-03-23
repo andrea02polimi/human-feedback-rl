@@ -69,6 +69,7 @@ class SegmentCollectorCallback(BaseCallback):
         self.current_segment_rewards  = [[] for _ in range(n_envs)]
         self.current_segment_actions  = [[] for _ in range(n_envs)]
         self._gradient_step_count     = 0
+        self._segments_dropped        = 0
 
         # per-episode true reward tracking (env reward, not predicted)
         self._ep_true_reward_accum      = [0.0] * n_envs   # running sum per env
@@ -122,12 +123,12 @@ class SegmentCollectorCallback(BaseCallback):
                 try:
                     self.segment_pipe.put(seg, block=False)
                 except Exception:
-                    pass
+                    self._segments_dropped += 1
                 if self.agent_demo_pipe is not None:
                     try:
                         self.agent_demo_pipe.put(seg, block=False)
                     except Exception:
-                        pass
+                        self._segments_dropped += 1
                 self.current_segment_frames[env_idx]   = []
                 self.current_segment_rewards[env_idx]  = []
                 self.current_segment_actions[env_idx]  = []
@@ -168,6 +169,7 @@ class SegmentCollectorCallback(BaseCallback):
             metrics = {
                 "policy/mean_predicted_rew": float(np.mean(rollout_rewards)),
                 "policy/std_predicted_rew":  float(np.std(rollout_rewards)),
+                "prefs/segments_dropped":    self._segments_dropped,
             }
 
             # Episode metrics (available once at least one episode has completed).

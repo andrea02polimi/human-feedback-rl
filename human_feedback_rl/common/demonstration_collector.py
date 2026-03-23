@@ -18,12 +18,15 @@ import numpy as np
 
 class DemonstrationCollector:
     """
-    Produces expert-correction segments paired with agent segments.
+    Produces expert rollout segments paired with agent segments.
 
-    For each agent segment:
-      1. For each observation in the segment, query the expert for an action.
-      2. Step the demo environment with that action.
-      3. Collect the resulting observation as the expert-correction frame.
+    For each agent segment, the expert runs in its own environment (demo env)
+    using the demo env's own observations to select actions — NOT the agent's
+    observations. This produces coherent expert trajectories where every action
+    is appropriate for the state the demo env is actually in.
+
+    The demo env state is maintained across calls so the expert builds up
+    continuous trajectories rather than restarting every segment.
 
     Args:
         segment_length: number of frames per segment (must match policy worker)
@@ -31,6 +34,7 @@ class DemonstrationCollector:
 
     def __init__(self, segment_length: int):
         self._segment_length = segment_length
+        self._current_obs = None  # demo env current obs, maintained across calls
 
     def create_expert_correction(
         self,
@@ -39,35 +43,34 @@ class DemonstrationCollector:
         env,
     ) -> list:
         """
-        Build an expert-correction segment from an agent segment.
+        Build a pure expert rollout segment of the same length as agent_frames.
 
-        For each agent observation, the expert decides an action and the demo
-        environment is stepped. The resulting observations form the expert
-        correction trajectory.
+        The expert acts based on the demo env's own observations at each step.
+        agent_frames is used only to determine the segment length.
 
         Args:
-            agent_frames: list of np.ndarray observations from the agent segment
+            agent_frames: list of np.ndarray — used only for segment length
             expert_model: SB3 model with .predict()
             env:          1-env SB3 VecEnv used exclusively by the demo worker
 
         Returns:
-            list of np.ndarray — expert-correction observations,
+            list of np.ndarray — expert rollout observations,
             length == segment_length (last frame repeated if episode ends early)
         """
+        if self._current_obs is None:
+            self._current_obs = np.asarray(env.reset(), dtype=np.float32)
+
         expert_frames = []
+        T = len(agent_frames)
 
-        for agent_obs in agent_frames:
-            # Expert decides action based on the agent's observation.
-            obs_batch = np.asarray(agent_obs, dtype=np.float32)[np.newaxis]  # (1, obs_dim)
-            action, _ = expert_model.predict(obs_batch, deterministic=True)
-
-            # Step the demo env — the resulting observation is the expert frame.
+        for _ in range(T):
+            action, _ = expert_model.predict(self._current_obs, deterministic=True)
             next_obs, _, dones, _ = env.step(action)
-            next_obs = np.asarray(next_obs)
+            next_obs = np.asarray(next_obs, dtype=np.float32)
             expert_frames.append(next_obs[0].copy())
-
+            self._current_obs = next_obs
             if dones[0]:
-                env.reset()
+                self._current_obs = np.asarray(env.reset(), dtype=np.float32)
 
         # Pad to segment_length in case the episode ended early.
         while len(expert_frames) < self._segment_length:

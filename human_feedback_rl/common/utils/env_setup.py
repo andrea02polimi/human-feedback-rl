@@ -92,6 +92,27 @@ def build_expert_only(cfg):
     return env, expert_model
 
 
+def build_policy_env(cfg):
+    """
+    Create the VecEnv for the policy worker using the RLHF config n_envs.
+
+    Unlike build_env_and_expert, this uses cfg.env.n_envs (the RLHF config)
+    instead of the expert's training config n_envs, which would be wrong
+    (the expert was trained with 16 envs; the RLHF policy should use 4).
+    Does NOT load the expert model.
+
+    Returns:
+        env — SB3 SubprocVecEnv with n_envs=cfg.env.n_envs
+    """
+    run_cfg = _load_expert_run_cfg(cfg)
+    env = sre.make_vec_env(
+        run_cfg.env.id,
+        n_envs=cfg.env.n_envs,
+        base_seed=cfg.seed,
+    )
+    return env
+
+
 def build_single_env(cfg):
     """
     Create a single (non-vectorized) gymnasium environment.

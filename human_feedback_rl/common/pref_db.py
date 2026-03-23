@@ -73,8 +73,8 @@ class PrefDB:
 
     def append(self, seg1, seg2, preference) -> None:
         """Add a labeled pair (seg1, seg2, pref) to the database."""
-        key1 = hash(np.asarray(seg1).tobytes())
-        key2 = hash(np.asarray(seg2).tobytes())
+        key1 = zlib.adler32(np.asarray(seg1).tobytes())
+        key2 = zlib.adler32(np.asarray(seg2).tobytes())
 
         for key, segment in zip([key1, key2], [seg1, seg2]):
             if key not in self.segments.keys():
@@ -186,7 +186,6 @@ class PrefBuffer:
                 continue
 
             received += 1
-            self.step += 1
             if source == "demo":
                 self._demo_received += 1
             else:
@@ -198,6 +197,7 @@ class PrefBuffer:
             )
 
             with self.lock:
+                self.step += 1
                 if np.random.rand() < validation_fraction:
                     self.val_db.append(seg1, seg2, preference)
                 else:

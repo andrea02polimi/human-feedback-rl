@@ -22,7 +22,7 @@ from human_feedback_rl.common.reward_predictor.networks import SumoRewardNetwork
 from human_feedback_rl.common.wrappers import PredictedRewardVecWrapper
 from human_feedback_rl.common.callbacks import SegmentCollectorCallback
 from human_feedback_rl.common.segment import Segment
-from human_feedback_rl.common.utils.env_setup import build_env_and_expert
+from human_feedback_rl.common.utils.env_setup import build_policy_env
 
 # Re-export common workers so christiano.py imports from a single location.
 from human_feedback_rl.common.workers import (          # noqa: F401
@@ -75,7 +75,7 @@ def _policy_worker(
     # Limit all CPU thread pools so multiple spawned processes don't saturate the CPU.
     _set_thread_limits(config.resources.torch_num_threads)
 
-    env, _ = build_env_and_expert(config)
+    env = build_policy_env(config)
 
     initial_obs     = np.asarray(env.reset())
     num_envs        = initial_obs.shape[0] if initial_obs.ndim > 1 else 1
