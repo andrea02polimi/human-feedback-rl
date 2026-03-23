@@ -170,6 +170,7 @@ class SegmentCollectorCallback(BaseCallback):
                 "policy/mean_predicted_rew": float(np.mean(rollout_rewards)),
                 "policy/std_predicted_rew":  float(np.std(rollout_rewards)),
                 "prefs/segments_dropped":    self._segments_dropped,
+                "a2c_step":                  self.num_timesteps,
             }
 
             # Episode metrics (available once at least one episode has completed).

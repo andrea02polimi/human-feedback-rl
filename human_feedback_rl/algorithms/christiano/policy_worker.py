@@ -83,6 +83,7 @@ def _policy_worker(
 
     reward_predictor = RewardPredictorEnsemble(
         core_network=functools.partial(SumoRewardNetwork, obs_dim=observation_dim),
+        n_preds=config.reward_predictor.n_preds,
         log_dir=None,
         device=config.resources.device,
     )

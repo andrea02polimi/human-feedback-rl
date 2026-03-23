@@ -255,7 +255,9 @@ class ChristianoRLHF:
         # Give reward-predictor metrics their own x-axis so they don't
         # conflict with the policy's a2c_steps x-axis (wandb drops
         # out-of-order steps otherwise).
-        wandb.define_metric("rp/*", step_metric="rp_step")
+        wandb.define_metric("rp/*",     step_metric="rp_step")
+        wandb.define_metric("policy/*", step_metric="a2c_step")
+        wandb.define_metric("prefs/*",  step_metric="a2c_step")
 
         reward_predictor_checkpoint_dir = str(run_directory / "reward_predictor_checkpoints")
         policy_checkpoint_path          = str(run_directory / "models" / "policy_christiano")
@@ -429,7 +431,8 @@ class ChristianoRLHF:
             while True:
                 try:
                     metrics = policy_metrics_queue.get_nowait()
-                    wandb.log(metrics, step=a2c_steps.value)
+                    metrics["a2c_step"] = a2c_steps.value
+                    wandb.log(metrics)
                 except Exception:
                     break
 

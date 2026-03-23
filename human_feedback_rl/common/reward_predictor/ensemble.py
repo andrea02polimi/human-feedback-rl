@@ -301,11 +301,12 @@ class RewardPredictorEnsemble:
         self.n_steps = state["step"]
         if "r_norm" in state:
             rn = state["r_norm"]
-            self.r_norm._n = rn["count"]
-            self.r_norm._M = np.array(rn["mean"])
-            # Reconstruct _S from saved std: S = std² * (n-1)
-            std = np.array(rn["std"])
-            self.r_norm._S = std ** 2 * max(rn["count"] - 1, 0)
+            mean = np.array(rn["mean"])
+            if mean.shape == self.r_norm._M.shape:
+                self.r_norm._n = rn["count"]
+                self.r_norm._M = mean
+                std = np.array(rn["std"])
+                self.r_norm._S = std ** 2 * max(rn["count"] - 1, 0)
         print(f"Loaded reward predictor checkpoint from {path}")
 
     @staticmethod

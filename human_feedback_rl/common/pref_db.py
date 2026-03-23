@@ -204,7 +204,7 @@ class PrefBuffer:
                     self.train_db.append(seg1, seg2, preference)
 
                 if wandb.run is not None:
-                    a2c_step = self._shared_steps.value if self._shared_steps is not None else None
+                    a2c_step = self._shared_steps.value if self._shared_steps is not None else 0
                     wandb.log({
                         "prefs/train_db_size":   len(self.train_db),
                         "prefs/val_db_size":     len(self.val_db),
@@ -212,7 +212,8 @@ class PrefBuffer:
                         "prefs/total_received":  received,
                         "prefs/oracle_received": self._oracle_received,
                         "prefs/demo_received":   self._demo_received,
-                    }, step=a2c_step)
+                        "a2c_step":              a2c_step,
+                    })
 
     # ------------------------------------------------------------------
 
