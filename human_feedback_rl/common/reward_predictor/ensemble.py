@@ -309,6 +309,21 @@ class RewardPredictorEnsemble:
                 self.r_norm._S = std ** 2 * max(rn["count"] - 1, 0)
         print(f"Loaded reward predictor checkpoint from {path}")
 
+    def load_weights_only(self, path: str) -> None:
+        """
+        Load model weights from a checkpoint without overwriting r_norm.
+
+        Used by PredictedRewardVecWrapper.reload() so the policy worker's
+        r_norm (which accumulates over thousands of inference calls) is NOT
+        reset to the checkpoint's n=0 every rp_reload_interval rollouts.
+        The main process never calls reward(), so its r_norm is always n=0.
+        """
+        state = torch.load(path, weights_only=True, map_location=self.device)
+        for m, s in zip(self.models, state["models"]):
+            m.load_state_dict(s)
+        self.n_steps = state["step"]
+        print(f"Loaded reward predictor weights from {path} (r_norm preserved)")
+
     @staticmethod
     def latest_checkpoint(ckpt_dir: str) -> Optional[str]:
         if not osp.exists(ckpt_dir):

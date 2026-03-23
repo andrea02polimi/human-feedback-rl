@@ -162,7 +162,11 @@ def _policy_worker(
     norm_wrapper   = VecNormalize(
         reward_wrapper,
         norm_obs=False,
-        norm_reward=True,
+        norm_reward=False,   # RP already normalises via r_norm (running z-score × 0.05, ±0.15 range).
+                             # VecNormalize norm_reward starts with ret_rms var=1.0 / count=1e-4.
+                             # After first update with RP rewards (~0.05), var drops to ~0.00045 →
+                             # amplification ×47 that shrinks over ~1000 steps → non-stationary
+                             # reward targets → value function never converges → EV=-50.
         clip_reward=10.0,
         gamma=config.policy.gamma,
     )

@@ -59,10 +59,16 @@ class PredictedRewardVecWrapper(VecEnvWrapper):
         return obs, rewards.astype(np.float32), dones, infos
 
     def reload(self, checkpoint_dir: str) -> None:
-        """Load the latest reward predictor checkpoint from disk."""
+        """
+        Load the latest reward predictor weights from disk, preserving r_norm.
+
+        Uses load_weights_only() instead of load() so the policy worker's
+        r_norm (built up over thousands of inference calls) is not reset to
+        the checkpoint's n=0 (the main process never calls reward()).
+        """
         latest = RewardPredictorEnsemble.latest_checkpoint(checkpoint_dir)
         if latest:
             try:
-                self.reward_predictor.load(latest)
+                self.reward_predictor.load_weights_only(latest)
             except Exception:
                 pass
