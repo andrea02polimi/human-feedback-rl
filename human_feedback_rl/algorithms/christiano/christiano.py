@@ -126,6 +126,9 @@ class ChristianoRLHF:
         demo_db_maxlen: int = 1500,
         disagreement_candidates: int = 20,
         max_query_interval: float = 5.0,
+        # OOD filtering for qnet oracle
+        ood_k: float = None,
+        ood_warmup: int = 5000,
         # Training
         total_env_steps: int = 1_000_000,
         rp_reload_interval: int = 50,
@@ -171,6 +174,8 @@ class ChristianoRLHF:
         self.demo_db_maxlen       = demo_db_maxlen
         self.disagreement_candidates = disagreement_candidates
         self.max_query_interval   = max_query_interval
+        self.ood_k                = ood_k
+        self.ood_warmup           = ood_warmup
         self.total_env_steps             = total_env_steps
         self.rp_reload_interval          = rp_reload_interval
         self.rp_retrain_min_new_prefs    = rp_retrain_min_new_prefs
@@ -225,6 +230,8 @@ class ChristianoRLHF:
                 "demo_db_maxlen": self.demo_db_maxlen,
                 "disagreement_candidates": self.disagreement_candidates,
                 "max_query_interval": self.max_query_interval,
+                "ood_k": self.ood_k,
+                "ood_warmup": self.ood_warmup,
             },
         }
 
@@ -275,9 +282,19 @@ class ChristianoRLHF:
         demo_pipe       = Queue()                                    if use_demonstrations else None
         demo_db         = DemoDatabase(maxlen=self.demo_db_maxlen)  if use_demonstrations else None
 
+        # OOD stats pipe: preference_worker → main process (for WandB logging).
+        # Only created when OOD filtering is active (ood_k is set) and oracle=qnet.
+        ood_stats_pipe = (
+            Queue(maxsize=200)
+            if self.ood_k is not None and self.oracle == "qnet"
+            else None
+        )
+
         if use_demo_preferences and not use_demonstrations:
             agent_demo_pipe = Queue(maxsize=self.demo_seg_pipe_maxsize)
 
+        # mp.Value crea un oggetto in memoria condivisa accessibile da più processi.
+        # Serve quando usi multiprocessing.Process e vuoi condividere uno stato globale.
         shared_env_steps     = mp.Value("l", 0)
         a2c_steps            = mp.Value("l", 0)
         policy_metrics_queue = Queue()
@@ -333,6 +350,7 @@ class ChristianoRLHF:
                 shutdown_event,
                 reward_predictor_checkpoint_dir,
                 shared_env_steps,
+                ood_stats_pipe,
             ),
         )
         if use_demonstrations:
@@ -365,15 +383,17 @@ class ChristianoRLHF:
 
         def _shutdown(*_):
             print("\n[main] Shutting down…", flush=True)
+            # Attiva un evento condiviso tra processi.
+            # Tutti i worker che controllano shutdown_event.is_set() inizieranno la terminazione.
             shutdown_event.set()
-            workers = [policy_process, preference_process]
+            workers = [policy_process, preference_process] # lista dei processi principali da chiudere
             if use_demonstrations:
                 workers.append(demo_process)
             if use_demo_preferences:
                 workers.append(demo_pref_process)
             for proc in workers:
-                proc.join(timeout=15)
-            for proc in workers:
+                proc.join(timeout=15) # Attende fino a 15 secondi che ogni processo termini in modo pulito:
+            for proc in workers: # terminazione forzata
                 if proc.is_alive():
                     proc.terminate()
                     proc.join(timeout=3)
@@ -382,7 +402,8 @@ class ChristianoRLHF:
             wandb.finish()
             os._exit(0)
 
-        signal.signal(signal.SIGINT, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown) # Registra _shutdown come handler del segnale SIGINT
+        # SIGINT è il segnale mandato quando facciamo Ctrl+C
 
         # ── Phase 1: collect initial preferences ──────────────────────────────
         target_preferences = self.initial_prefs
@@ -430,6 +451,7 @@ class ChristianoRLHF:
         while not shutdown_event.is_set():
             while True:
                 try:
+                    # Recupera un elemento dalla coda policy_metrics_queue senza bloccare l’esecuzione.
                     metrics = policy_metrics_queue.get_nowait()
                     metrics["a2c_step"] = a2c_steps.value
                     wandb.log(metrics)
@@ -470,6 +492,15 @@ class ChristianoRLHF:
 
             if use_demonstrations and wandb.run is not None:
                 wandb.log({"prefs/demo_db_size": len(demo_db)}, step=a2c_steps.value)
+
+            if ood_stats_pipe is not None and wandb.run is not None:
+                import queue as _queue
+                while True:
+                    try:
+                        ood_stats = ood_stats_pipe.get_nowait()
+                        wandb.log({**ood_stats, "a2c_step": a2c_steps.value})
+                    except _queue.Empty:
+                        break
 
             demo_info = f"  demo={len(demo_db)}" if use_demonstrations else ""
             print(

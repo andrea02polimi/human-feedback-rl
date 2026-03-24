@@ -45,6 +45,7 @@ def _preference_worker(
     shutdown_event,
     reward_predictor_checkpoint_dir,
     shared_env_steps,
+    ood_stats_pipe=None,
 ):
     """
     Subprocess responsible for labeling segment pairs.
@@ -54,6 +55,9 @@ def _preference_worker(
 
     Compatible with any RLHF algorithm that produces Segment objects on
     segment_pipe and consumes (frames1, frames2, pref) tuples from preference_pipe.
+
+    ood_stats_pipe: optional Queue; when provided, OOD stats are sent every
+    50 label() calls so the main process can log them to WandB.
     """
     sys.stdin = os.fdopen(0)
 
@@ -73,6 +77,9 @@ def _preference_worker(
         config, reward_predictor_checkpoint_dir, observation_dim
     )
 
+    _label_calls = 0  # total oracle.label() calls (labeled + filtered)
+    _OOD_LOG_INTERVAL = 50
+
     while not shutdown_event.is_set():
         collector.drain_pipe(segment_pipe)
         collector.refresh_rp(reward_predictor_ready_event)
@@ -83,9 +90,27 @@ def _preference_worker(
             continue
         seg1, seg2 = pair
         pref = oracle.label(seg1, seg2)
+        _label_calls += 1
         if pref is not None:
             preference_pipe.put((seg1.frames, seg2.frames, pref, "oracle"))
             collector.on_labeled(shared_env_steps, reward_predictor_ready_event)
+
+        # Periodically push OOD stats to the main process for WandB logging.
+        if (
+            ood_stats_pipe is not None
+            and hasattr(oracle, "ood_filter_rate")
+            and _label_calls % _OOD_LOG_INTERVAL == 0
+        ):
+            try:
+                ood_stats_pipe.put_nowait({
+                    "prefs/ood_filter_rate": oracle.ood_filter_rate,
+                    "prefs/ood_mean":        oracle.ood_mean,
+                    "prefs/ood_std":         oracle.ood_std,
+                    "prefs/ood_n_labeled":   oracle._n_labeled,
+                    "prefs/ood_n_filtered":  oracle._n_filtered,
+                })
+            except Exception:
+                pass  # pipe full — skip this log point
 
 
 # ─────────────────────────────────────────────────────────────────────────────

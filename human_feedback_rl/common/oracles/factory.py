@@ -25,13 +25,21 @@ def build_oracle(config: DictConfig) -> BaseOracle:
 
     label_mode  = config.preferences.get("label_mode", "hard")
     temperature = config.preferences.get("oracle_temperature", 1.0)
+    ood_k       = config.preferences.get("ood_k", None)
+    ood_warmup  = config.preferences.get("ood_warmup", 5000)
 
     if oracle == "env_reward":
         return ExpertOracle(mode="env_reward", label_mode=label_mode)
     elif oracle == "qnet":
         env, expert_model = build_expert_only(config)
         env.close()
-        return ExpertOracle(mode="qnet", label_mode=label_mode, expert_model=expert_model)
+        return ExpertOracle(
+            mode="qnet",
+            label_mode=label_mode,
+            expert_model=expert_model,
+            ood_k=ood_k,
+            ood_warmup=ood_warmup,
+        )
     elif oracle == "q_action":
         env, expert_model = build_expert_only(config)
         env.close()
