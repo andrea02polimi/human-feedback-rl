@@ -29,7 +29,7 @@ def _set_thread_limits(n: int) -> None:
 from human_feedback_rl.common.preference_collector import PreferenceCollector
 from human_feedback_rl.common.demonstration_collector import DemonstrationCollector
 from human_feedback_rl.common.oracles.factory import build_oracle
-from human_feedback_rl.common.utils.env_setup import build_single_env, build_demo_env_and_expert
+from human_feedback_rl.common.utils.env_setup import build_single_env, build_expert_only
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,7 +45,6 @@ def _preference_worker(
     shutdown_event,
     reward_predictor_checkpoint_dir,
     shared_env_steps,
-    ood_stats_pipe=None,
 ):
     """
     Subprocess responsible for labeling segment pairs.
@@ -54,10 +53,8 @@ def _preference_worker(
     PreferenceCollector, and oracle labeling to the configured oracle.
 
     Compatible with any RLHF algorithm that produces Segment objects on
-    segment_pipe and consumes (frames1, frames2, pref) tuples from preference_pipe.
-
-    ood_stats_pipe: optional Queue; when provided, OOD stats are sent every
-    50 label() calls so the main process can log them to WandB.
+    segment_pipe and consumes (frames1, actions1, frames2, actions2, pref, source)
+    tuples from preference_pipe.
     """
     sys.stdin = os.fdopen(0)
 
@@ -68,17 +65,17 @@ def _preference_worker(
 
     oracle = build_oracle(config)
 
-    # Need observation_dim to instantiate the RP for disagreement scoring.
+    # Need observation_dim and action space info to instantiate the RP for disagreement scoring.
     env = build_single_env(config)
-    observation_dim = env.observation_space.shape[0]
+    observation_dim    = env.observation_space.shape[0]
+    is_discrete        = hasattr(env.action_space, "n")
+    action_feature_dim = env.action_space.n if is_discrete else env.action_space.shape[0]
     env.close()
 
     collector = PreferenceCollector(
-        config, reward_predictor_checkpoint_dir, observation_dim
+        config, reward_predictor_checkpoint_dir, observation_dim,
+        is_discrete=is_discrete, action_feature_dim=action_feature_dim,
     )
-
-    _label_calls = 0  # total oracle.label() calls (labeled + filtered)
-    _OOD_LOG_INTERVAL = 50
 
     while not shutdown_event.is_set():
         collector.drain_pipe(segment_pipe)
@@ -90,27 +87,13 @@ def _preference_worker(
             continue
         seg1, seg2 = pair
         pref = oracle.label(seg1, seg2)
-        _label_calls += 1
         if pref is not None:
-            preference_pipe.put((seg1.frames, seg2.frames, pref, "oracle"))
+            preference_pipe.put((
+                seg1.frames, getattr(seg1, "actions", []),
+                seg2.frames, getattr(seg2, "actions", []),
+                pref, "oracle",
+            ))
             collector.on_labeled(shared_env_steps, reward_predictor_ready_event)
-
-        # Periodically push OOD stats to the main process for WandB logging.
-        if (
-            ood_stats_pipe is not None
-            and hasattr(oracle, "ood_filter_rate")
-            and _label_calls % _OOD_LOG_INTERVAL == 0
-        ):
-            try:
-                ood_stats_pipe.put_nowait({
-                    "prefs/ood_filter_rate": oracle.ood_filter_rate,
-                    "prefs/ood_mean":        oracle.ood_mean,
-                    "prefs/ood_std":         oracle.ood_std,
-                    "prefs/ood_n_labeled":   oracle._n_labeled,
-                    "prefs/ood_n_filtered":  oracle._n_filtered,
-                })
-            except Exception:
-                pass  # pipe full — skip this log point
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,16 +118,17 @@ def _demonstration_worker(
     the margin ranking loss (DemoDatabase path).
     """
     import queue as _queue
+    import numpy as np
 
     config = OmegaConf.create(config_dict)
 
     # Limit all CPU thread pools (used for expert model inference).
     _set_thread_limits(config.resources.torch_num_threads)
 
-    env, expert_model = build_demo_env_and_expert(config)
-    env.reset()
+    env, expert_model = build_expert_only(config)
+    env.close()  # env not needed after loading the expert model weights
 
-    collector = DemonstrationCollector(config.preferences.segment_len)
+    collector = DemonstrationCollector()
 
     print("[demo] Demonstration worker started.", flush=True)
 
@@ -154,16 +138,18 @@ def _demonstration_worker(
         except _queue.Empty:
             continue
 
-        expert_frames = collector.create_expert_correction(
-            agent_seg.frames, expert_model, env
+        agent_frames, expert_actions = collector.create_expert_correction(
+            agent_seg.frames, expert_model
         )
+        agent_actions = getattr(agent_seg, "actions", [0] * len(agent_seg.frames))
 
         try:
-            demo_pipe.put((expert_frames, agent_seg.frames), block=False)
+            demo_pipe.put(
+                (np.array(agent_frames), np.array(expert_actions), np.array(agent_actions)),
+                block=False,
+            )
         except Exception:
             pass
-
-    env.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -193,16 +179,17 @@ def _demo_preference_worker(
     keep flowing alongside oracle preferences at all times.
     """
     import queue as _queue
+    import numpy as np
 
     config = OmegaConf.create(config_dict)
 
     # Limit all CPU thread pools (used for expert model inference).
     _set_thread_limits(config.resources.torch_num_threads)
 
-    env, expert_model = build_demo_env_and_expert(config)
-    env.reset()
+    env, expert_model = build_expert_only(config)
+    env.close()  # env not needed after loading the expert model weights
 
-    collector = DemonstrationCollector(config.preferences.segment_len)
+    collector = DemonstrationCollector()
 
     print("[demo_pref] Demo preference worker started.", flush=True)
 
@@ -212,17 +199,20 @@ def _demo_preference_worker(
         except _queue.Empty:
             continue
 
-        expert_frames = collector.create_expert_correction(
-            agent_seg.frames, expert_model, env
+        agent_frames, expert_actions = collector.create_expert_correction(
+            agent_seg.frames, expert_model
         )
+        agent_actions = getattr(agent_seg, "actions", [0] * len(agent_seg.frames))
+        frames_arr    = np.array(agent_frames)
+        exp_act_arr   = np.array(expert_actions)
+        ag_act_arr    = np.array(agent_actions)
 
         try:
-            # Always prefer expert correction over agent segment.
+            # seg1 = expert correction (frames + expert actions) is preferred (1.0, 0.0)
+            # seg2 = agent segment    (frames + agent  actions)
             preference_pipe.put(
-                (expert_frames, agent_seg.frames, (1.0, 0.0), "demo"),
+                (frames_arr, exp_act_arr, frames_arr, ag_act_arr, (1.0, 0.0), "demo"),
                 block=False,
             )
         except Exception:
             pass
-
-    env.close()

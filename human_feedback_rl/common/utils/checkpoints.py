@@ -23,12 +23,12 @@ def keep_latest_checkpoints(checkpoint_dir: str, keep: int = 2) -> None:
 
 
 def drain_demo_pipe(demo_pipe, demo_db) -> int:
-    """Drain all pending demo pairs from demo_pipe into demo_db. Returns count added."""
+    """Drain all pending demo triples from demo_pipe into demo_db. Returns count added."""
     added = 0
     while True:
         try:
-            exp_frames, ag_frames = demo_pipe.get_nowait()
-            demo_db.append(exp_frames, ag_frames)
+            frames, expert_actions, agent_actions = demo_pipe.get_nowait()
+            demo_db.append(frames, expert_actions, agent_actions)
             added += 1
         except Exception:
             break

@@ -45,7 +45,7 @@ class ChristianoRLHF:
       Main process      — PrefDB management + reward predictor training
 
     Args:
-        expert_model_path: path to the expert model directory (relative to project root)
+        expert_policy_id: registered policy id (e.g. "dqn_v0") from sre.list_models()
         seed: random seed
         n_envs: number of parallel environments for the policy worker
         device: torch device ("cpu" or "cuda")
@@ -91,7 +91,7 @@ class ChristianoRLHF:
 
     def __init__(
         self,
-        expert_model_path: str,
+        expert_policy_id: str,
         seed: int = 0,
         n_envs: int = 4,
         device: str = "cpu",
@@ -126,9 +126,6 @@ class ChristianoRLHF:
         demo_db_maxlen: int = 1500,
         disagreement_candidates: int = 20,
         max_query_interval: float = 5.0,
-        # OOD filtering for qnet oracle
-        ood_k: float = None,
-        ood_warmup: int = 5000,
         # Training
         total_env_steps: int = 1_000_000,
         rp_reload_interval: int = 50,
@@ -144,7 +141,7 @@ class ChristianoRLHF:
         wandb_entity: str = None,
         wandb_tags: list = None,
     ):
-        self.expert_model_path    = expert_model_path
+        self.expert_policy_id     = expert_policy_id
         self.seed                 = seed
         self.n_envs               = n_envs
         self.device               = device
@@ -174,8 +171,6 @@ class ChristianoRLHF:
         self.demo_db_maxlen       = demo_db_maxlen
         self.disagreement_candidates = disagreement_candidates
         self.max_query_interval   = max_query_interval
-        self.ood_k                = ood_k
-        self.ood_warmup           = ood_warmup
         self.total_env_steps             = total_env_steps
         self.rp_reload_interval          = rp_reload_interval
         self.rp_retrain_min_new_prefs    = rp_retrain_min_new_prefs
@@ -189,7 +184,7 @@ class ChristianoRLHF:
         return {
             "seed": self.seed,
             "env": {
-                "expert_model": self.expert_model_path,
+                "expert_model": self.expert_policy_id,
                 "n_envs": self.n_envs,
             },
             "resources": {"device": self.device, "torch_num_threads": self.torch_num_threads},
@@ -230,8 +225,6 @@ class ChristianoRLHF:
                 "demo_db_maxlen": self.demo_db_maxlen,
                 "disagreement_candidates": self.disagreement_candidates,
                 "max_query_interval": self.max_query_interval,
-                "ood_k": self.ood_k,
-                "ood_warmup": self.ood_warmup,
             },
         }
 
@@ -282,14 +275,6 @@ class ChristianoRLHF:
         demo_pipe       = Queue()                                    if use_demonstrations else None
         demo_db         = DemoDatabase(maxlen=self.demo_db_maxlen)  if use_demonstrations else None
 
-        # OOD stats pipe: preference_worker → main process (for WandB logging).
-        # Only created when OOD filtering is active (ood_k is set) and oracle=qnet.
-        ood_stats_pipe = (
-            Queue(maxsize=200)
-            if self.ood_k is not None and self.oracle == "qnet"
-            else None
-        )
-
         if use_demo_preferences and not use_demonstrations:
             agent_demo_pipe = Queue(maxsize=self.demo_seg_pipe_maxsize)
 
@@ -311,16 +296,24 @@ class ChristianoRLHF:
 
         # ── Reward predictor ──────────────────────────────────────────────────
         cfg_obj         = OmegaConf.create(config_dict)
-        temp_env        = build_single_env(cfg_obj)
-        observation_dim = temp_env.observation_space.shape[0]
+        temp_env           = build_single_env(cfg_obj)
+        observation_dim    = temp_env.observation_space.shape[0]
+        is_discrete        = hasattr(temp_env.action_space, "n")
+        action_feature_dim = temp_env.action_space.n if is_discrete else temp_env.action_space.shape[0]
         temp_env.close()
 
         reward_predictor = RewardPredictorEnsemble(
-            core_network=functools.partial(SumoRewardNetwork, obs_dim=observation_dim),
+            core_network=functools.partial(
+                SumoRewardNetwork,
+                obs_dim=observation_dim,
+                action_feature_dim=action_feature_dim,
+            ),
             lr=self.rp_lr,
             n_preds=self.n_reward_predictors,
             log_dir=str(run_directory),
             device=self.device,
+            is_discrete=is_discrete,
+            action_feature_dim=action_feature_dim,
         )
 
         # ── Launch worker processes ───────────────────────────────────────────
@@ -350,7 +343,6 @@ class ChristianoRLHF:
                 shutdown_event,
                 reward_predictor_checkpoint_dir,
                 shared_env_steps,
-                ood_stats_pipe,
             ),
         )
         if use_demonstrations:
@@ -492,15 +484,6 @@ class ChristianoRLHF:
 
             if use_demonstrations and wandb.run is not None:
                 wandb.log({"prefs/demo_db_size": len(demo_db)}, step=a2c_steps.value)
-
-            if ood_stats_pipe is not None and wandb.run is not None:
-                import queue as _queue
-                while True:
-                    try:
-                        ood_stats = ood_stats_pipe.get_nowait()
-                        wandb.log({**ood_stats, "a2c_step": a2c_steps.value})
-                    except _queue.Empty:
-                        break
 
             demo_info = f"  demo={len(demo_db)}" if use_demonstrations else ""
             print(

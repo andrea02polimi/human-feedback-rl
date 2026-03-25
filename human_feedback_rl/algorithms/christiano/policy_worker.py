@@ -77,15 +77,23 @@ def _policy_worker(
 
     env = build_policy_env(config)
 
-    initial_obs     = np.asarray(env.reset())
-    num_envs        = initial_obs.shape[0] if initial_obs.ndim > 1 else 1
-    observation_dim = initial_obs.shape[-1]
+    initial_obs        = np.asarray(env.reset())
+    num_envs           = initial_obs.shape[0] if initial_obs.ndim > 1 else 1
+    observation_dim    = initial_obs.shape[-1]
+    is_discrete        = hasattr(env.action_space, "n")
+    action_feature_dim = env.action_space.n if is_discrete else env.action_space.shape[0]
 
     reward_predictor = RewardPredictorEnsemble(
-        core_network=functools.partial(SumoRewardNetwork, obs_dim=observation_dim),
+        core_network=functools.partial(
+            SumoRewardNetwork,
+            obs_dim=observation_dim,
+            action_feature_dim=action_feature_dim,
+        ),
         n_preds=config.reward_predictor.n_preds,
         log_dir=None,
         device=config.resources.device,
+        is_discrete=is_discrete,
+        action_feature_dim=action_feature_dim,
     )
 
     segment_length         = config.preferences.segment_len
@@ -115,7 +123,10 @@ def _policy_worker(
         for env_idx in range(num_envs):
             current_segment_frames[env_idx].append(current_obs[env_idx].copy())
             current_segment_rewards[env_idx].append(float(env_rewards[env_idx]))
-            current_segment_actions[env_idx].append(int(actions[env_idx]))
+            act = actions[env_idx]
+            current_segment_actions[env_idx].append(
+                int(act) if is_discrete else np.asarray(act, dtype=np.float32).copy()
+            )
             if (
                 len(current_segment_frames[env_idx]) >= segment_length
                 or dones[env_idx]
@@ -126,7 +137,8 @@ def _policy_worker(
                 while len(frames) < segment_length:
                     frames.append(frames[-1].copy())
                     rewards.append(0.0)
-                    acts.append(acts[-1])
+                    last = acts[-1]
+                    acts.append(last.copy() if hasattr(last, "copy") else last)
                 seg = Segment(frames[:segment_length])
                 seg.env_rewards = rewards[:segment_length]
                 seg.actions     = acts[:segment_length]

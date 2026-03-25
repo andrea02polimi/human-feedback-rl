@@ -24,8 +24,9 @@ def disagreement_score(segment, reward_predictor) -> float:
     the segment — these are the most informative pairs to label (Section 3.2 of
     Christiano et al.).
     """
-    frames = np.array(segment.frames, dtype=np.float32)   # (segment_len, obs_dim)
-    raw = reward_predictor.raw_rewards(frames)             # (n_preds, segment_len)
+    frames  = np.array(segment.frames, dtype=np.float32)                    # (T, obs_dim)
+    actions = np.array(getattr(segment, "actions", [0] * len(segment.frames)))  # (T,) or (T, act_dim)
+    raw = reward_predictor.raw_rewards(frames, actions)    # (n_preds, T)
     member_totals = raw.sum(axis=-1).flatten()             # (n_preds,)
     return float(np.var(member_totals))
 

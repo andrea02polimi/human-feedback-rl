@@ -10,18 +10,6 @@ Supports three scoring modes:
 Supports two labeling modes:
   "hard"  — (1,0) / (0,1) / (0.5,0.5)  [original Christiano et al.]
   "soft"  — softmax over scores
-
-OOD filtering (qnet mode only):
-  Tracks a running distribution of per-frame V(s) = max_a Q(s,a) values seen
-  so far (Welford's online algorithm). After a warmup period, any preference
-  pair where *either* segment contains a frame whose V(s) exceeds
-  mean + ood_k * std is discarded (label() returns None). This prevents
-  OOD Q-value extrapolation from poisoning the reward predictor.
-
-  Parameters:
-    ood_k        — z-score threshold (default 3.0; None = disabled)
-    ood_warmup   — number of frames to accumulate before filtering starts
-                   (default 5000; lets the oracle see the early distribution)
 """
 
 from typing import List, Optional, Tuple
@@ -33,14 +21,12 @@ from .base import BaseOracle
 
 class ExpertOracle(BaseOracle):
     """
-    Synthetic preference oracle supporting two scoring modes and two label modes.
+    Synthetic preference oracle supporting three scoring modes and two label modes.
 
     Args:
-        mode:         "env_reward" | "qnet"
+        mode:         "env_reward" | "qnet" | "q_action"
         label_mode:   "hard" | "soft"
-        expert_model: SB3 DQN with a .q_net attribute — required when mode="qnet"
-        ood_k:        OOD z-score threshold for qnet filtering (None = disabled)
-        ood_warmup:   frames to observe before OOD filtering activates
+        expert_model: SB3 DQN with a .q_net attribute — required when mode != "env_reward"
     """
 
     def __init__(
@@ -48,8 +34,6 @@ class ExpertOracle(BaseOracle):
         mode: str = "env_reward",
         label_mode: str = "hard",
         expert_model=None,
-        ood_k: Optional[float] = None,
-        ood_warmup: int = 5000,
     ):
         if mode in ("qnet", "q_action") and expert_model is None:
             raise ValueError(f"mode={mode!r} requires expert_model to be provided")
@@ -58,33 +42,6 @@ class ExpertOracle(BaseOracle):
         self.mode         = mode
         self.label_mode   = label_mode
         self.expert_model = expert_model
-        self.ood_k        = ood_k
-        self.ood_warmup   = ood_warmup
-
-        # Welford's online stats for per-frame V(s) values
-        self._n_frames: int   = 0
-        self._mean: float     = 0.0
-        self._M2: float       = 0.0   # sum of squared deviations
-
-        # Counters for WandB logging (read externally via properties)
-        self._n_labeled:  int = 0
-        self._n_filtered: int = 0
-
-    # ------------------------------------------------------------------
-    # Public stats (read by preference_worker for WandB logging)
-
-    @property
-    def ood_mean(self) -> float:
-        return self._mean
-
-    @property
-    def ood_std(self) -> float:
-        return (self._M2 / self._n_frames) ** 0.5 if self._n_frames > 1 else 0.0
-
-    @property
-    def ood_filter_rate(self) -> float:
-        total = self._n_labeled + self._n_filtered
-        return self._n_filtered / total if total > 0 else 0.0
 
     # ------------------------------------------------------------------
 
@@ -94,34 +51,16 @@ class ExpertOracle(BaseOracle):
 
         hard mode: (1,0) / (0,1) / (0.5,0.5) — original Christiano et al.
         soft mode: softmax over raw scores.
-
-        Returns None if OOD filtering is active and either segment contains
-        a frame with V(s) above mean + ood_k * std.
         """
         if self.mode == "qnet":
-            frame_vals1 = self._frame_qnet_values(seg1)
-            frame_vals2 = self._frame_qnet_values(seg2)
-
-            # Update running stats with all frames from both segments
-            for v in frame_vals1 + frame_vals2:
-                self._update_stats(v)
-
-            # OOD filter: discard pair if any frame is too far from distribution
-            if self._is_ood_pair(frame_vals1, frame_vals2):
-                self._n_filtered += 1
-                return None
-
-            score1 = sum(frame_vals1)
-            score2 = sum(frame_vals2)
-
+            score1 = self._score_qnet(seg1)
+            score2 = self._score_qnet(seg2)
         elif self.mode == "q_action":
             score1 = self._score_q_action(seg1)
             score2 = self._score_q_action(seg2)
         else:  # "env_reward"
             score1 = self._score_env_reward(seg1)
             score2 = self._score_env_reward(seg2)
-
-        self._n_labeled += 1
 
         if self.label_mode == "soft":
             probs = torch.softmax(torch.tensor([score1, score2]), dim=0)
@@ -131,28 +70,6 @@ class ExpertOracle(BaseOracle):
         if abs(score1 - score2) < 1e-6:
             return (0.5, 0.5)
         return (1.0, 0.0) if score1 > score2 else (0.0, 1.0)
-
-    # ------------------------------------------------------------------
-
-    def _update_stats(self, value: float) -> None:
-        """Welford's online algorithm for running mean and variance."""
-        self._n_frames += 1
-        delta = value - self._mean
-        self._mean += delta / self._n_frames
-        delta2 = value - self._mean
-        self._M2 += delta * delta2
-
-    def _is_ood_pair(self, vals1: List[float], vals2: List[float]) -> bool:
-        """Return True if OOD filtering is enabled and either segment is OOD."""
-        if self.ood_k is None:
-            return False
-        if self._n_frames < self.ood_warmup:
-            return False
-        std = self.ood_std
-        if std < 1e-6:
-            return False
-        threshold = self._mean + self.ood_k * std
-        return max(vals1) > threshold or max(vals2) > threshold
 
     # ------------------------------------------------------------------
 
@@ -185,10 +102,9 @@ class ExpertOracle(BaseOracle):
         if not hasattr(seg, "actions") or not seg.actions:
             return 0.0
         total = 0.0
-        T = len(seg.frames)
         for frame, action in zip(seg.frames, seg.actions):
             obs = torch.as_tensor(frame, dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
                 q_vals = self.expert_model.q_net(obs)[0]
             total += q_vals[int(action)].item()
-        return total / T
+        return total / len(seg.frames)

@@ -29,7 +29,14 @@ class PreferenceCollector:
         observation_dim:                 obs_dim used to instantiate the RP ensemble
     """
 
-    def __init__(self, config, reward_predictor_checkpoint_dir: str, observation_dim: int):
+    def __init__(
+        self,
+        config,
+        reward_predictor_checkpoint_dir: str,
+        observation_dim: int,
+        is_discrete: bool,
+        action_feature_dim: int,
+    ):
         self._config = config
         self._checkpoint_dir = reward_predictor_checkpoint_dir
         self._max_segs = config.preferences.max_segs
@@ -43,9 +50,15 @@ class PreferenceCollector:
 
         # Inference-only RP for disagreement-based pair selection.
         self._rp = RewardPredictorEnsemble(
-            core_network=functools.partial(SumoRewardNetwork, obs_dim=observation_dim),
+            core_network=functools.partial(
+                SumoRewardNetwork,
+                obs_dim=observation_dim,
+                action_feature_dim=action_feature_dim,
+            ),
             log_dir=None,
             device=config.resources.device,
+            is_discrete=is_discrete,
+            action_feature_dim=action_feature_dim,
         )
         self._rp_loaded = False
 

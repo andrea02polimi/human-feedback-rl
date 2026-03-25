@@ -55,11 +55,15 @@ class RewardPredictorEnsemble:
         n_preds: int = 1,
         log_dir: Optional[str] = None,
         device: str = "cpu",
+        is_discrete: bool = True,
+        action_feature_dim: int = 1,
     ):
-        self.device  = device
-        self.n_preds = n_preds
-        self.n_steps = 0
-        self.r_norm  = RunningStat(shape=n_preds)   # running mean/std for reward normalisation
+        self.device             = device
+        self.n_preds            = n_preds
+        self.n_steps            = 0
+        self.r_norm             = RunningStat(shape=n_preds)   # running mean/std for reward normalisation
+        self.is_discrete        = is_discrete
+        self.action_feature_dim = action_feature_dim
 
         self.models     = [core_network().to(device) for _ in range(n_preds)]
         self.optimizers = [optim.Adam(m.parameters(), lr=lr, weight_decay=1e-4) for m in self.models]
@@ -72,28 +76,46 @@ class RewardPredictorEnsemble:
             self._log           = False
             self.checkpoint_dir = None
 
+    # ── Action encoding ────────────────────────────────────────────────────────
+
+    def _encode_actions_t(self, actions_np: np.ndarray) -> torch.Tensor:
+        """
+        Encode raw actions to float feature tensor.
+
+        Discrete:   (... ) int   → one-hot  (... , action_feature_dim) float
+        Continuous: (..., d) float → passthrough (..., d) float
+        """
+        if self.is_discrete:
+            t = torch.tensor(np.asarray(actions_np, dtype=np.int64), dtype=torch.long).to(self.device)
+            return F.one_hot(t, self.action_feature_dim).float()
+        else:
+            return torch.tensor(np.asarray(actions_np, dtype=np.float32), dtype=torch.float32).to(self.device)
+
     # ── Inference ─────────────────────────────────────────────────────────────
 
-    def raw_rewards(self, obs: np.ndarray) -> np.ndarray:
+    def raw_rewards(self, obs: np.ndarray, actions: np.ndarray) -> np.ndarray:
         """
-        Per-member reward for each observation (no normalisation).
-        obs: (N, obs_dim)  →  (n_preds, N)
+        Per-member reward for each (obs, action) pair (no normalisation).
+        Discrete:   obs (N, obs_dim), actions (N,) int
+        Continuous: obs (N, obs_dim), actions (N, act_dim) float
+        Returns (n_preds, N).
         Used by disagreement-based pair selection.
         """
         obs_t = torch.tensor(obs, dtype=torch.float32).to(self.device)
+        act_t = self._encode_actions_t(actions)   # (N, action_feature_dim)
         rs = []
         for model in self.models:
             model.eval()
             with torch.no_grad():
-                rs.append(model(obs_t).cpu().numpy())
+                rs.append(model(obs_t, act_t).cpu().numpy())
         return np.array(rs)   # (n_preds, N)
 
-    def reward(self, obs: np.ndarray) -> np.ndarray:
+    def reward(self, obs: np.ndarray, actions: np.ndarray) -> np.ndarray:
         """
         Normalised mean ensemble reward (running z-score, scaled × 0.05).
-        obs: (N, obs_dim)  →  (N,)
+        obs: (N, obs_dim), actions: (N,) int  →  (N,)
         """
-        ensemble_rs = self.raw_rewards(obs)   # (n_preds, N)
+        ensemble_rs = self.raw_rewards(obs, actions)   # (n_preds, N)
         ensemble_rs = ensemble_rs.T           # (N, n_preds)
         for step_reward in ensemble_rs:
             self.r_norm.push(step_reward)
@@ -169,42 +191,42 @@ class RewardPredictorEnsemble:
                 optimizer.zero_grad()
 
                 # ── Preference loss (soft cross-entropy) ──────────────────────
-                s1s   = torch.tensor(
-                    [pref_db.segments[k1] for k1, k2, _ in batch],
-                    dtype=torch.float32,
-                ).to(self.device)   # (B, T, obs_dim)
-                s2s   = torch.tensor(
-                    [pref_db.segments[k2] for k1, k2, _ in batch],
-                    dtype=torch.float32,
-                ).to(self.device)
+                # Each segment is stored as (frames, actions) tuple in pref_db.segments.
+                s1_data = [pref_db.segments[k1] for k1, k2, _ in batch]
+                s2_data = [pref_db.segments[k2] for k1, k2, _ in batch]
+                s1s_frames, s1s_actions = zip(*s1_data)
+                s2s_frames, s2s_actions = zip(*s2_data)
+
+                s1s   = torch.tensor(np.array(s1s_frames), dtype=torch.float32).to(self.device)   # (B, T, obs_dim)
+                s2s   = torch.tensor(np.array(s2s_frames), dtype=torch.float32).to(self.device)
+                s1a   = self._encode_actions_t(np.array(s1s_actions))   # (B, T, afd)
+                s2a   = self._encode_actions_t(np.array(s2s_actions))   # (B, T, afd)
                 prefs = torch.tensor(
                     [p for _, _, p in batch],
                     dtype=torch.float32,
                 ).to(self.device)   # (B, 2)
 
                 B, T = s1s.shape[:2]
-                r1 = model(s1s.view(B * T, -1)).view(B, T).sum(dim=1)   # (B,)
-                r2 = model(s2s.view(B * T, -1)).view(B, T).sum(dim=1)   # (B,)
+                r1 = model(s1s.view(B * T, -1), s1a.view(B * T, -1)).view(B, T).sum(dim=1)   # (B,)
+                r2 = model(s2s.view(B * T, -1), s2a.view(B * T, -1)).view(B, T).sum(dim=1)   # (B,)
 
                 # Soft cross-entropy: H(p, softmax([r1, r2]))
                 log_probs = F.log_softmax(torch.stack([r1, r2], dim=1), dim=1)   # (B, 2)
                 L_pref    = -(prefs * log_probs).sum(dim=1).mean()
 
                 # ── Demo margin ranking loss ───────────────────────────────────
+                # Each demo item is (frames, expert_actions, agent_actions).
+                # Margin loss: relu(margin - (RP(obs, a_expert) - RP(obs, a_agent)))
                 L_demo = torch.tensor(0.0, device=self.device)
                 if demo_batch:
-                    exp_t = torch.tensor(
-                        [e for e, a in demo_batch],
-                        dtype=torch.float32,
-                    ).to(self.device)   # (B, T, obs_dim)
-                    ag_t  = torch.tensor(
-                        [a for e, a in demo_batch],
-                        dtype=torch.float32,
-                    ).to(self.device)
+                    frames_arr, exp_act_arr, ag_act_arr = zip(*demo_batch)
+                    frames_t  = torch.tensor(np.array(frames_arr), dtype=torch.float32).to(self.device)  # (Bd, Td, obs_dim)
+                    exp_act_t = self._encode_actions_t(np.array(exp_act_arr))   # (Bd, Td, afd)
+                    ag_act_t  = self._encode_actions_t(np.array(ag_act_arr))    # (Bd, Td, afd)
 
-                    Bd, Td = exp_t.shape[:2]
-                    r_exp = model(exp_t.view(Bd * Td, -1)).view(Bd, Td).sum(dim=1)   # (B,)
-                    r_ag  = model(ag_t.view(Bd * Td, -1)).view(Bd, Td).sum(dim=1)    # (B,)
+                    Bd, Td = frames_t.shape[:2]
+                    r_exp = model(frames_t.view(Bd * Td, -1), exp_act_t.view(Bd * Td, -1)).view(Bd, Td).sum(dim=1)  # (Bd,)
+                    r_ag  = model(frames_t.view(Bd * Td, -1),  ag_act_t.view(Bd * Td, -1)).view(Bd, Td).sum(dim=1)  # (Bd,)
                     L_demo = F.relu(demo_margin - (r_exp - r_ag)).mean()
 
                 loss = L_pref + demo_weight * L_demo
@@ -242,19 +264,22 @@ class RewardPredictorEnsemble:
         for model in self.models:
             model.eval()
             with torch.no_grad():
-                s1s   = torch.tensor(
-                    [val_db.segments[k1] for k1, k2, _ in batch], dtype=torch.float32
-                ).to(self.device)
-                s2s   = torch.tensor(
-                    [val_db.segments[k2] for k1, k2, _ in batch], dtype=torch.float32
-                ).to(self.device)
+                s1_data = [val_db.segments[k1] for k1, k2, _ in batch]
+                s2_data = [val_db.segments[k2] for k1, k2, _ in batch]
+                s1s_frames, s1s_actions = zip(*s1_data)
+                s2s_frames, s2s_actions = zip(*s2_data)
+
+                s1s   = torch.tensor(np.array(s1s_frames), dtype=torch.float32).to(self.device)
+                s2s   = torch.tensor(np.array(s2s_frames), dtype=torch.float32).to(self.device)
+                s1a   = self._encode_actions_t(np.array(s1s_actions))   # (B, T, afd)
+                s2a   = self._encode_actions_t(np.array(s2s_actions))   # (B, T, afd)
                 prefs = torch.tensor(
                     [p for _, _, p in batch], dtype=torch.float32
                 ).to(self.device)
 
                 B, T = s1s.shape[:2]
-                r1 = model(s1s.view(B * T, -1)).view(B, T).sum(dim=1)   # (B,)
-                r2 = model(s2s.view(B * T, -1)).view(B, T).sum(dim=1)   # (B,)
+                r1 = model(s1s.view(B * T, -1), s1a.view(B * T, -1)).view(B, T).sum(dim=1)   # (B,)
+                r2 = model(s2s.view(B * T, -1), s2a.view(B * T, -1)).view(B, T).sum(dim=1)   # (B,)
 
                 log_probs = F.log_softmax(torch.stack([r1, r2], dim=1), dim=1)
                 loss      = -(prefs * log_probs).sum(dim=1).mean()

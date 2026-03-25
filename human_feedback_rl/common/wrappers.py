@@ -36,9 +36,11 @@ class PredictedRewardVecWrapper(VecEnvWrapper):
     def reset(self):
         obs = self.venv.reset()
         self._current_obs = np.array(obs, dtype=np.float32)
+        self._last_actions = None
         return obs
 
     def step_async(self, actions):
+        self._last_actions = np.asarray(actions)
         self.venv.step_async(actions)
 
     def step_wait(self):
@@ -48,9 +50,13 @@ class PredictedRewardVecWrapper(VecEnvWrapper):
         for i, info in enumerate(infos):
             info["true_reward"] = float(true_rewards[i])
 
-        # Use pre-step observation (same obs the RP was trained on in segments).
-        if self.reward_predictor_ready_event.is_set() and self._current_obs is not None:
-            predicted = self.reward_predictor.reward(self._current_obs)
+        # Use pre-step observation and the action taken at that step.
+        if (
+            self.reward_predictor_ready_event.is_set()
+            and self._current_obs is not None
+            and self._last_actions is not None
+        ):
+            predicted = self.reward_predictor.reward(self._current_obs, self._last_actions)
             rewards = predicted if np.all(np.isfinite(predicted)) else np.zeros(len(obs))
         else:
             rewards = np.zeros(len(obs), dtype=np.float32)

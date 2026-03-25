@@ -97,7 +97,11 @@ class SegmentCollectorCallback(BaseCallback):
             self.current_segment_frames[env_idx].append(obs_np[env_idx].copy())
             self.current_segment_rewards[env_idx].append(true_reward)
             if actions is not None:
-                self.current_segment_actions[env_idx].append(int(actions[env_idx]))
+                act = actions[env_idx]
+                a   = np.asarray(act)
+                self.current_segment_actions[env_idx].append(
+                    int(act) if a.ndim == 0 else a.copy().astype(np.float32)
+                )
 
             self._ep_true_reward_accum[env_idx] += true_reward
             if dones[env_idx]:
@@ -115,7 +119,8 @@ class SegmentCollectorCallback(BaseCallback):
                     frames.append(frames[-1].copy())
                     rewards.append(0.0)
                     if acts:
-                        acts.append(acts[-1])
+                        last = acts[-1]
+                        acts.append(last.copy() if hasattr(last, "copy") else last)
                 seg = Segment(frames[:self.segment_length])
                 seg.env_rewards = rewards[:self.segment_length]
                 if acts:

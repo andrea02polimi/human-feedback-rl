@@ -71,14 +71,29 @@ class PrefDB:
 
     # ------------------------------------------------------------------
 
-    def append(self, seg1, seg2, preference) -> None:
-        """Add a labeled pair (seg1, seg2, pref) to the database."""
-        key1 = zlib.adler32(np.asarray(seg1).tobytes())
-        key2 = zlib.adler32(np.asarray(seg2).tobytes())
+    def append(self, seg1_frames, seg1_actions, seg2_frames, seg2_actions, preference) -> None:
+        """Add a labeled pair to the database.
 
-        for key, segment in zip([key1, key2], [seg1, seg2]):
+        Segments are stored as (frames, actions) tuples so that an
+        action-conditioned reward predictor can distinguish which action was
+        taken at each observation.
+        """
+        seg1_frames  = np.asarray(seg1_frames)
+        seg1_actions = np.asarray(seg1_actions)
+        seg2_frames  = np.asarray(seg2_frames)
+        seg2_actions = np.asarray(seg2_actions)
+
+        # Include actions in the key so that two segments with identical
+        # observations but different actions are stored separately.
+        key1 = zlib.adler32(seg1_frames.tobytes() + seg1_actions.tobytes())
+        key2 = zlib.adler32(seg2_frames.tobytes() + seg2_actions.tobytes())
+
+        for key, frames, actions in [
+            (key1, seg1_frames, seg1_actions),
+            (key2, seg2_frames, seg2_actions),
+        ]:
             if key not in self.segments.keys():
-                self.segments[key] = segment
+                self.segments[key] = (frames, actions)
                 self.segment_references[key] = 1
             else:
                 self.segment_references[key] += 1
@@ -181,7 +196,7 @@ class PrefBuffer:
 
         while not self._stop_flag:
             try:
-                seg1, seg2, preference, source = pref_queue.get(timeout=1)
+                seg1_frames, seg1_actions, seg2_frames, seg2_actions, preference, source = pref_queue.get(timeout=1)
             except queue.Empty:
                 continue
 
@@ -199,9 +214,9 @@ class PrefBuffer:
             with self.lock:
                 self.step += 1
                 if np.random.rand() < validation_fraction:
-                    self.val_db.append(seg1, seg2, preference)
+                    self.val_db.append(seg1_frames, seg1_actions, seg2_frames, seg2_actions, preference)
                 else:
-                    self.train_db.append(seg1, seg2, preference)
+                    self.train_db.append(seg1_frames, seg1_actions, seg2_frames, seg2_actions, preference)
 
                 if wandb.run is not None:
                     a2c_step = self._shared_steps.value if self._shared_steps is not None else 0
