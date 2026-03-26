@@ -29,7 +29,16 @@ def _set_thread_limits(n: int) -> None:
 from human_feedback_rl.common.preference_collector import PreferenceCollector
 from human_feedback_rl.common.demonstration_collector import DemonstrationCollector
 from human_feedback_rl.common.oracles.factory import build_oracle
+from human_feedback_rl.common.oracles.expert import ExpertOracle
 from human_feedback_rl.common.utils.env_setup import build_single_env, build_expert_only
+
+
+def _pref_winner(pref):
+    """Return 0 (seg1 preferred), 1 (seg2 preferred), or None (tie)."""
+    if pref is None:
+        return None
+    p1, p2 = pref
+    return None if abs(p1 - p2) < 1e-6 else (0 if p1 > p2 else 1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,6 +54,7 @@ def _preference_worker(
     shutdown_event,
     reward_predictor_checkpoint_dir,
     shared_env_steps,
+    oracle_metrics_queue=None,
 ):
     """
     Subprocess responsible for labeling segment pairs.
@@ -55,6 +65,9 @@ def _preference_worker(
     Compatible with any RLHF algorithm that produces Segment objects on
     segment_pipe and consumes (frames1, actions1, frames2, actions2, pref, source)
     tuples from preference_pipe.
+
+    If oracle_metrics_queue is provided, sends running oracle consistency stats
+    (agreement rate vs env_reward oracle) every 10 labeled pairs.
     """
     sys.stdin = os.fdopen(0)
 
@@ -64,6 +77,14 @@ def _preference_worker(
     _set_thread_limits(config.resources.torch_num_threads)
 
     oracle = build_oracle(config)
+
+    # env_reward oracle for consistency comparison (skip if oracle already is env_reward).
+    _track_consistency = (
+        oracle_metrics_queue is not None
+        and config.preferences.oracle != "env_reward"
+    )
+    env_oracle = ExpertOracle(mode="env_reward", label_mode="hard") if _track_consistency else None
+    _agree = _disagree = _ties = 0
 
     # Need observation_dim and action space info to instantiate the RP for disagreement scoring.
     env = build_single_env(config)
@@ -94,6 +115,29 @@ def _preference_worker(
                 pref, "oracle",
             ))
             collector.on_labeled(shared_env_steps, reward_predictor_ready_event)
+
+            # ── Oracle consistency tracking ────────────────────────────────
+            if _track_consistency:
+                pref_env = env_oracle.label(seg1, seg2)
+                w_expert = _pref_winner(pref)
+                w_env    = _pref_winner(pref_env)
+                if w_expert is None or w_env is None:
+                    _ties += 1
+                elif w_expert == w_env:
+                    _agree += 1
+                else:
+                    _disagree += 1
+
+                total_labeled = _agree + _disagree + _ties
+                if total_labeled % 10 == 0:
+                    counted = _agree + _disagree
+                    oracle_metrics_queue.put({
+                        "oracle/agree":      _agree,
+                        "oracle/disagree":   _disagree,
+                        "oracle/ties":       _ties,
+                        "oracle/error_rate": _disagree / max(counted, 1) * 100,
+                        "a2c_step":          shared_env_steps.value,
+                    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────

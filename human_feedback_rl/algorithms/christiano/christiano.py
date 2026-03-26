@@ -255,9 +255,12 @@ class ChristianoRLHF:
         # Give reward-predictor metrics their own x-axis so they don't
         # conflict with the policy's a2c_steps x-axis (wandb drops
         # out-of-order steps otherwise).
-        wandb.define_metric("rp/*",     step_metric="rp_step")
-        wandb.define_metric("policy/*", step_metric="a2c_step")
-        wandb.define_metric("prefs/*",  step_metric="a2c_step")
+        wandb.define_metric("rp_step",   hidden=True)
+        wandb.define_metric("a2c_step",  hidden=True)
+        wandb.define_metric("rp/*",      step_metric="rp_step")
+        wandb.define_metric("policy/*",  step_metric="a2c_step")
+        wandb.define_metric("prefs/*",   step_metric="a2c_step")
+        wandb.define_metric("oracle/*",  step_metric="a2c_step")
 
         reward_predictor_checkpoint_dir = str(run_directory / "reward_predictor_checkpoints")
         policy_checkpoint_path          = str(run_directory / "models" / "policy_christiano")
@@ -282,6 +285,7 @@ class ChristianoRLHF:
         # Serve quando usi multiprocessing.Process e vuoi condividere uno stato globale.
         shared_env_steps     = mp.Value("l", 0)
         a2c_steps            = mp.Value("l", 0)
+        oracle_metrics_queue = Queue() if self.oracle != "env_reward" else None
         policy_metrics_queue = Queue()
 
         # ── Preference databases ──────────────────────────────────────────────
@@ -343,6 +347,7 @@ class ChristianoRLHF:
                 shutdown_event,
                 reward_predictor_checkpoint_dir,
                 shared_env_steps,
+                oracle_metrics_queue,
             ),
         )
         if use_demonstrations:
@@ -443,12 +448,18 @@ class ChristianoRLHF:
         while not shutdown_event.is_set():
             while True:
                 try:
-                    # Recupera un elemento dalla coda policy_metrics_queue senza bloccare l’esecuzione.
                     metrics = policy_metrics_queue.get_nowait()
                     metrics["a2c_step"] = a2c_steps.value
                     wandb.log(metrics)
                 except Exception:
                     break
+
+            if oracle_metrics_queue is not None:
+                while True:
+                    try:
+                        wandb.log(oracle_metrics_queue.get_nowait())
+                    except Exception:
+                        break
 
             # Use total-ever-received count (monotonically increasing) as the
             # retrain trigger, NOT DB sizes which plateau at maxlen and would

@@ -145,12 +145,20 @@ def _policy_worker(
                 try:
                     segment_pipe.put(seg, block=False)
                 except Exception:
-                    pass
+                    try:
+                        segment_pipe.get_nowait()   # evict oldest, keep newest
+                        segment_pipe.put(seg, block=False)
+                    except Exception:
+                        pass
                 if agent_demo_pipe is not None:
                     try:
                         agent_demo_pipe.put(seg, block=False)
                     except Exception:
-                        pass
+                        try:
+                            agent_demo_pipe.get_nowait()
+                            agent_demo_pipe.put(seg, block=False)
+                        except Exception:
+                            pass
                 current_segment_frames[env_idx]   = []
                 current_segment_rewards[env_idx]  = []
                 current_segment_actions[env_idx]  = []

@@ -128,12 +128,20 @@ class SegmentCollectorCallback(BaseCallback):
                 try:
                     self.segment_pipe.put(seg, block=False)
                 except Exception:
-                    self._segments_dropped += 1
+                    try:
+                        self.segment_pipe.get_nowait()   # evict oldest, keep newest
+                        self.segment_pipe.put(seg, block=False)
+                    except Exception:
+                        self._segments_dropped += 1
                 if self.agent_demo_pipe is not None:
                     try:
                         self.agent_demo_pipe.put(seg, block=False)
                     except Exception:
-                        self._segments_dropped += 1
+                        try:
+                            self.agent_demo_pipe.get_nowait()
+                            self.agent_demo_pipe.put(seg, block=False)
+                        except Exception:
+                            self._segments_dropped += 1
                 self.current_segment_frames[env_idx]   = []
                 self.current_segment_rewards[env_idx]  = []
                 self.current_segment_actions[env_idx]  = []
