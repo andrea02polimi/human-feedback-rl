@@ -16,13 +16,7 @@ class Trajectory:
     def total_reward(self) -> float:
         return sum(t.reward for t in self.transitions)
 
-
-@dataclass
-class Segment:
-    transitions: List[Transition]
-
-    def total_reward(self) -> float:
-        return sum(t.reward for t in self.transitions)
+Segment = Trajectory
 
 
 @dataclass
@@ -33,7 +27,7 @@ class SegmentPair:
 
 @dataclass
 class Preference:
-    label: Tuple[int, int]  # (1,0) or (0,1)
+    label: Tuple[float, float]  # (1,0) or (0,1)
 
 
 class PreferenceDataset:
@@ -54,3 +48,9 @@ class PreferenceDataset:
 
     def __iter__(self):
         return zip(self.pairs, self.targets)
+    
+    def get_pairs(self) -> List[SegmentPair]:
+        return self.pairs
+    
+    def get_preferences(self) -> List[Preference]:
+        return self.targets

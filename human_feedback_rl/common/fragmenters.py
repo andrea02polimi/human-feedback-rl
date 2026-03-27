@@ -1,8 +1,6 @@
-from . import *
-from typing import List
-import random
+from typing import List, Tuple
 import numpy as np
-
+from .core import *
 
 # ---------------------------------------------------------------------------
 # Fragmenter
@@ -10,81 +8,118 @@ import numpy as np
 
 class ActiveFragmenter:
     """
-    Extracts fixed-length segments from trajectories and pairs them.
-
-    If the reward model has already been trained, pairs are selected by
-    ensemble disagreement (active learning). Otherwise random selection is used.
+    Pipeline:
+    1. Split trajectories into segments (last segment can be shorter)
+    2. Compute reward and variance per segment (normalized by length)
+    3. Sort segments by variance (descending)
+    4. Take top segments and form N pairs
     """
 
     def __init__(
         self,
-        reward_model: EnsembleRewardModel,
-        length_segment: int,
-        num_max_segment_pairs: int,
+        reward_model,
+        segment_length: int,
     ):
         self.reward_model = reward_model
-        self.length_segment = length_segment
-        self.num_max_segment_pairs = num_max_segment_pairs
+        self.segment_length = segment_length
 
-    def fragment(self, trajectories: List[Trajectory]) -> List[SegmentPair]:
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def fragment(
+            self, 
+            trajectories: List[Trajectory],
+            num_pairs: int
+        ) -> List[SegmentPair]:
+
         segments = self._extract_segments(trajectories)
+
         if len(segments) < 2:
             return []
 
-        n_pairs = min(self.num_max_segment_pairs, len(segments) // 2)
+        scored_segments = self._score_segments(segments)
 
-        # Active selection: prefer segment pairs with high ensemble disagreement
-        if len(segments) > n_pairs * 2:
-            pairs = self._active_pairs(segments, n_pairs)
-        else:
-            pairs = self._random_pairs(segments, n_pairs)
+        # Sort by variance (descending)
+        scored_segments.sort(key=lambda x: x[2], reverse=True)
 
-        return pairs
+        # Take top segments needed for pairing
+        top_k = min(len(scored_segments), 2 * num_pairs)
+        top_segments = [s for s, _, _ in scored_segments[:top_k]]
 
+        return self._pair_sequentially(top_segments, num_pairs)
+
+    # ------------------------------------------------------------------
+    # Segment extraction
     # ------------------------------------------------------------------
 
     def _extract_segments(self, trajectories: List[Trajectory]) -> List[Segment]:
-        segments = []
+        segments: List[Segment] = []
+
         for traj in trajectories:
-            transitions = traj.transitions
-            T = len(transitions)
-            if T < self.length_segment:
-                continue
-            start = 0
-            while start + self.length_segment <= T:
-                segments.append(Segment(transitions[start : start + self.length_segment]))
-                start += self.length_segment
+            segments.extend(self._split_trajectory(traj))
+
         return segments
 
-    def _random_pairs(self, segments: List[Segment], n_pairs: int) -> List[SegmentPair]:
-        idxs = list(range(len(segments)))
-        random.shuffle(idxs)
-        pairs = []
-        for i in range(0, min(n_pairs * 2, len(idxs) - 1), 2):
-            pairs.append(SegmentPair(seg1=segments[idxs[i]], seg2=segments[idxs[i + 1]]))
-        return pairs
+    def _split_trajectory(self, traj: Trajectory) -> List[Segment]:
+        transitions = traj.transitions
+        T = len(transitions)
 
-    def _active_pairs(self, segments: List[Segment], n_pairs: int) -> List[SegmentPair]:
-        """Score candidate pairs by ensemble disagreement and take the top ones."""
-        rm = self.reward_model
+        segments = []
+        start = 0
 
-        # Score each segment by mean per-step ensemble variance
-        def _seg_score(seg: Segment) -> float:
-            obs = np.stack([t.obs for t in seg.transitions])
-            actions = np.array([t.action for t in seg.transitions], dtype=np.int64)
-            return float(rm.ensemble_variance(obs, actions).mean())
+        while start < T:
+            end = min(start + self.segment_length, T)
+            segments.append(Segment(transitions[start:end]))
+            start += self.segment_length
 
-        scored = [(s, _seg_score(s)) for s in segments]
-        # Sort descending by uncertainty
-        scored.sort(key=lambda x: x[1], reverse=True)
+        return segments
 
-        # Take top-K uncertain segments
-        top_k = min(n_pairs * 2, len(scored))
-        top_segs = [s for s, _ in scored[:top_k]]
+    # ------------------------------------------------------------------
+    # Scoring
+    # ------------------------------------------------------------------
 
-        pairs = []
-        for i in range(0, len(top_segs) - 1, 2):
-            pairs.append(SegmentPair(seg1=top_segs[i], seg2=top_segs[i + 1]))
-            if len(pairs) >= n_pairs:
+    def _score_segments(
+        self,
+        segments: List[Segment]
+    ) -> List[Tuple[Segment, float, float]]:
+        """
+        Returns:
+            List of (segment, reward_score, variance_score)
+        """
+        return [
+            (seg, *self._compute_scores(seg))
+            for seg in segments
+        ]
+
+    def _compute_scores(self, seg: Segment) -> Tuple[float, float]:
+        obs = np.stack([t.obs for t in seg.transitions])
+        actions = np.array([t.action for t in seg.transitions], dtype=np.int64)
+
+        rewards = self.reward_model.predict(obs, actions)
+        variances = self.reward_model.ensemble_variance(obs, actions)
+
+        length = len(seg.transitions)
+
+        # Normalize by segment length
+        reward_score = float(rewards.sum() / length)
+        variance_score = float(variances.sum() / length)
+
+        return reward_score, variance_score
+
+    # ------------------------------------------------------------------
+    # Pairing
+    # ------------------------------------------------------------------
+
+    def _pair_sequentially(self, segments: List[Segment], num_pairs) -> List[SegmentPair]:
+        pairs: List[SegmentPair] = []
+
+        for i in range(0, len(segments) - 1, 2):
+            if len(pairs) >= num_pairs:
                 break
+
+            pairs.append(
+                SegmentPair(seg1=segments[i], seg2=segments[i + 1])
+            )
+
         return pairs

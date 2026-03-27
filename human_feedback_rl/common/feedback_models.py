@@ -1,4 +1,4 @@
-from . import *
+from .core import *
 from typing import Tuple
 import numpy as np
 import torch
@@ -18,7 +18,7 @@ class PreferenceModelFromReward:
     and the final preference probability uses the mean across members.
     """
 
-    def __init__(self, reward_model: EnsembleRewardModel):
+    def __init__(self, reward_model):
         self.reward_model = reward_model
 
     def preference_probs(self, seg1: Segment, seg2: Segment) -> Tuple[float, float]:
@@ -33,20 +33,21 @@ class PreferenceModelFromReward:
                 r1_list.append(rm.segment_returns(seg1, k).item())
                 r2_list.append(rm.segment_returns(seg2, k).item())
 
-        r1 = float(np.mean(r1_list))
-        r2 = float(np.mean(r2_list))
+        r1 = float(np.mean(r1_list))/len(seg1.transitions)
+        r2 = float(np.mean(r2_list))/len(seg2.transitions)
 
         logits = torch.tensor([r1, r2])
         probs = torch.softmax(logits, dim=0)
-        return float(probs[0].item()), float(probs[1].item())
+        return Preference((float(probs[0].item()), float(probs[1].item())))
+
 
     def preference_logits_for_net(
         self, seg1: Segment, seg2: Segment, net_idx: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Differentiable (R1, R2) for one ensemble member. Used by the trainer."""
         rm = self.reward_model
-        r1 = rm.segment_returns(seg1, net_idx)
-        r2 = rm.segment_returns(seg2, net_idx)
+        r1 = rm.segment_returns(seg1, net_idx)/len(seg1.transitions)
+        r2 = rm.segment_returns(seg2, net_idx)/len(seg2.transitions)
         return r1, r2
 
 

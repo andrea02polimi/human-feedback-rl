@@ -7,6 +7,6 @@ class InverseSchedule:
     def __call__(self, progress_remaining):
         progress = 1 - progress_remaining
 
-        return self.final_value + (
-            self.initial_value - self.final_value
-        ) / (1 + self.decay_rate * progress)
+        delta = self.initial_value - self.final_value
+
+        return self.final_value + delta / (1 + self.decay_rate * progress)

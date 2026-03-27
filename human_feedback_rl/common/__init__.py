@@ -4,6 +4,7 @@ from .reward_functions import RewardNet, EnsembleRewardModel
 from .env_reward_wrapper import EnvRewardWrapper
 from .feedback_models import PreferenceModelFromReward
 from .schedules import InverseSchedule
+from .loggers import UnifiedLogger, PrefixLogger
 
 from .core import (
     Segment, 
@@ -28,4 +29,6 @@ __all__ = [
     "Transition",
     "PreferenceDataset",
     "InverseSchedule",
+    "UnifiedLogger",
+    "PrefixLogger",
 ]
