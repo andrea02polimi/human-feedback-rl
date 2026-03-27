@@ -1,3 +1,3 @@
-from human_feedback_rl.algorithms.christiano.christiano import ChristianoRLHF
+from human_feedback_rl.algorithms.christiano.christiano_algorithm import ChristianoAlgorithm
 
-__all__ = ["ChristianoRLHF"]
+__all__ = ["ChristianoAlgorithm"]

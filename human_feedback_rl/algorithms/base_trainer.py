@@ -11,6 +11,6 @@ class BaseTrainer(ABC):
     """Common interface for all RLHF training algorithms."""
 
     @abstractmethod
-    def train(self, cfg: DictConfig) -> None:
+    def train(self, *args, **kwargs):
         """Run the full training pipeline."""
         ...

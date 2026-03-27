@@ -1,11 +1,31 @@
 """
-ChristianoRLHF — Christiano et al. (2017) RLHF algorithm.
+ChristianoAlgorithm — Christiano et al. (2017) RLHF algorithm.
 
-Like SB3 algorithms, all configuration parameters is passed to __init__ constructor.
-Call train(output_dir) to start the full asynchronous pipeline.
+Like SB3 algorithms, all configuration is passed to __init__.
+Call train(...) to run the full synchronous pipeline.
 """
 
+from typing import Any, List
+
+import numpy as np
+import wandb
+
 from human_feedback_rl.algorithms.base_trainer import BaseTrainer
+from human_feedback_rl.algorithms.christiano.components import (
+    ActiveFragmenter,
+    EnsembleRewardModel,
+    EnvRewardWrapper,
+    PreferenceModelFromReward,
+    RewardTrainerChristiano,
+)
+from human_feedback_rl.common.core import (
+    Preference,
+    PreferenceDataset,
+    Segment,
+    SegmentPair,
+    Trajectory,
+    Transition,
+)
 
 
 class ChristianoAlgorithm(BaseTrainer):
@@ -14,35 +34,39 @@ class ChristianoAlgorithm(BaseTrainer):
         self,
         env,
         agent,
-        n_ensembles,
-        n_max,
-        length_segment,
-        num_max_segment_pairs,
-
+        n_ensembles: int,
+        n_max: int,
+        length_segment: int,
+        num_max_segment_pairs: int,
+        lr: float = 2e-4,
+        device: str = "cpu",
     ):
         self.env = env
         self.agent = agent
-        
-        env_reward_wrapper = EnvRewardWrapper(self.env)
-        self.agent.set_env(env_reward_wrapper)
-        
-        self.reward_model = EnsembleRewardModel(n_ensembles)
 
-        self.preference_model = PreferenceModelFromReward(reward_model)
+        obs_dim = env.observation_space.shape[0]
+        action_dim = env.action_space.n  # Discrete(5)
 
-        self.reward_trainer = RewardTrainerChristiano(preference_model)
-
-        self.fragmenter = ActiveFragmenter(reward_model, length_segment, num_max_segment_pairs)
-
+        self.reward_model = EnsembleRewardModel(
+            obs_dim, action_dim, n_ensembles, lr=lr, device=device
+        )
+        self.preference_model = PreferenceModelFromReward(self.reward_model)
+        self.reward_trainer = RewardTrainerChristiano(self.preference_model)
+        self.fragmenter = ActiveFragmenter(
+            self.reward_model, length_segment, num_max_segment_pairs
+        )
         self.preference_dataset = PreferenceDataset(n_max)
 
+        env_reward_wrapper = EnvRewardWrapper(self.env, self.reward_model)
+        self.agent.set_env(env_reward_wrapper)
 
     def train(
         self,
-        total_timesteps,
-        num_iterations,
-        num_traj_rollout,
-    ) -> None:
+        total_timesteps: int,
+        num_iterations: int,
+        num_traj_rollout: int,
+    ) -> Any:
+        timesteps_per_iter = int(total_timesteps / num_iterations)
 
         for it in range(num_iterations):
 
@@ -51,32 +75,68 @@ class ChristianoAlgorithm(BaseTrainer):
             # ---------------------------
             trajectories: List[Trajectory] = []
 
+            obs = self.env.reset()
+            if isinstance(obs, tuple):  # gymnasium-style (obs, infos)
+                obs, _ = obs
+
             for _ in range(num_traj_rollout):
-                obs, _ = self.env.reset()
-                self.agent.reset()
-
-                terminated, truncated = False, False
                 transitions = []
+                done = np.zeros(self.env.num_envs, dtype=bool)
 
-                while not (terminated or truncated):
-                    action = self.agent.predict(obs)
-                    next_obs, reward, terminated, truncated, info = self.env.step(action)
+                while not done[0]:
+                    action, _ = self.agent.predict(obs, deterministic=False)
+                    step_result = self.env.step(action)
+
+                    if len(step_result) == 5:  # gymnasium VecEnv
+                        next_obs, reward, terminated, truncated, info = step_result
+                        done = terminated | truncated
+                    else:  # classic SB3 VecEnv
+                        next_obs, reward, done, info = step_result
 
                     transitions.append(
-                        Transition(obs=obs, action=action, reward=reward)
+                        Transition(
+                            obs=obs[0].copy(),
+                            action=int(action[0]),
+                            reward=float(reward[0]),
+                        )
                     )
-
                     obs = next_obs
 
                 trajectories.append(Trajectory(transitions))
+
+                # Reset env[0] for the next rollout
+                obs = self.env.reset()
+                if isinstance(obs, tuple):
+                    obs, _ = obs
+
+            # ---------------------------
+            # Log policy metrics (true env reward)
+            # ---------------------------
+            avg_true_reward = float(np.mean([t.total_reward() for t in trajectories]))
+            avg_ep_length = float(np.mean([len(t.transitions) for t in trajectories]))
+            print(
+                f"[iter {it + 1}/{num_iterations}] "
+                f"avg_true_reward={avg_true_reward:.3f}  avg_ep_length={avg_ep_length:.1f}"
+            )
+            if wandb.run is not None:
+                wandb.log(
+                    {
+                        "policy/avg_true_reward": avg_true_reward,
+                        "policy/avg_episode_length": avg_ep_length,
+                    },
+                    step=it + 1,
+                )
 
             # ---------------------------
             # 2) Fragment trajectories
             # ---------------------------
             segment_pairs: List[SegmentPair] = self.fragmenter.fragment(trajectories)
 
+            if not segment_pairs:
+                continue
+
             # ---------------------------
-            # 3) Compute preferences
+            # 3) Compute preferences (oracle: true env reward)
             # ---------------------------
             preferences: List[Preference] = []
 
@@ -86,14 +146,29 @@ class ChristianoAlgorithm(BaseTrainer):
 
                 if r1 > r2:
                     preferences.append(Preference((1, 0)))
-                else:
+                elif r2 > r1:
                     preferences.append(Preference((0, 1)))
+                else:
+                    # Tie — label uniformly at random
+                    if np.random.rand() < 0.5:
+                        preferences.append(Preference((1, 0)))
+                    else:
+                        preferences.append(Preference((0, 1)))
 
             self.preference_dataset.push(segment_pairs, preferences)
 
-            self.reward_trainer.train(self.preference_dataset)
-            
+            # ---------------------------
+            # 4) Train reward model
+            # ---------------------------
+            loss = self.reward_trainer.train(self.preference_dataset)
+            print(f"[iter {it + 1}/{num_iterations}] reward_model loss: {loss:.4f}")
+
+            # ---------------------------
+            # 5) Train agent on predicted rewards
+            # ---------------------------
             self.agent.learn(
-                total_timesteps=total_timesteps/num_iterations
+                total_timesteps=timesteps_per_iter,
+                reset_num_timesteps=False,
             )
 
+        return self.agent

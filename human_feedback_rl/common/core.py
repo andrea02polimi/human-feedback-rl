@@ -36,7 +36,21 @@ class Preference:
     label: Tuple[int, int]  # (1,0) or (0,1)
 
 
-@dataclass
 class PreferenceDataset:
-    pairs: List[SegmentPair]
-    targets: List[Preference]
+    def __init__(self, n_max: int):
+        self.n_max = n_max
+        self.pairs: List[SegmentPair] = []
+        self.targets: List[Preference] = []
+
+    def push(self, pairs: List[SegmentPair], preferences: List[Preference]) -> None:
+        self.pairs.extend(pairs)
+        self.targets.extend(preferences)
+        if len(self.pairs) > self.n_max:
+            self.pairs = self.pairs[-self.n_max:]
+            self.targets = self.targets[-self.n_max:]
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __iter__(self):
+        return zip(self.pairs, self.targets)
