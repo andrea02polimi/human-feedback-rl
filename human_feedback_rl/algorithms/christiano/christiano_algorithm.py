@@ -10,25 +10,12 @@ from typing import Any, List
 import numpy as np
 import wandb
 
-from human_feedback_rl.algorithms.base_trainer import BaseTrainer
-from human_feedback_rl.algorithms.christiano.components import (
-    ActiveFragmenter,
-    EnsembleRewardModel,
-    EnvRewardWrapper,
-    PreferenceModelFromReward,
-    RewardTrainerChristiano,
-)
-from human_feedback_rl.common.core import (
-    Preference,
-    PreferenceDataset,
-    Segment,
-    SegmentPair,
-    Trajectory,
-    Transition,
-)
+from . import RewardTrainerChristiano
+from human_feedback_rl.common import *
 
 
-class ChristianoAlgorithm(BaseTrainer):
+
+class ChristianoAlgorithm(BaseAlgorithm):
 
     def __init__(
         self,
@@ -60,54 +47,31 @@ class ChristianoAlgorithm(BaseTrainer):
         env_reward_wrapper = EnvRewardWrapper(self.env, self.reward_model)
         self.agent.set_env(env_reward_wrapper)
 
+
     def train(
         self,
         total_timesteps: int,
         num_iterations: int,
-        num_traj_rollout: int,
+        num_pairs_initial: int,
+        num_pairs_final: int = 0,
+        decay_pairs_schedule: float = 1.0,
     ) -> Any:
+        
         timesteps_per_iter = int(total_timesteps / num_iterations)
+
+        schedule = InverseSchedule(
+            initial_value=num_pairs_initial,
+            final_value=num_pairs_final,
+            decay_rate=decay_pairs_schedule
+        )
 
         for it in range(num_iterations):
 
             # ---------------------------
             # 1) Collect trajectories
             # ---------------------------
-            trajectories: List[Trajectory] = []
+            trajectories = self._get_rollout(schedule(it/num_iterations))
 
-            obs = self.env.reset()
-            if isinstance(obs, tuple):  # gymnasium-style (obs, infos)
-                obs, _ = obs
-
-            for _ in range(num_traj_rollout):
-                transitions = []
-                done = np.zeros(self.env.num_envs, dtype=bool)
-
-                while not done[0]:
-                    action, _ = self.agent.predict(obs, deterministic=False)
-                    step_result = self.env.step(action)
-
-                    if len(step_result) == 5:  # gymnasium VecEnv
-                        next_obs, reward, terminated, truncated, info = step_result
-                        done = terminated | truncated
-                    else:  # classic SB3 VecEnv
-                        next_obs, reward, done, info = step_result
-
-                    transitions.append(
-                        Transition(
-                            obs=obs[0].copy(),
-                            action=int(action[0]),
-                            reward=float(reward[0]),
-                        )
-                    )
-                    obs = next_obs
-
-                trajectories.append(Trajectory(transitions))
-
-                # Reset env[0] for the next rollout
-                obs = self.env.reset()
-                if isinstance(obs, tuple):
-                    obs, _ = obs
 
             # ---------------------------
             # Log policy metrics (true env reward)
@@ -157,6 +121,8 @@ class ChristianoAlgorithm(BaseTrainer):
 
             self.preference_dataset.push(segment_pairs, preferences)
 
+
+
             # ---------------------------
             # 4) Train reward model
             # ---------------------------
@@ -172,3 +138,44 @@ class ChristianoAlgorithm(BaseTrainer):
             )
 
         return self.agent
+    
+    
+    def _get_rollout(self, num_traj_rollout):
+        
+        trajectories: List[Trajectory] = []
+
+        obs = self.env.reset()
+        if isinstance(obs, tuple):  # gymnasium-style (obs, infos)
+            obs, _ = obs
+
+        for _ in range(num_traj_rollout):
+            transitions = []
+            done = np.zeros(self.env.num_envs, dtype=bool)
+
+            while not done[0]:
+                action, _ = self.agent.predict(obs, deterministic=False)
+                step_result = self.env.step(action)
+
+                if len(step_result) == 5:  # gymnasium VecEnv
+                    next_obs, reward, terminated, truncated, info = step_result
+                    done = terminated | truncated
+                else:  # classic SB3 VecEnv
+                    next_obs, reward, done, info = step_result
+
+                transitions.append(
+                    Transition(
+                        obs=obs[0].copy(),
+                        action=int(action[0]),
+                        reward=float(reward[0]),
+                    )
+                )
+                obs = next_obs
+
+            trajectories.append(Trajectory(transitions))
+
+            # Reset env[0] for the next rollout
+            obs = self.env.reset()
+            if isinstance(obs, tuple):
+                obs, _ = obs
+
+        return trajectories

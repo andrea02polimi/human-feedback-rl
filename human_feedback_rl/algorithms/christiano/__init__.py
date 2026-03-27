@@ -1,3 +1,7 @@
-from human_feedback_rl.algorithms.christiano.christiano_algorithm import ChristianoAlgorithm
+from .christiano_algorithm import ChristianoAlgorithm
+from .reward_trainer_christiano import RewardTrainerChristiano
 
-__all__ = ["ChristianoAlgorithm"]
+__all__ = [
+    "ChristianoAlgorithm",
+    "RewardTrainerChristiano",
+    ]
