@@ -12,7 +12,7 @@ class UnifiedLogger:
         self.data[key].append(value)
 
 
-    def dump(self, step):
+    def dump(self):
         log_dict = {}
 
         for key, values in self.data.items():
@@ -36,5 +36,5 @@ class PrefixLogger:
         else:
             self.unified_logger.record(key, value)
 
-    def dump(self, step=0):
-        self.unified_logger.dump(step)
+    def dump(self):
+        self.unified_logger.dump()

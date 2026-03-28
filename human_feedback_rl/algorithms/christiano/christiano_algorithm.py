@@ -1,5 +1,6 @@
 from typing import Any, List
 import numpy as np
+import wandb
 
 from human_feedback_rl.common import *
 from .reward_trainer_christiano import RewardTrainerChristiano
@@ -26,9 +27,6 @@ class ChristianoAlgorithm:
         self.reward_training_epochs = reward_training_epochs
 
         self.logger = UnifiedLogger()
-
-        # Inject logger into SB3
-        self.agent.set_logger(PrefixLogger(self.logger, prefix="agent"))
 
         self.reward_model = EnsembleRewardModel(
             obs_dim = env.observation_space.shape[0], 
@@ -58,6 +56,14 @@ class ChristianoAlgorithm:
         # the agent learns from the env wrapped with the reward model
         env_reward_wrapper = EnvRewardWrapper(self.env, self.reward_model)
         self.agent.set_env(env_reward_wrapper)
+
+        # Map each metric group to its natural x-axis for WandB charts.
+        # reward_model/* updates once per iteration (reward trainer epochs),
+        # agent/* accumulates agent timesteps, rollout_trajectories/* tracks iterations.
+        if wandb.run is not None:
+            wandb.define_metric("reward_model/*",        step_metric="timescales/global_reward_trainer_epochs")
+            wandb.define_metric("agent/*",               step_metric="timescales/global_agent_steps")
+            wandb.define_metric("rollout_trajectories/*", step_metric="timescales/iterations")
 
         # schedule for number of pairs to sample at each iteration
         self.schedule_num_pairs = InverseSchedule(
@@ -124,31 +130,45 @@ class ChristianoAlgorithm:
 
             global_agent_steps += per_iter_timesteps
 
-            # Logging
-            avg_true_reward = np.mean([t.total_reward() for t in trajectories])
-            avg_ep_length = np.mean([len(t.transitions) for t in trajectories])
+            # --- rollout stats (computed on trajectories collected before this iteration's training) ---
+            avg_true_reward = float(np.mean([t.total_reward() for t in trajectories]))
+            avg_ep_length   = float(np.mean([len(t.transitions) for t in trajectories]))
+            avg_model_reward = self._compute_avg_model_reward(trajectories)
+
+            self.logger.record("rollout_trajectories/num_pairs",          num_pairs)
+            self.logger.record("rollout_trajectories/avg_true_reward",     avg_true_reward)
+            self.logger.record("rollout_trajectories/avg_episode_length",  avg_ep_length)
+
+            # --- reward model ---
             pref_model_current_accuracy_train = self._compute_preference_model_accuracy(train_pairs, train_prefs)
-            pref_model_current_accuracy_val = self._compute_preference_model_accuracy(val_pairs, val_prefs)
-            pref_model_global_accuracy_train = self._compute_preference_model_accuracy(self.preference_dataset.get_pairs(), self.preference_dataset.get_preferences())
-            pref_model_global_accuracy_val = self._compute_preference_model_accuracy(self.preference_dataset_val.get_pairs(), self.preference_dataset_val.get_preferences())
+            pref_model_current_accuracy_val   = self._compute_preference_model_accuracy(val_pairs, val_prefs)
+            pref_model_global_accuracy_train  = self._compute_preference_model_accuracy(
+                self.preference_dataset.get_pairs(), self.preference_dataset.get_preferences()
+            )
+            pref_model_global_accuracy_val    = self._compute_preference_model_accuracy(
+                self.preference_dataset_val.get_pairs(), self.preference_dataset_val.get_preferences()
+            )
 
-            self.logger.record("rollout_trajectories/avg_true_reward", avg_true_reward)
-            self.logger.record("rollout_trajectories/avg_episode_length", avg_ep_length)
-            self.logger.record("rollout_trajectories/num_pairs", num_pairs)
+            self.logger.record("reward_model/training_loss",                        loss)
+            self.logger.record("reward_model/validation_loss",                      validation_loss)
+            self.logger.record("reward_model/current_accuracy_train_vs_true_rew",   pref_model_current_accuracy_train)
+            self.logger.record("reward_model/current_accuracy_val_vs_true_rew",     pref_model_current_accuracy_val)
+            self.logger.record("reward_model/global_accuracy_train_vs_true_rew",    pref_model_global_accuracy_train)
+            self.logger.record("reward_model/global_accuracy_val_vs_true_rew",      pref_model_global_accuracy_val)
 
-            self.logger.record("reward_model/training_loss", loss)
-            self.logger.record("reward_model/validation_loss", validation_loss)
-            self.logger.record("reward_model/current_accuracy_train_wrt_true_reward", pref_model_current_accuracy_train)
-            self.logger.record("reward_model/current_accuracy_val_wrt_true_reward", pref_model_current_accuracy_val)
-            self.logger.record("reward_model/global_accuracy_train_wrt_true_reward", pref_model_global_accuracy_train)
-            self.logger.record("reward_model/global_accuracy_val_wrt_true_reward", pref_model_global_accuracy_val)
-            
-            self.logger.record("timescales/iterations", it)
-            self.logger.record("timescales/global_reward_trainer_epochs", global_reward_trainer_epochs)
-            self.logger.record("timescales/global_agent_steps", global_agent_steps)
+            # --- agent (same rollout trajectories, model-reward view) ---
+            self.logger.record("agent/avg_episode_length",      avg_ep_length)
+            self.logger.record("agent/avg_episode_true_reward", avg_true_reward)
+            self.logger.record("agent/avg_episode_reward",      avg_model_reward)
 
-            # unified dump at each iteration
-            self.logger.dump(it)
+            # --- timescales (x-axis anchors for define_metric) ---
+            self.logger.record("timescales/iterations",                    it)
+            self.logger.record("timescales/global_reward_trainer_epochs",  global_reward_trainer_epochs)
+            self.logger.record("timescales/global_agent_steps",            global_agent_steps)
+
+            # unified dump — all groups land in the same wandb.log() call so WandB
+            # can resolve define_metric references within the same log entry
+            self.logger.dump()
 
         return self.agent
     
@@ -235,6 +255,15 @@ class ChristianoAlgorithm:
         return correct / len(preferences) if preferences else 0.0
 
 
+
+    def _compute_avg_model_reward(self, trajectories: List[Trajectory]) -> float:
+        """Mean per-episode model reward across trajectories (sum of reward_model(obs, action))."""
+        ep_model_rewards = []
+        for traj in trajectories:
+            obs     = np.array([t.obs    for t in traj.transitions])
+            actions = np.array([t.action for t in traj.transitions])
+            ep_model_rewards.append(float(self.reward_model.predict(obs, actions).sum()))
+        return float(np.mean(ep_model_rewards))
 
     def _split_segment_pairs_and_preference_data(
             self,

@@ -60,12 +60,6 @@ class RewardTrainerChristiano:
             total_updates += n_steps
             self.global_epochs += 1
 
-            if self.logger:
-                self.logger.record("reward_model/train/epoch_loss", epoch_loss)
-                self.logger.record("reward_model/train/epoch", epoch)
-                self.logger.record("timescales/global_reward_trainer_epochs", self.global_epochs)
-                self.logger.dump(step=self.global_epochs)
-
         return total_loss / max(total_updates, 1)
 
 
