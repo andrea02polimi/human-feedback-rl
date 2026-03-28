@@ -1,5 +1,6 @@
 from .fragmenters import ActiveFragmenter
 from .base_algorithm import BaseAlgorithm
+from .base_policy import BCPolicy
 from .reward_functions import RewardNet, EnsembleRewardModel
 from .env_reward_wrapper import EnvRewardWrapper
 from .feedback_models import PreferenceModelFromReward
@@ -31,4 +32,5 @@ __all__ = [
     "InverseSchedule",
     "UnifiedLogger",
     "PrefixLogger",
+    "BCPolicy",
 ]
