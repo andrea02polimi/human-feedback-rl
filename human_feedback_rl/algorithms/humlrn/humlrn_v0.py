@@ -31,7 +31,6 @@ from human_feedback_rl.common import (
     PreferenceDataset,
     PreferenceModelFromReward,
     PrefixLogger,
-    SB3BridgeLogger,
     SegmentPair,
     Trajectory,
     Transition,

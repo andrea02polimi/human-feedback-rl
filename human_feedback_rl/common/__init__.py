@@ -5,7 +5,8 @@ from .reward_model import RewardNet, EnsembleRewardModel
 from .env_reward_wrapper import EnvRewardWrapper
 from .preference_model import PreferenceModelFromReward
 from .schedules import InverseSchedule
-from .loggers import UnifiedLogger, PrefixLogger, SB3BridgeLogger
+from .loggers import UnifiedLogger, PrefixLogger
+from .custom_logging_callback import CustomLoggingCallback
 
 from .core import (
     Segment, 
@@ -32,6 +33,6 @@ __all__ = [
     "InverseSchedule",
     "UnifiedLogger",
     "PrefixLogger",
-    "SB3BridgeLogger",
     "BCPolicy",
+    "CustomLoggingCallback",
 ]

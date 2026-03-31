@@ -54,28 +54,31 @@ class RewardTrainerChristiano:
     # Public API
     # -----------------------------------------------------------------------
 
-    def train(self, dataset: PreferenceDataset) -> float:
+    def train(self, dataset: PreferenceDataset):
         """Train on a preference dataset. Returns average training loss."""
         if len(dataset) == 0:
             return 0.0
 
-        n = len(dataset)
         total_loss = 0.0
         total_updates = 0
 
-        for ensemble_idx in range(self.reward_model.n_ensembles):
-            # Independent bootstrap sample for each ensemble member
-            bootstrap_indices = np.random.choice(n, size=n, replace=True).tolist()
+        for epoch in range(self.num_epochs):
+            # shuffle independently per ensemble
+            n = len(dataset)
+            bootstrap_indices_per_ensemble = [
+                np.random.choice(n, size=n, replace=True).tolist()
+                for _ in range(self.reward_model.n_ensembles)
+            ]
 
-            for _ in range(self.num_epochs):
-                epoch_loss, n_steps = self._train_one_epoch(
-                    dataset, bootstrap_indices, ensemble_idx
-                )
-                total_loss += epoch_loss
-                total_updates += n_steps
-                self.global_epochs += 1
+            epoch_loss, n_steps = self._train_one_epoch(dataset, bootstrap_indices_per_ensemble)
+            total_loss += epoch_loss
+            total_updates += n_steps
+            self.global_epochs += 1
 
-        return total_loss / max(total_updates, 1)
+            self.logger.record("loss", epoch_loss)
+            self.logger.record("global_epochs", self.global_epochs)
+            self.logger.dump()
+
 
     def evaluate(self, dataset: PreferenceDataset) -> float:
         """Evaluate reward model accuracy/loss on a preference dataset."""
@@ -85,40 +88,51 @@ class RewardTrainerChristiano:
     # Internal logic
     # -----------------------------------------------------------------------
 
-    def _train_one_epoch(self, dataset: PreferenceDataset, indices: list, ensemble_idx: int):
-        shuffled = indices.copy()
-        random.shuffle(shuffled)
+    def _train_one_epoch(self, dataset, bootstrap_indices_per_ensemble) -> float:
 
         epoch_loss = 0.0
         n_steps = 0
 
-        for batch_indices in self._iterate_minibatches(shuffled):
-            epoch_loss += self._train_on_batch(dataset, batch_indices, ensemble_idx)
+        # iterate batches using SAME positions
+        for batch_start in range(0, len(bootstrap_indices_per_ensemble[0]), self.batch_size):
+            batch_indices_per_ensemble = [
+                indices[batch_start: batch_start + self.batch_size]
+                for indices in bootstrap_indices_per_ensemble
+            ]
+
+            epoch_loss += self._train_on_batch(
+                dataset, batch_indices_per_ensemble
+            )
             n_steps += 1
 
         return epoch_loss / max(n_steps, 1), n_steps
+    
 
-    def _iterate_minibatches(self, indices):
-        for start in range(0, len(indices), self.batch_size):
-            yield indices[start : start + self.batch_size]
-
-    def _train_on_batch(self, dataset: PreferenceDataset, batch_indices, ensemble_idx: int) -> float:
-        opt = self.reward_model.optimizers[ensemble_idx]
-        opt.zero_grad()
-
+    def _train_on_batch(self, dataset, batch_indices_per_ensemble) -> float:
         total_batch_loss = 0.0
 
-        for idx in batch_indices:
-            pair = dataset.pairs[idx]
-            pref = dataset.preferences[idx]
-            target = _preference_to_target(pref, self.reward_model.device)
+        for ensemble_idx, batch_indices in enumerate(batch_indices_per_ensemble):
+            opt = self.reward_model.optimizers[ensemble_idx]
+            opt.zero_grad()
 
-            loss = self._compute_pair_loss(pair, target, ensemble_idx)
-            loss.backward()
-            total_batch_loss += loss.item()
+            losses = []
 
-        opt.step()
-        return total_batch_loss / len(batch_indices)
+            for idx in batch_indices:
+                pair = dataset.pairs[idx]
+                pref = dataset.preferences[idx]
+                target = _preference_to_target(pref, self.reward_model.device)
+
+                loss = self._compute_pair_loss(pair, target, ensemble_idx)
+                losses.append(loss)
+
+            # ONE backward per ensemble
+            batch_loss = torch.stack(losses).mean()
+            batch_loss.backward()
+            opt.step()
+
+            total_batch_loss += batch_loss.item()
+
+        return total_batch_loss / len(batch_indices_per_ensemble)
 
     # -----------------------------------------------------------------------
     # Core computations

@@ -12,11 +12,11 @@ from human_feedback_rl.common import (
     PreferenceDataset,
     PreferenceModelFromReward,
     PrefixLogger,
-    SB3BridgeLogger,
     SegmentPair,
     Trajectory,
     Transition,
     UnifiedLogger,
+    CustomLoggingCallback,
 )
 from .preference_trainer import RewardTrainerChristiano
 
@@ -59,7 +59,7 @@ class ChristianoAlgorithm:
 
         self.reward_trainer = RewardTrainerChristiano(
             self.preference_model,
-            logger=PrefixLogger(self.logger),
+            logger=PrefixLogger(self.logger, "reward_model"),
             batch_size=reward_model_batch_size,
             num_epochs=reward_training_epochs,
         )
@@ -75,15 +75,7 @@ class ChristianoAlgorithm:
         # The agent learns from the env wrapped with the reward model
         env_reward_wrapper = EnvRewardWrapper(self.env, self.reward_model)
         self.agent.set_env(env_reward_wrapper)
-        self.agent.set_logger(SB3BridgeLogger(self.logger, key_map={"train/loss": "agent/train_loss"}))
-
-        # Map each metric group to its natural x-axis for WandB charts.
-        # reward_model/* updates once per iteration (reward trainer epochs),
-        # agent/* accumulates agent timesteps, rollout/* tracks iterations.
-        if wandb.run is not None:
-            wandb.define_metric("reward_model/*",  step_metric="timescales/global_reward_trainer_epochs")
-            wandb.define_metric("agent/*",         step_metric="timescales/global_agent_steps")
-            wandb.define_metric("rollout/*",        step_metric="timescales/iterations")
+        self.agent.set_logger(PrefixLogger(self.logger, "agent"))
 
         self.schedule_num_pairs = InverseSchedule(
             initial_value=num_pairs_initial,
@@ -91,10 +83,15 @@ class ChristianoAlgorithm:
             decay_rate=decay_pairs_schedule,
         )
 
-    def train(self, total_timesteps: int = 1_000_000, num_iterations: int = 10) -> Any:
+    def train(self, 
+              total_timesteps: int = 1_000_000, 
+              num_iterations: int = 10,
+              rolling_window: int = 100
+              ) -> Any:
+        
         per_iter_timesteps = int(total_timesteps / num_iterations)
-        global_agent_steps = 0
-        global_reward_trainer_epochs = 0
+        agent_global_steps = 0
+        reward_model_global_epochs = 0
 
         for it in range(num_iterations):
             print(f"\n=== Iteration {it+1}/{num_iterations} ===")
@@ -122,27 +119,35 @@ class ChristianoAlgorithm:
 
             # 4) Train reward model
             print("[4/5] Training reward model...")
-            loss = self.reward_trainer.train(self.preference_dataset)
-            val_loss = self.reward_trainer.evaluate(self.preference_dataset_val)
+            self.reward_trainer.train(self.preference_dataset)
 
-            global_reward_trainer_epochs += self.reward_training_epochs
+            reward_model_global_epochs += self.reward_training_epochs
 
             # 5) Train agent
             print("[5/5] Training agent...")
-            self.agent.learn(total_timesteps=per_iter_timesteps, reset_num_timesteps=False)
-            global_agent_steps += per_iter_timesteps
+            self.agent.learn(
+                total_timesteps=per_iter_timesteps, 
+                reset_num_timesteps=False,
+                callback=CustomLoggingCallback(window_size=rolling_window),
+            )
+            agent_global_steps += per_iter_timesteps
 
             # --- Logging ---
             avg_true_reward = float(np.mean([t.total_reward() for t in trajectories]))
             avg_ep_length = float(np.mean([len(t.transitions) for t in trajectories]))
             avg_model_reward = self._compute_avg_model_reward(trajectories)
+            loss_val_reward_model = self.reward_trainer.evaluate(self.preference_dataset_val)
 
+            # rollout metrics
+            self.logger.record("iterations",        it + 1)
             self.logger.record("rollout/num_pairs",         num_pairs)
             self.logger.record("rollout/avg_true_reward",   avg_true_reward)
+            self.logger.record("rollout/avg_model_reward",  avg_model_reward)
             self.logger.record("rollout/avg_ep_length",     avg_ep_length)
 
-            self.logger.record("reward_model/training_loss",              loss)
-            self.logger.record("reward_model/validation_loss",            val_loss)
+            # reward model metrics
+            self.logger.record("reward_model/global_epochs", reward_model_global_epochs)
+            self.logger.record("reward_model/loss_validation", loss_val_reward_model)
             self.logger.record("reward_model/accuracy_train_current",
                                self._compute_preference_accuracy(train_pairs, train_prefs))
             self.logger.record("reward_model/accuracy_val_current",
@@ -156,13 +161,8 @@ class ChristianoAlgorithm:
                                    self.preference_dataset_val.pairs,
                                    self.preference_dataset_val.preferences))
 
-            self.logger.record("agent/avg_ep_length",      avg_ep_length)
-            self.logger.record("agent/avg_ep_true_reward", avg_true_reward)
-            self.logger.record("agent/avg_ep_reward",      avg_model_reward)
-
-            self.logger.record("timescales/iterations",                   it)
-            self.logger.record("timescales/global_reward_trainer_epochs", global_reward_trainer_epochs)
-            self.logger.record("timescales/global_agent_steps",           global_agent_steps)
+            # agent metrics
+            self.logger.record("agent/time/total_timesteps", agent_global_steps)
 
             self.logger.dump()
 
