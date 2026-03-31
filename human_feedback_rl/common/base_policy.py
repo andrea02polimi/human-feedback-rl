@@ -3,9 +3,9 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 
 
 class BCPolicy(ActorCriticPolicy):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, net_arch: list = None, **kwargs):
         super().__init__(*args, **kwargs,
-            net_arch=dict(pi=[64, 64], vf=[])
+            net_arch=dict(pi=net_arch or [64, 64], vf=[])
         )
 
     def save(self, path) -> None:

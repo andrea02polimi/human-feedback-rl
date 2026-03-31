@@ -1,11 +1,11 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 
 @dataclass
 class Transition:
-    obs: any
-    action: any
+    obs: Any
+    action: Any
     reward: float
 
 
@@ -31,26 +31,20 @@ class Preference:
 
 
 class PreferenceDataset:
-    def __init__(self, n_max: int):
-        self.n_max = n_max
+    def __init__(self, capacity: int):
+        self.capacity = capacity
         self.pairs: List[SegmentPair] = []
-        self.targets: List[Preference] = []
+        self.preferences: List[Preference] = []
 
     def push(self, pairs: List[SegmentPair], preferences: List[Preference]) -> None:
         self.pairs.extend(pairs)
-        self.targets.extend(preferences)
-        if len(self.pairs) > self.n_max:
-            self.pairs = self.pairs[-self.n_max:]
-            self.targets = self.targets[-self.n_max:]
+        self.preferences.extend(preferences)
+        if len(self.pairs) > self.capacity:
+            self.pairs = self.pairs[-self.capacity:]
+            self.preferences = self.preferences[-self.capacity:]
 
     def __len__(self) -> int:
         return len(self.pairs)
 
     def __iter__(self):
-        return zip(self.pairs, self.targets)
-    
-    def get_pairs(self) -> List[SegmentPair]:
-        return self.pairs
-    
-    def get_preferences(self) -> List[Preference]:
-        return self.targets
+        return zip(self.pairs, self.preferences)

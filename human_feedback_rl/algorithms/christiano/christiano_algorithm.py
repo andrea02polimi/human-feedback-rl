@@ -1,9 +1,25 @@
 from typing import Any, List
+
 import numpy as np
 import wandb
 
-from human_feedback_rl.common import *
-from .reward_trainer_christiano import RewardTrainerChristiano
+from human_feedback_rl.common import (
+    ActiveFragmenter,
+    EnsembleRewardModel,
+    EnvRewardWrapper,
+    InverseSchedule,
+    Preference,
+    PreferenceDataset,
+    PreferenceModelFromReward,
+    PrefixLogger,
+    SB3BridgeLogger,
+    SegmentPair,
+    Trajectory,
+    Transition,
+    UnifiedLogger,
+)
+from .preference_trainer import RewardTrainerChristiano
+
 
 class ChristianoAlgorithm:
 
@@ -28,21 +44,24 @@ class ChristianoAlgorithm:
 
         self.logger = UnifiedLogger()
 
+        discrete = hasattr(env.action_space, "n")
+        self.discrete_actions = discrete
         self.reward_model = EnsembleRewardModel(
-            obs_dim = env.observation_space.shape[0], 
-            action_dim = env.action_space.n, 
-            n_ensembles = n_ensembles, 
-            lr = lr_reward_model, 
-            device = device
+            obs_dim=env.observation_space.shape[0],
+            action_dim=env.action_space.n if discrete else env.action_space.shape[0],
+            n_ensembles=n_ensembles,
+            lr=lr_reward_model,
+            device=device,
+            discrete_actions=discrete,
         )
 
         self.preference_model = PreferenceModelFromReward(self.reward_model)
 
         self.reward_trainer = RewardTrainerChristiano(
             self.preference_model,
-            logger=PrefixLogger(self.logger),   
+            logger=PrefixLogger(self.logger),
             batch_size=reward_model_batch_size,
-            num_epochs=reward_training_epochs, 
+            num_epochs=reward_training_epochs,
         )
 
         self.fragmenter = ActiveFragmenter(
@@ -53,33 +72,27 @@ class ChristianoAlgorithm:
         self.preference_dataset = PreferenceDataset(max_dataset_size)
         self.preference_dataset_val = PreferenceDataset(max_dataset_size)
 
-        # the agent learns from the env wrapped with the reward model
+        # The agent learns from the env wrapped with the reward model
         env_reward_wrapper = EnvRewardWrapper(self.env, self.reward_model)
         self.agent.set_env(env_reward_wrapper)
+        self.agent.set_logger(SB3BridgeLogger(self.logger, key_map={"train/loss": "agent/train_loss"}))
 
         # Map each metric group to its natural x-axis for WandB charts.
         # reward_model/* updates once per iteration (reward trainer epochs),
-        # agent/* accumulates agent timesteps, rollout_trajectories/* tracks iterations.
+        # agent/* accumulates agent timesteps, rollout/* tracks iterations.
         if wandb.run is not None:
-            wandb.define_metric("reward_model/*",        step_metric="timescales/global_reward_trainer_epochs")
-            wandb.define_metric("agent/*",               step_metric="timescales/global_agent_steps")
-            wandb.define_metric("rollout_trajectories/*", step_metric="timescales/iterations")
+            wandb.define_metric("reward_model/*",  step_metric="timescales/global_reward_trainer_epochs")
+            wandb.define_metric("agent/*",         step_metric="timescales/global_agent_steps")
+            wandb.define_metric("rollout/*",        step_metric="timescales/iterations")
 
-        # schedule for number of pairs to sample at each iteration
         self.schedule_num_pairs = InverseSchedule(
             initial_value=num_pairs_initial,
             final_value=num_pairs_final,
             decay_rate=decay_pairs_schedule,
         )
 
-    def train(
-        self,
-        total_timesteps: int = 1e6,
-        num_iterations: int = 10,
-    ) -> Any:
-
+    def train(self, total_timesteps: int = 1_000_000, num_iterations: int = 10) -> Any:
         per_iter_timesteps = int(total_timesteps / num_iterations)
-
         global_agent_steps = 0
         global_reward_trainer_epochs = 0
 
@@ -91,22 +104,17 @@ class ChristianoAlgorithm:
             print("[1/5] Collecting rollouts...")
             num_pairs = int(self.schedule_num_pairs(progress_remaining))
             tot_rollout_timesteps = num_pairs * self.fragmenter.segment_length * 2
-            trajectories = self._get_rollout(tot_rollout_timesteps)
-
+            trajectories = self._collect_rollout(tot_rollout_timesteps)
 
             # 2) Fragment trajectories
-            print("[2/5] Fragmenting trajectories...")      
-            segment_pairs = self.fragmenter.fragment(
-                trajectories=trajectories, 
-                num_pairs=num_pairs
-            )
+            print("[2/5] Fragmenting trajectories...")
+            segment_pairs = self.fragmenter.fragment(trajectories=trajectories, num_pairs=num_pairs)
 
             # 3) Generate preferences from true rewards
             print("[3/5] Generating preferences...")
             preferences = self._preferences_from_true_rewards(segment_pairs)
 
-            # 3.1) Add to dataset --> the reward model is trained on all data collected so far
-            train_pairs, train_prefs, val_pairs, val_prefs = self._split_segment_pairs_and_preference_data(
+            train_pairs, train_prefs, val_pairs, val_prefs = self._train_val_split(
                 segment_pairs, preferences
             )
             self.preference_dataset.push(train_pairs, train_prefs)
@@ -114,73 +122,60 @@ class ChristianoAlgorithm:
 
             # 4) Train reward model
             print("[4/5] Training reward model...")
-            loss = self.reward_trainer.train(
-                self.preference_dataset,
-            )
-            validation_loss = self.reward_trainer.evaluate(self.preference_dataset_val)
+            loss = self.reward_trainer.train(self.preference_dataset)
+            val_loss = self.reward_trainer.evaluate(self.preference_dataset_val)
 
             global_reward_trainer_epochs += self.reward_training_epochs
 
             # 5) Train agent
             print("[5/5] Training agent...")
-            self.agent.learn(
-                total_timesteps=per_iter_timesteps,
-                reset_num_timesteps=False,
-            )
-
+            self.agent.learn(total_timesteps=per_iter_timesteps, reset_num_timesteps=False)
             global_agent_steps += per_iter_timesteps
 
-            # --- rollout stats (computed on trajectories collected before this iteration's training) ---
+            # --- Logging ---
             avg_true_reward = float(np.mean([t.total_reward() for t in trajectories]))
-            avg_ep_length   = float(np.mean([len(t.transitions) for t in trajectories]))
+            avg_ep_length = float(np.mean([len(t.transitions) for t in trajectories]))
             avg_model_reward = self._compute_avg_model_reward(trajectories)
 
-            self.logger.record("rollout_trajectories/num_pairs",          num_pairs)
-            self.logger.record("rollout_trajectories/avg_true_reward",     avg_true_reward)
-            self.logger.record("rollout_trajectories/avg_episode_length",  avg_ep_length)
+            self.logger.record("rollout/num_pairs",         num_pairs)
+            self.logger.record("rollout/avg_true_reward",   avg_true_reward)
+            self.logger.record("rollout/avg_ep_length",     avg_ep_length)
 
-            # --- reward model ---
-            pref_model_current_accuracy_train = self._compute_preference_model_accuracy(train_pairs, train_prefs)
-            pref_model_current_accuracy_val   = self._compute_preference_model_accuracy(val_pairs, val_prefs)
-            pref_model_global_accuracy_train  = self._compute_preference_model_accuracy(
-                self.preference_dataset.get_pairs(), self.preference_dataset.get_preferences()
-            )
-            pref_model_global_accuracy_val    = self._compute_preference_model_accuracy(
-                self.preference_dataset_val.get_pairs(), self.preference_dataset_val.get_preferences()
-            )
+            self.logger.record("reward_model/training_loss",              loss)
+            self.logger.record("reward_model/validation_loss",            val_loss)
+            self.logger.record("reward_model/accuracy_train_current",
+                               self._compute_preference_accuracy(train_pairs, train_prefs))
+            self.logger.record("reward_model/accuracy_val_current",
+                               self._compute_preference_accuracy(val_pairs, val_prefs))
+            self.logger.record("reward_model/accuracy_train_global",
+                               self._compute_preference_accuracy(
+                                   self.preference_dataset.pairs,
+                                   self.preference_dataset.preferences))
+            self.logger.record("reward_model/accuracy_val_global",
+                               self._compute_preference_accuracy(
+                                   self.preference_dataset_val.pairs,
+                                   self.preference_dataset_val.preferences))
 
-            self.logger.record("reward_model/training_loss",                        loss)
-            self.logger.record("reward_model/validation_loss",                      validation_loss)
-            self.logger.record("reward_model/current_accuracy_train_vs_true_rew",   pref_model_current_accuracy_train)
-            self.logger.record("reward_model/current_accuracy_val_vs_true_rew",     pref_model_current_accuracy_val)
-            self.logger.record("reward_model/global_accuracy_train_vs_true_rew",    pref_model_global_accuracy_train)
-            self.logger.record("reward_model/global_accuracy_val_vs_true_rew",      pref_model_global_accuracy_val)
+            self.logger.record("agent/avg_ep_length",      avg_ep_length)
+            self.logger.record("agent/avg_ep_true_reward", avg_true_reward)
+            self.logger.record("agent/avg_ep_reward",      avg_model_reward)
 
-            # --- agent (same rollout trajectories, model-reward view) ---
-            self.logger.record("agent/avg_episode_length",      avg_ep_length)
-            self.logger.record("agent/avg_episode_true_reward", avg_true_reward)
-            self.logger.record("agent/avg_episode_reward",      avg_model_reward)
+            self.logger.record("timescales/iterations",                   it)
+            self.logger.record("timescales/global_reward_trainer_epochs", global_reward_trainer_epochs)
+            self.logger.record("timescales/global_agent_steps",           global_agent_steps)
 
-            # --- timescales (x-axis anchors for define_metric) ---
-            self.logger.record("timescales/iterations",                    it)
-            self.logger.record("timescales/global_reward_trainer_epochs",  global_reward_trainer_epochs)
-            self.logger.record("timescales/global_agent_steps",            global_agent_steps)
-
-            # unified dump — all groups land in the same wandb.log() call so WandB
-            # can resolve define_metric references within the same log entry
             self.logger.dump()
 
         return self.agent
-    
 
-    def _get_rollout(self, total_timesteps_target):
-        
+    # -----------------------------------------------------------------------
+    # Rollout collection
+    # -----------------------------------------------------------------------
+
+    def _collect_rollout(self, total_timesteps_target: int) -> List[Trajectory]:
         num_envs = self.env.num_envs
-
-        # Active trajectories (one per env)
         current_transitions = [[] for _ in range(num_envs)]
         trajectories: List[Trajectory] = []
-
         total_timesteps = 0
 
         obs = self.env.reset()
@@ -192,102 +187,81 @@ class ChristianoAlgorithm:
             step_result = self.env.step(action)
 
             if len(step_result) == 5:  # gymnasium VecEnv
-                next_obs, reward, terminated, truncated, info = step_result
+                next_obs, reward, terminated, truncated, _ = step_result
                 done = terminated | truncated
-            else:  # classic SB3 VecEnv
-                next_obs, reward, done, info = step_result
+            else:  # SB3 VecEnv
+                next_obs, reward, done, _ = step_result
 
             for i in range(num_envs):
                 current_transitions[i].append(
                     Transition(
                         obs=obs[i].copy(),
-                        action=int(action[i]),
+                        action=int(action[i]) if self.discrete_actions else action[i].copy(),
                         reward=float(reward[i]),
                     )
                 )
-
-                # If episode ends → close trajectory
                 if done[i]:
                     trajectories.append(Trajectory(current_transitions[i]))
                     current_transitions[i] = []
 
             obs = next_obs
-            total_timesteps += num_envs  # 🔥 critical fix
+            total_timesteps += num_envs
 
-        # Optional: include unfinished trajectories
+        # Include unfinished trajectories
         for i in range(num_envs):
-            if len(current_transitions[i]) > 0:
+            if current_transitions[i]:
                 trajectories.append(Trajectory(current_transitions[i]))
 
         return trajectories
 
-    
+    # -----------------------------------------------------------------------
+    # Preference helpers
+    # -----------------------------------------------------------------------
+
     def _preferences_from_true_rewards(self, segment_pairs: List[SegmentPair]) -> List[Preference]:
-        
-        preferences: List[Preference] = []
-
+        preferences = []
         for pair in segment_pairs:
-            r1 = pair.seg1.total_reward()
-            r2 = pair.seg2.total_reward()
-
-            if r1 > r2:
-                preferences.append(Preference((1, 0)))
-            else:
-                preferences.append(Preference((0, 1)))
-
+            r1, r2 = pair.seg1.total_reward(), pair.seg2.total_reward()
+            preferences.append(Preference((1, 0) if r1 > r2 else (0, 1)))
         return preferences
-    
 
-    def _compute_preference_model_accuracy(self, segment_pairs: List[SegmentPair], preferences: List[Preference]) -> float:
-        
-        correct = 0
-
-        for pair, pref in zip(segment_pairs, preferences):
-            pref_predicted = self.preference_model.preference_probs(pair.seg1, pair.seg2)
-            if pref_predicted.label[0] > pref_predicted.label[1]:  # P(seg1 preferred) > P(seg2 preferred)
-                pref_predicted_label = (1, 0)
-            else:
-                pref_predicted_label = (0, 1)
-            
-            if pref_predicted_label == pref.label:
-                correct += 1
-
-        return correct / len(preferences) if preferences else 0.0
-
-
+    def _compute_preference_accuracy(
+        self, segment_pairs: List[SegmentPair], preferences: List[Preference]
+    ) -> float:
+        if not preferences:
+            return 0.0
+        correct = sum(
+            1 for pair, pref in zip(segment_pairs, preferences)
+            if (self.preference_model.preference_probs(pair.seg1, pair.seg2).label[0] > 0.5) ==
+               (pref.label[0] > 0.5)
+        )
+        return correct / len(preferences)
 
     def _compute_avg_model_reward(self, trajectories: List[Trajectory]) -> float:
-        """Mean per-episode model reward across trajectories (sum of reward_model(obs, action))."""
-        ep_model_rewards = []
-        for traj in trajectories:
-            obs     = np.array([t.obs    for t in traj.transitions])
-            actions = np.array([t.action for t in traj.transitions])
-            ep_model_rewards.append(float(self.reward_model.predict(obs, actions).sum()))
+        """Mean per-episode model reward across trajectories."""
+        ep_model_rewards = [
+            float(self.reward_model.predict(
+                np.array([t.obs for t in traj.transitions]),
+                np.array([t.action for t in traj.transitions]),
+            ).sum())
+            for traj in trajectories
+        ]
         return float(np.mean(ep_model_rewards))
 
-    def _split_segment_pairs_and_preference_data(
-            self,
-            pairs: List[SegmentPair],
-            preferences: List[Preference],
-            split_ratio: float = 0.7,
-        ):
-
-        assert len(pairs) == len(preferences)
-
-        # 1. create shuffled indices (synchronous shuffle)
+    def _train_val_split(
+        self,
+        pairs: List[SegmentPair],
+        preferences: List[Preference],
+        split_ratio: float = 0.7,
+    ):
         n = len(pairs)
         indices = np.random.permutation(n)
-
-        pairs_shuffled = [pairs[i] for i in indices]
-        prefs_shuffled = [preferences[i] for i in indices]
-
-        # 2. split 70 / 30
         split_idx = int(n * split_ratio)
 
-        train_pairs = pairs_shuffled[:split_idx]
-        train_prefs = prefs_shuffled[:split_idx]
-
-        val_pairs = pairs_shuffled[split_idx:]
-        val_prefs = prefs_shuffled[split_idx:]
-
-        return train_pairs, train_prefs, val_pairs, val_prefs
+        train_idx, val_idx = indices[:split_idx], indices[split_idx:]
+        return (
+            [pairs[i] for i in train_idx],
+            [preferences[i] for i in train_idx],
+            [pairs[i] for i in val_idx],
+            [preferences[i] for i in val_idx],
+        )

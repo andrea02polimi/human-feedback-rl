@@ -5,22 +5,18 @@ from human_feedback_rl.common import BaseAlgorithm, Transition, Trajectory
 from human_feedback_rl.common.loggers import UnifiedLogger, PrefixLogger
 
 
-def _beta_schedule(round_idx: int, decay: float = 0.7) -> float:
-    """Exponential decay: beta=1.0 at round 0 (pure expert), approaches 0."""
-    return decay ** round_idx
-
-
 class DaggerAlgorithm(BaseAlgorithm):
 
     def __init__(
-            self,
-            env,
-            agent,
-            expert,
-            bc_epochs: int = 5,
-            bc_batch_size: int = 64,
-            bc_lr: float = 1e-3,
-            n_eval_episodes: int = 5,
+        self,
+        env,
+        agent,
+        expert,
+        bc_epochs: int = 5,
+        bc_batch_size: int = 64,
+        bc_lr: float = 1e-3,
+        n_eval_episodes: int = 5,
+        beta_decay: float = 0.7,
     ):
         self.env = env
         self.agent = agent
@@ -29,6 +25,7 @@ class DaggerAlgorithm(BaseAlgorithm):
         self.bc_epochs = bc_epochs
         self.bc_batch_size = bc_batch_size
         self.n_eval_episodes = n_eval_episodes
+        self.beta_decay = beta_decay
         self._optimizer = torch.optim.Adam(agent.parameters(), lr=bc_lr)
 
         self._logger = UnifiedLogger()
@@ -37,13 +34,13 @@ class DaggerAlgorithm(BaseAlgorithm):
         self._train_log = PrefixLogger(self._logger, prefix="train")
         self._eval_log = PrefixLogger(self._logger, prefix="eval")
 
-    def train(
-            self,
-            n_rounds: int,
-            num_episodes: int,
-    ):
+    def _beta_schedule(self, round_idx: int) -> float:
+        """Exponential decay: beta=1.0 at round 0 (pure expert), approaches 0."""
+        return self.beta_decay ** round_idx
+
+    def train(self, n_rounds: int, num_episodes: int):
         for round_idx in range(n_rounds):
-            beta = _beta_schedule(round_idx)
+            beta = self._beta_schedule(round_idx)
             print(f"\n=== Round {round_idx + 1}/{n_rounds} (beta={beta:.3f}) ===")
 
             # 1) Collect trajectories mixing expert and agent
@@ -64,22 +61,21 @@ class DaggerAlgorithm(BaseAlgorithm):
             eval_stats = self._evaluate(self.n_eval_episodes)
             print(f"      Eval reward: {eval_stats['mean_ep_reward']:.2f}  length: {eval_stats['mean_ep_length']:.1f}")
 
-            # Log metrics
-            self._dagger_log.record("beta", beta)
-            self._dagger_log.record("dataset_size", len(self.dataset))
-            self._dagger_log.record("expert_usage", collect_stats["expert_usage"])
+            self._dagger_log.record("beta",              beta)
+            self._dagger_log.record("dataset_size",      len(self.dataset))
+            self._dagger_log.record("expert_usage",      collect_stats["expert_usage"])
             self._dagger_log.record("disagreement_rate", collect_stats["disagreement_rate"])
-            self._dagger_log.record("round_reward", collect_stats["round_reward"])
+            self._dagger_log.record("round_reward",      collect_stats["round_reward"])
 
-            self._bc_log.record("loss", bc_stats["loss"])
+            self._bc_log.record("loss",         bc_stats["loss"])
             self._bc_log.record("log_prob_mean", bc_stats["log_prob_mean"])
-            self._bc_log.record("entropy", bc_stats["entropy"])
+            self._bc_log.record("entropy",       bc_stats["entropy"])
 
             self._train_log.record("grad_norm", bc_stats["grad_norm"])
-            self._train_log.record("lr", bc_stats["lr"])
+            self._train_log.record("lr",         bc_stats["lr"])
 
-            self._eval_log.record("mean_ep_reward", eval_stats["mean_ep_reward"])
-            self._eval_log.record("mean_ep_length", eval_stats["mean_ep_length"])
+            self._eval_log.record("mean_ep_reward",  eval_stats["mean_ep_reward"])
+            self._eval_log.record("mean_ep_length",  eval_stats["mean_ep_length"])
 
             self._logger.dump()
 
@@ -112,26 +108,21 @@ class DaggerAlgorithm(BaseAlgorithm):
                 if len(step_result) == 5:  # gymnasium VecEnv
                     next_obs, reward, terminated, truncated, _ = step_result
                     done = terminated | truncated
-                else:  # classic SB3 VecEnv
+                else:  # SB3 VecEnv
                     next_obs, reward, done, _ = step_result
 
                 total_reward += float(reward[0])
-
                 episode_data.append(
-                    Transition(
-                        obs=obs[0].copy(),
-                        action=int(expert_action[0]),
-                        reward=float(reward[0]),
-                    )
+                    Transition(obs=obs[0].copy(), action=int(expert_action[0]), reward=float(reward[0]))
                 )
                 obs = next_obs
 
             trajectories.append(Trajectory(episode_data))
 
         collect_stats = {
-            "round_reward": total_reward / num_episodes,
+            "round_reward":      total_reward / num_episodes,
             "disagreement_rate": total_disagreements / max(total_steps, 1),
-            "expert_usage": beta,
+            "expert_usage":      beta,
         }
         return trajectories, collect_stats
 
@@ -144,25 +135,17 @@ class DaggerAlgorithm(BaseAlgorithm):
         if not self.dataset:
             return empty_stats
 
-        obs_t = torch.as_tensor(
-            np.stack([t.obs for t in self.dataset]).astype(np.float32)
-        )
-        act_t = torch.as_tensor(
-            np.array([t.action for t in self.dataset], dtype=np.int64)
-        )
+        obs_t = torch.as_tensor(np.stack([t.obs for t in self.dataset]).astype(np.float32))
+        act_t = torch.as_tensor(np.array([t.action for t in self.dataset], dtype=np.int64))
 
-        total_loss = 0.0
-        total_log_prob = 0.0
-        total_entropy = 0.0
-        total_grad_norm = 0.0
+        total_loss = total_log_prob = total_entropy = total_grad_norm = 0.0
         n_steps = 0
 
         for _ in range(self.bc_epochs):
             perm = torch.randperm(len(obs_t))
             for start in range(0, len(perm), self.bc_batch_size):
                 batch_idx = perm[start : start + self.bc_batch_size]
-                obs_b = obs_t[batch_idx]
-                act_b = act_t[batch_idx]
+                obs_b, act_b = obs_t[batch_idx], act_t[batch_idx]
 
                 _, log_prob, entropy = self.agent.evaluate_actions(obs_b, act_b)
                 loss = -log_prob.mean()
@@ -182,11 +165,11 @@ class DaggerAlgorithm(BaseAlgorithm):
 
         n = max(n_steps, 1)
         return {
-            "loss": total_loss / n,
+            "loss":         total_loss / n,
             "log_prob_mean": total_log_prob / n,
-            "entropy": total_entropy / n,
-            "grad_norm": total_grad_norm / n,
-            "lr": self._get_lr(),
+            "entropy":       total_entropy / n,
+            "grad_norm":     total_grad_norm / n,
+            "lr":            self._get_lr(),
         }
 
     def _evaluate(self, n_eval_episodes: int) -> dict:
