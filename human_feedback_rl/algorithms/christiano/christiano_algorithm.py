@@ -1,3 +1,4 @@
+import math
 from typing import Any, List
 
 import numpy as np
@@ -33,14 +34,12 @@ class ChristianoAlgorithm:
         lr_reward_model: float = 1e-4,
         max_dataset_size: int = 1e10,
         reward_model_batch_size: int = 32,
-        reward_training_epochs: int = 10,
         num_pairs_initial: int = 100,
         num_pairs_final: int = 0,
         decay_pairs_schedule: float = 1.0,
     ):
         self.env = env
         self.agent = agent
-        self.reward_training_epochs = reward_training_epochs
 
         self.logger = UnifiedLogger()
 
@@ -61,7 +60,6 @@ class ChristianoAlgorithm:
             self.preference_model,
             logger=PrefixLogger(self.logger, "reward_model"),
             batch_size=reward_model_batch_size,
-            num_epochs=reward_training_epochs,
         )
 
         self.fragmenter = ActiveFragmenter(
@@ -84,24 +82,26 @@ class ChristianoAlgorithm:
         )
 
     def train(self, 
-              total_timesteps: int = 1_000_000, 
-              num_iterations: int = 10,
-              rolling_window: int = 100
-              ) -> Any:
+            total_iterations: int = 10,
+            pretrain_iterations: int = 0,
+            agent_timesteps_per_it: int = 100_000, 
+            reward_model_epochs_per_it: int = 10,
+            agent_log_interval: int = 100,
+            segments_oversample_factor: int = 3,
+        ) -> Any:
         
-        per_iter_timesteps = int(total_timesteps / num_iterations)
-        agent_global_steps = 0
+        agent_global_timesteps = 0
         reward_model_global_epochs = 0
 
-        for it in range(num_iterations):
-            print(f"\n=== Iteration {it+1}/{num_iterations} ===")
-            progress_remaining = 1 - it / num_iterations
+        for it in range(total_iterations):
+            print(f"\n=== Iteration {it+1}/{total_iterations} ===")
+            progress_remaining = 1 - (it - pretrain_iterations) / (total_iterations - pretrain_iterations) if it > pretrain_iterations else 1.0
 
             # 1) Sample trajectories with current agent
             print("[1/5] Collecting rollouts...")
             num_pairs = int(self.schedule_num_pairs(progress_remaining))
-            tot_rollout_timesteps = num_pairs * self.fragmenter.segment_length * 2
-            trajectories = self._collect_rollout(tot_rollout_timesteps)
+            total_segments_target = 2 * num_pairs * segments_oversample_factor 
+            trajectories = self._collect_rollout(total_segments_target)
 
             # 2) Fragment trajectories
             print("[2/5] Fragmenting trajectories...")
@@ -119,18 +119,26 @@ class ChristianoAlgorithm:
 
             # 4) Train reward model
             print("[4/5] Training reward model...")
-            self.reward_trainer.train(self.preference_dataset)
+            self.reward_trainer.train(
+                self.preference_dataset,
+                num_epochs=reward_model_epochs_per_it,
+            )               
 
-            reward_model_global_epochs += self.reward_training_epochs
+            reward_model_global_epochs += reward_model_epochs_per_it
 
-            # 5) Train agent
-            print("[5/5] Training agent...")
-            self.agent.learn(
-                total_timesteps=per_iter_timesteps, 
-                reset_num_timesteps=False,
-                callback=CustomLoggingCallback(window_size=rolling_window),
-            )
-            agent_global_steps += per_iter_timesteps
+            is_pretraining = pretrain_iterations > 0 and it < pretrain_iterations
+            if is_pretraining:
+                print(f"[-/5] Pretraining phase: skipping agent training for first {pretrain_iterations} iterations.")
+            else:
+                # 5) Train agent
+                print("[5/5] Training agent...")
+                self.agent.learn(
+                    total_timesteps=agent_timesteps_per_it, 
+                    reset_num_timesteps=False,
+                    log_interval=agent_log_interval,
+                    callback=CustomLoggingCallback(),
+                )
+                agent_global_timesteps += agent_timesteps_per_it
 
             # --- Logging ---
             avg_true_reward = float(np.mean([t.total_reward() for t in trajectories]))
@@ -139,7 +147,7 @@ class ChristianoAlgorithm:
             loss_val_reward_model = self.reward_trainer.evaluate(self.preference_dataset_val)
 
             # rollout metrics
-            self.logger.record("iterations",        it + 1)
+            self.logger.record("iterations", it + 1)
             self.logger.record("rollout/num_pairs",         num_pairs)
             self.logger.record("rollout/avg_true_reward",   avg_true_reward)
             self.logger.record("rollout/avg_model_reward",  avg_model_reward)
@@ -160,9 +168,10 @@ class ChristianoAlgorithm:
                                self._compute_preference_accuracy(
                                    self.preference_dataset_val.pairs,
                                    self.preference_dataset_val.preferences))
+            self.logger.record("reward_model/pretraining", is_pretraining)
 
             # agent metrics
-            self.logger.record("agent/time/total_timesteps", agent_global_steps)
+            self.logger.record("agent/time/total_timesteps", agent_global_timesteps)
 
             self.logger.dump()
 
@@ -172,17 +181,17 @@ class ChristianoAlgorithm:
     # Rollout collection
     # -----------------------------------------------------------------------
 
-    def _collect_rollout(self, total_timesteps_target: int) -> List[Trajectory]:
+    def _collect_rollout(self, total_segments_target: int) -> List[Trajectory]:
         num_envs = self.env.num_envs
         current_transitions = [[] for _ in range(num_envs)]
         trajectories: List[Trajectory] = []
-        total_timesteps = 0
+        total_segments = 0
 
         obs = self.env.reset()
         if isinstance(obs, tuple):  # gymnasium-style
             obs, _ = obs
 
-        while total_timesteps < total_timesteps_target:
+        while total_segments < total_segments_target:
             action, _ = self.agent.predict(obs, deterministic=False)
             step_result = self.env.step(action)
 
@@ -201,11 +210,15 @@ class ChristianoAlgorithm:
                     )
                 )
                 if done[i]:
-                    trajectories.append(Trajectory(current_transitions[i]))
+                    traj_i = Trajectory(current_transitions[i])
+                    trajectories.append(traj_i)
                     current_transitions[i] = []
 
+                    length = traj_i.length()
+                    num_segments = math.ceil(length / self.fragmenter.segment_length)
+                    total_segments += num_segments
+                    
             obs = next_obs
-            total_timesteps += num_envs
 
         # Include unfinished trajectories
         for i in range(num_envs):
@@ -265,3 +278,4 @@ class ChristianoAlgorithm:
             [pairs[i] for i in val_idx],
             [preferences[i] for i in val_idx],
         )
+    

@@ -1,6 +1,7 @@
 import numpy as np
-from typing import List, Tuple
+import random
 
+from typing import List, Tuple
 from .core import Trajectory, Segment, SegmentPair
 
 
@@ -37,7 +38,7 @@ class ActiveFragmenter:
         top_k = min(len(scored), 2 * num_pairs)
         top_segments = [s for s, _, _ in scored[:top_k]]
 
-        return self._pair_sequentially(top_segments, num_pairs)
+        return self._pair_randomly(top_segments, num_pairs)
 
     # ------------------------------------------------------------------
     # Segment extraction
@@ -91,3 +92,9 @@ class ActiveFragmenter:
             )
 
         return pairs
+    
+    def _pair_randomly(self, segments: List[Segment], num_pairs) -> List[SegmentPair]:
+        segments = segments.copy()          # avoid modifying original list
+        random.shuffle(segments)            # randomize order
+
+        return self._pair_sequentially(segments, num_pairs)

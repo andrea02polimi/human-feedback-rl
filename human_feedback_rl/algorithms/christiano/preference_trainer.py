@@ -39,7 +39,6 @@ class RewardTrainerChristiano:
         self,
         preference_model: PreferenceModelFromReward,
         batch_size: int = 32,
-        num_epochs: int = 10,
         logger: UnifiedLogger = None,
     ):
         self.preference_model = preference_model
@@ -47,14 +46,17 @@ class RewardTrainerChristiano:
 
         self.batch_size = batch_size
         self.logger = logger
-        self.num_epochs = num_epochs
         self.global_epochs = 0
 
     # -----------------------------------------------------------------------
     # Public API
     # -----------------------------------------------------------------------
 
-    def train(self, dataset: PreferenceDataset):
+    def train(self, 
+            dataset: PreferenceDataset,
+            num_epochs: int = 10,
+        ):
+
         """Train on a preference dataset. Returns average training loss."""
         if len(dataset) == 0:
             return 0.0
@@ -62,7 +64,7 @@ class RewardTrainerChristiano:
         total_loss = 0.0
         total_updates = 0
 
-        for epoch in range(self.num_epochs):
+        for epoch in range(num_epochs):
             # shuffle independently per ensemble
             n = len(dataset)
             bootstrap_indices_per_ensemble = [

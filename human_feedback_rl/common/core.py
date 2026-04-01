@@ -15,6 +15,12 @@ class Trajectory:
 
     def total_reward(self) -> float:
         return sum(t.reward for t in self.transitions)
+    
+    def length(self) -> int:
+        return len(self.transitions)
+
+    def add_transition(self, transition: Transition) -> None:
+        self.transitions.append(transition)
 
 Segment = Trajectory
 
