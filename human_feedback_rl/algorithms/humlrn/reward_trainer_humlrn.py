@@ -22,6 +22,7 @@ from typing import List
 from human_feedback_rl.common import (
     PreferenceDataset,
     PreferenceModelFromReward,
+    Trajectory,
     UnifiedLogger,
 )
 from .demo_dataset import DemonstrationDataset
@@ -65,14 +66,23 @@ class RewardTrainerHumLrn:
         self,
         pref_dataset: PreferenceDataset,
         demo_dataset: DemonstrationDataset | None,
+        rollout_trajectories: List[Trajectory] | None = None,
     ) -> float:
         """
         Train reward model combinando preference loss e demonstration loss.
         Se demo_dataset è None, viene usata solo la preference loss.
+        rollout_trajectories: traiettorie dell'agente corrente usate come negativi
+        nella demo loss (se None, si usa il fallback shuffle-within-batch).
         Ritorna la loss media totale.
         """
         if len(pref_dataset) == 0:
             return 0.0
+
+        # Estrai tutte le transizioni agente una sola volta per tutto il training
+        agent_transitions = (
+            [t for traj in rollout_trajectories for t in traj.transitions]
+            if rollout_trajectories else None
+        )
 
         n = len(pref_dataset)
         total_loss = 0.0
@@ -83,7 +93,8 @@ class RewardTrainerHumLrn:
 
             for _ in range(self.num_epochs):
                 epoch_loss, n_steps = self._train_one_epoch(
-                    pref_dataset, demo_dataset, bootstrap_indices, ensemble_idx
+                    pref_dataset, demo_dataset, bootstrap_indices, ensemble_idx,
+                    agent_transitions,
                 )
                 total_loss += epoch_loss
                 total_updates += n_steps
@@ -107,6 +118,7 @@ class RewardTrainerHumLrn:
         demo_dataset: DemonstrationDataset,
         indices: list,
         ensemble_idx: int,
+        agent_transitions: list | None = None,
     ):
         shuffled = indices.copy()
         random.shuffle(shuffled)
@@ -115,7 +127,9 @@ class RewardTrainerHumLrn:
         n_steps = 0
 
         for batch_indices in self._iterate_minibatches(shuffled):
-            loss = self._train_on_batch(pref_dataset, demo_dataset, batch_indices, ensemble_idx)
+            loss = self._train_on_batch(
+                pref_dataset, demo_dataset, batch_indices, ensemble_idx, agent_transitions
+            )
             epoch_loss += loss
             n_steps += 1
 
@@ -131,6 +145,7 @@ class RewardTrainerHumLrn:
         demo_dataset: DemonstrationDataset,
         batch_indices: list,
         ensemble_idx: int,
+        agent_transitions: list | None = None,
     ) -> float:
         opt = self.reward_model.optimizers[ensemble_idx]
         opt.zero_grad()
@@ -147,7 +162,7 @@ class RewardTrainerHumLrn:
 
         # --- Demonstration loss (optional) ---
         if demo_dataset is not None and len(demo_dataset) > 0:
-            demo_loss = self._compute_demo_loss(demo_dataset, ensemble_idx)
+            demo_loss = self._compute_demo_loss(demo_dataset, ensemble_idx, agent_transitions)
             loss = pref_loss + self.lambda_demo * demo_loss
         else:
             loss = pref_loss
@@ -171,16 +186,51 @@ class RewardTrainerHumLrn:
         self,
         demo_dataset: DemonstrationDataset,
         ensemble_idx: int,
+        agent_transitions: list | None = None,
     ) -> torch.Tensor:
         """
-        Margin ranking loss: R(demo_seg) > R(agent_seg) + margin
+        Margin ranking loss: R(demo_obs, demo_action) > R(agent_obs, agent_action) + margin
 
-        Per ogni traiettoria dimostrativa, campiona un segmento e confronta
-        il suo predicted return con quello di un segmento agente casuale
-        estratto dalla demo_dataset (usato come proxy di segmento sub-ottimale).
+        Positivi: transizioni dimostrative (obs, a_expert).
+        Negativi: se agent_transitions è disponibile, transizioni reali dell'agente
+                  corrente — segnale di ranking più forte perché riflette gli errori
+                  effettivi del policy. Fallback: azioni del batch shiftate di 1
+                  (stesso obs, azione diversa).
 
-        TODO: usare segmenti dell'agente corrente (dal rollout buffer) invece
-              di segmenti casuali dalla demo_dataset come termine negativo.
-        TODO: implementare campionamento da DemonstrationDataset.sample()
+        Loss: mean(relu(R_neg - R_pos + margin))
         """
-        raise NotImplementedError
+        demo_transitions = [t for traj in demo_dataset.trajectories for t in traj.transitions]
+
+        if len(demo_transitions) < 2:
+            return torch.tensor(0.0, device=self.reward_model.device)
+
+        n = min(self.batch_size, len(demo_transitions))
+
+        # --- Positivi: campiona transizioni dimostrative ---
+        pos_idx = np.random.choice(len(demo_transitions), size=n, replace=n > len(demo_transitions))
+        pos_batch = [demo_transitions[i] for i in pos_idx]
+        obs_pos = np.stack([t.obs for t in pos_batch])
+        act_pos = np.array([t.action for t in pos_batch])
+
+        # --- Negativi: transizioni agente reali o fallback shuffle ---
+        if agent_transitions and len(agent_transitions) >= 2:
+            neg_idx = np.random.choice(len(agent_transitions), size=n, replace=n > len(agent_transitions))
+            neg_batch = [agent_transitions[i] for i in neg_idx]
+            obs_neg = np.stack([t.obs for t in neg_batch])
+            act_neg = np.array([t.action for t in neg_batch])
+        else:
+            # Fallback: stesso obs dei positivi, azione shiftata di 1
+            obs_neg = obs_pos
+            act_neg = act_pos[np.roll(np.arange(n), 1)]
+            print("pericolo")
+
+        obs_pos_t = self.reward_model._obs_tensor(obs_pos)
+        obs_neg_t = self.reward_model._obs_tensor(obs_neg)
+        act_pos_t = self.reward_model._encode_actions(act_pos)
+        act_neg_t = self.reward_model._encode_actions(act_neg)
+
+        net = self.reward_model.nets[ensemble_idx]
+        r_pos = net(obs_pos_t, act_pos_t)  # (n,)
+        r_neg = net(obs_neg_t, act_neg_t)  # (n,)
+
+        return F.relu(r_neg - r_pos + self.demo_margin).mean()

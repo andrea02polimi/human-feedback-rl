@@ -38,7 +38,7 @@ class ActiveFragmenter:
         top_k = min(len(scored), 2 * num_pairs)
         top_segments = [s for s, _, _ in scored[:top_k]]
 
-        return self._pair_randomly(top_segments, num_pairs)
+        return self._pair_sequentially(top_segments, num_pairs)
 
     # ------------------------------------------------------------------
     # Segment extraction
@@ -63,18 +63,30 @@ class ActiveFragmenter:
     # ------------------------------------------------------------------
 
     def _score_segments(self, segments: List[Segment]) -> List[Tuple[Segment, float, float]]:
-        """Returns list of (segment, reward_score, variance_score)."""
-        return [(seg, *self._compute_scores(seg)) for seg in segments]
+        """Returns list of (segment, reward_score, variance_score).
+        All segments are scored in two batched forward passes for efficiency.
+        """
+        dtype = np.int64 if self.reward_model.discrete_actions else np.float32
+        lengths = [len(seg.transitions) for seg in segments]
 
-    def _compute_scores(self, seg: Segment) -> Tuple[float, float]:
-        obs = np.stack([t.obs for t in seg.transitions])
-        actions = np.array([t.action for t in seg.transitions], dtype=np.int64)
-        length = len(seg.transitions)
+        all_obs = np.concatenate([
+            np.stack([t.obs for t in seg.transitions]) for seg in segments
+        ])
+        all_actions = np.concatenate([
+            np.array([t.action for t in seg.transitions], dtype=dtype) for seg in segments
+        ])
 
-        reward_score = float(self.reward_model.predict(obs, actions).sum() / length)
-        variance_score = float(self.reward_model.ensemble_variance(obs, actions).sum() / length)
+        all_rewards = self.reward_model.predict(all_obs, all_actions)
+        all_variances = self.reward_model.ensemble_variance(all_obs, all_actions)
 
-        return reward_score, variance_score
+        scored = []
+        idx = 0
+        for seg, length in zip(segments, lengths):
+            r = float(all_rewards[idx:idx + length].sum() / length)
+            v = float(all_variances[idx:idx + length].sum() / length)
+            scored.append((seg, r, v))
+            idx += length
+        return scored
 
     # ------------------------------------------------------------------
     # Pairing

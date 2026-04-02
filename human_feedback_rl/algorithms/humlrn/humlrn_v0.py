@@ -19,11 +19,10 @@ from typing import Any, List
 
 import numpy as np
 import torch
-import wandb
-
 from human_feedback_rl.common import (
     ActiveFragmenter,
     BaseAlgorithm,
+    CustomLoggingCallback,
     EnsembleRewardModel,
     EnvRewardWrapper,
     InverseSchedule,
@@ -97,7 +96,7 @@ class HumLrnAlgorithm(BaseAlgorithm):
 
         self.reward_trainer = RewardTrainerHumLrn(
             preference_model=self.preference_model,
-            logger=PrefixLogger(self.logger),
+            logger=PrefixLogger(self.logger, "reward_model"),
             batch_size=reward_model_batch_size,
             num_epochs=reward_training_epochs,
             lambda_demo=lambda_demo,
@@ -115,12 +114,7 @@ class HumLrnAlgorithm(BaseAlgorithm):
 
         env_reward_wrapper = EnvRewardWrapper(self.env, self.reward_model)
         self.agent.set_env(env_reward_wrapper)
-        self.agent.set_logger(SB3BridgeLogger(self.logger, key_map={"train/loss": "agent/train_loss"}))
-
-        if wandb.run is not None:
-            wandb.define_metric("reward_model/*", step_metric="timescales/global_reward_trainer_epochs")
-            wandb.define_metric("agent/*",        step_metric="timescales/global_agent_steps")
-            wandb.define_metric("rollout/*",       step_metric="timescales/iterations")
+        self.agent.set_logger(PrefixLogger(self.logger, "agent"))
 
         self.schedule_num_pairs = InverseSchedule(
             initial_value=num_pairs_initial,
@@ -132,7 +126,7 @@ class HumLrnAlgorithm(BaseAlgorithm):
     # Main training loop
     # -----------------------------------------------------------------------
 
-    def train(self, total_timesteps: int = 1_000_000, num_iterations: int = 10) -> Any:
+    def train(self, total_timesteps: int = 1_000_000, num_iterations: int = 10, rolling_window: int = 100) -> Any:
         per_iter_timesteps = int(total_timesteps / num_iterations)
         global_agent_steps = 0
         global_reward_trainer_epochs = 0
@@ -190,6 +184,7 @@ class HumLrnAlgorithm(BaseAlgorithm):
             loss = self.reward_trainer.train(
                 self.preference_dataset,
                 self.demo_dataset if self.use_demonstrations else None,
+                rollout_trajectories=trajectories,
             )
             val_loss = self.reward_trainer.evaluate(self.preference_dataset_val)
             # DEBUG
@@ -205,30 +200,39 @@ class HumLrnAlgorithm(BaseAlgorithm):
 
             # 6) Train agent
             print("[6/6] Training agent...")
-            self.agent.learn(total_timesteps=per_iter_timesteps, reset_num_timesteps=False)
+            self.agent.learn(
+                total_timesteps=per_iter_timesteps,
+                reset_num_timesteps=False,
+                callback=CustomLoggingCallback(window_size=rolling_window),
+            )
             global_agent_steps += per_iter_timesteps
             avg_model_reward = self._compute_avg_model_reward(trajectories)
             # DEBUG
             print(f"      avg_model_reward={avg_model_reward:.3f}  avg_true_reward={avg_true_reward:.3f}")
             # FINE
 
-            self.logger.record("rollout/num_pairs",     num_pairs)
-            self.logger.record("rollout/avg_ep_length", avg_ep_length)
-            self.logger.record("rollout/num_demos",     len(demo_trajectories))
+            # --- Logging ---
+            # rollout metrics
+            self.logger.record("iterations",             it + 1)
+            self.logger.record("rollout/num_pairs",      num_pairs)
+            self.logger.record("rollout/avg_true_reward", avg_true_reward)
+            self.logger.record("rollout/avg_model_reward", avg_model_reward)
+            self.logger.record("rollout/avg_ep_length",  avg_ep_length)
+            self.logger.record("rollout/num_demos",      len(demo_trajectories))
 
-            self.logger.record("reward_model/training_loss",   loss)
-            self.logger.record("reward_model/validation_loss", val_loss)
-            self.logger.record("reward_model/accuracy_train",
-                               self._compute_preference_accuracy(train_pairs, train_prefs))
-            self.logger.record("reward_model/accuracy_val",
-                               self._compute_preference_accuracy(val_pairs, val_prefs))
+            # reward model metrics
+            self.logger.record("reward_model/global_epochs",          global_reward_trainer_epochs)
+            self.logger.record("reward_model/loss_validation",        val_loss)
+            self.logger.record("reward_model/accuracy_train_current", acc_train)
+            self.logger.record("reward_model/accuracy_val_current",   acc_val)
+            self.logger.record("reward_model/accuracy_train_global",  acc_train_global)
+            self.logger.record("reward_model/accuracy_val_global",
+                               self._compute_preference_accuracy(
+                                   self.preference_dataset_val.pairs,
+                                   self.preference_dataset_val.preferences))
 
-            self.logger.record("agent/avg_ep_length",  avg_ep_length)
-            self.logger.record("agent/avg_ep_reward",  avg_model_reward)
-
-            self.logger.record("timescales/iterations",                   it)
-            self.logger.record("timescales/global_reward_trainer_epochs", global_reward_trainer_epochs)
-            self.logger.record("timescales/global_agent_steps",           global_agent_steps)
+            # agent metrics
+            self.logger.record("agent/time/total_timesteps", global_agent_steps)
 
             self.logger.dump()
 
@@ -297,12 +301,44 @@ class HumLrnAlgorithm(BaseAlgorithm):
 
     def _collect_expert_demonstrations(self, n_episodes: int) -> List[Trajectory]:
         """
-        Collect demonstration trajectories by running the expert policy.
-
-        TODO: optionally filter demonstrations by quality (e.g. top-k by episode length).
+        Collect n_episodes complete trajectories by running the expert policy
+        deterministically on self.env.
         """
-        # TODO: implement rollout collection using self.expert
-        raise NotImplementedError
+        num_envs = self.env.num_envs
+        current_transitions = [[] for _ in range(num_envs)]
+        trajectories: List[Trajectory] = []
+
+        obs = self.env.reset()
+        if isinstance(obs, tuple):
+            obs, _ = obs
+
+        while len(trajectories) < n_episodes:
+            action = self.expert.predict(obs)
+            step_result = self.env.step(action)
+
+            if len(step_result) == 5:
+                next_obs, reward, terminated, truncated, _ = step_result
+                done = terminated | truncated
+            else:
+                next_obs, reward, done, _ = step_result
+
+            for i in range(num_envs):
+                current_transitions[i].append(
+                    Transition(
+                        obs=obs[i].copy(),
+                        action=int(action[i]) if self.discrete_actions else action[i].copy(),
+                        reward=float(reward[i]),
+                    )
+                )
+                if done[i]:
+                    trajectories.append(Trajectory(current_transitions[i]))
+                    current_transitions[i] = []
+                    if len(trajectories) >= n_episodes:
+                        break
+
+            obs = next_obs
+
+        return trajectories[:n_episodes]
 
     # -----------------------------------------------------------------------
     # Rollout collection (same as ChristianoAlgorithm)

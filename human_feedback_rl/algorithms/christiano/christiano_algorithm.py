@@ -2,8 +2,6 @@ import math
 from typing import Any, List
 
 import numpy as np
-import wandb
-
 from human_feedback_rl.common import (
     ActiveFragmenter,
     EnsembleRewardModel,
@@ -72,6 +70,7 @@ class ChristianoAlgorithm:
 
         # The agent learns from the env wrapped with the reward model
         env_reward_wrapper = EnvRewardWrapper(self.env, self.reward_model)
+        self.reward_wrapper = env_reward_wrapper
         self.agent.set_env(env_reward_wrapper)
         self.agent.set_logger(PrefixLogger(self.logger, "agent"))
 
@@ -103,13 +102,24 @@ class ChristianoAlgorithm:
             total_segments_target = 2 * num_pairs * segments_oversample_factor 
             trajectories = self._collect_rollout(total_segments_target)
 
+            avg_ep_length = float(np.mean([len(t.transitions) for t in trajectories]))
+            avg_true_reward = float(np.mean([t.total_reward() for t in trajectories]))
+            print(
+                f"      trajectories={len(trajectories)}  avg_ep_length={avg_ep_length:.1f}  avg_true_reward={avg_true_reward:.3f}")
+
             # 2) Fragment trajectories
             print("[2/5] Fragmenting trajectories...")
             segment_pairs = self.fragmenter.fragment(trajectories=trajectories, num_pairs=num_pairs)
 
+            print(f"      segment_pairs={len(segment_pairs)} (requested {num_pairs})")
+
             # 3) Generate preferences from true rewards
             print("[3/5] Generating preferences...")
-            preferences = self._preferences_from_true_rewards(segment_pairs)
+            segment_pairs, preferences = self._preferences_from_true_rewards(segment_pairs)
+
+            debug_accuracy = self._compute_preference_accuracy(segment_pairs, preferences)
+
+            print(f"      debug_accuracy={debug_accuracy:.3f}")
 
             train_pairs, train_prefs, val_pairs, val_prefs = self._train_val_split(
                 segment_pairs, preferences
@@ -117,14 +127,29 @@ class ChristianoAlgorithm:
             self.preference_dataset.push(train_pairs, train_prefs)
             self.preference_dataset_val.push(val_pairs, val_prefs)
 
+            print(f"      dataset — train={len(self.preference_dataset)}  val={len(self.preference_dataset_val)}")
+
             # 4) Train reward model
             print("[4/5] Training reward model...")
             self.reward_trainer.train(
                 self.preference_dataset,
                 num_epochs=reward_model_epochs_per_it,
-            )               
+            )
+            self.reward_wrapper.reset_stats()
 
             reward_model_global_epochs += reward_model_epochs_per_it
+
+            loss_val_reward_model = self.reward_trainer.evaluate(self.preference_dataset_val)
+            acc_train = self._compute_preference_accuracy(train_pairs, train_prefs)
+            acc_val = self._compute_preference_accuracy(val_pairs, val_prefs)
+            acc_train_global = self._compute_preference_accuracy(
+                self.preference_dataset.pairs, self.preference_dataset.preferences)
+            acc_val_global = self._compute_preference_accuracy(
+                self.preference_dataset_val.pairs, self.preference_dataset_val.preferences)
+            print(f"      loss_val={loss_val_reward_model:.4f}")
+            print(
+                f"      accuracy — train_current={acc_train:.2f}  val_current={acc_val:.2f}  train_global={acc_train_global:.2f}")
+
 
             is_pretraining = pretrain_iterations > 0 and it < pretrain_iterations
             if is_pretraining:
@@ -132,8 +157,13 @@ class ChristianoAlgorithm:
             else:
                 # 5) Train agent
                 print("[5/5] Training agent...")
+                # Sync env state: _collect_rollout stepped self.env directly,
+                # leaving env_reward_wrapper._obs and agent._last_obs stale.
+                sync_obs = self.reward_wrapper.reset()
+                self.agent._last_obs = sync_obs
+                self.agent._last_episode_starts = np.ones((self.env.num_envs,), dtype=bool)
                 self.agent.learn(
-                    total_timesteps=agent_timesteps_per_it, 
+                    total_timesteps=agent_timesteps_per_it,
                     reset_num_timesteps=False,
                     log_interval=agent_log_interval,
                     callback=CustomLoggingCallback(),
@@ -141,10 +171,10 @@ class ChristianoAlgorithm:
                 agent_global_timesteps += agent_timesteps_per_it
 
             # --- Logging ---
-            avg_true_reward = float(np.mean([t.total_reward() for t in trajectories]))
-            avg_ep_length = float(np.mean([len(t.transitions) for t in trajectories]))
             avg_model_reward = self._compute_avg_model_reward(trajectories)
-            loss_val_reward_model = self.reward_trainer.evaluate(self.preference_dataset_val)
+
+            print(
+                f"      agent_steps={agent_global_timesteps}  avg_model_reward={avg_model_reward:.3f}  avg_true_reward={avg_true_reward:.3f}")
 
             # rollout metrics
             self.logger.record("iterations", it + 1)
@@ -156,19 +186,13 @@ class ChristianoAlgorithm:
             # reward model metrics
             self.logger.record("reward_model/global_epochs", reward_model_global_epochs)
             self.logger.record("reward_model/loss_validation", loss_val_reward_model)
-            self.logger.record("reward_model/accuracy_train_current",
-                               self._compute_preference_accuracy(train_pairs, train_prefs))
-            self.logger.record("reward_model/accuracy_val_current",
-                               self._compute_preference_accuracy(val_pairs, val_prefs))
-            self.logger.record("reward_model/accuracy_train_global",
-                               self._compute_preference_accuracy(
-                                   self.preference_dataset.pairs,
-                                   self.preference_dataset.preferences))
-            self.logger.record("reward_model/accuracy_val_global",
-                               self._compute_preference_accuracy(
-                                   self.preference_dataset_val.pairs,
-                                   self.preference_dataset_val.preferences))
+            self.logger.record("reward_model/accuracy_train_current", acc_train)
+            self.logger.record("reward_model/accuracy_val_current",   acc_val)
+            self.logger.record("reward_model/accuracy_train_global",  acc_train_global)
+            self.logger.record("reward_model/accuracy_val_global",    acc_val_global)
             self.logger.record("reward_model/pretraining", is_pretraining)
+
+            self.logger.record("reward_model/debug_accuracy", debug_accuracy)
 
             # agent metrics
             self.logger.record("agent/time/total_timesteps", agent_global_timesteps)
@@ -231,12 +255,18 @@ class ChristianoAlgorithm:
     # Preference helpers
     # -----------------------------------------------------------------------
 
-    def _preferences_from_true_rewards(self, segment_pairs: List[SegmentPair]) -> List[Preference]:
-        preferences = []
+    def _preferences_from_true_rewards(
+        self, segment_pairs: List[SegmentPair]
+    ) -> tuple[List[SegmentPair], List[Preference]]:
+        filtered_pairs: List[SegmentPair] = []
+        preferences: List[Preference] = []
         for pair in segment_pairs:
             r1, r2 = pair.seg1.total_reward(), pair.seg2.total_reward()
+            if r1 == r2:
+                continue  # skip ties: cross-entropy has no neutral label
+            filtered_pairs.append(pair)
             preferences.append(Preference((1, 0) if r1 > r2 else (0, 1)))
-        return preferences
+        return filtered_pairs, preferences
 
     def _compute_preference_accuracy(
         self, segment_pairs: List[SegmentPair], preferences: List[Preference]

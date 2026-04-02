@@ -7,6 +7,10 @@ class InverseSchedule:
     def __call__(self, progress_remaining):
         progress = 1 - progress_remaining
 
-        delta = self.initial_value - self.final_value
+        inv = 1 / (1 + self.decay_rate * progress)
+        inv_0 = 1
+        inv_1 = 1 / (1 + self.decay_rate)
 
-        return self.final_value + delta / (1 + self.decay_rate * progress)
+        normalized = (inv - inv_1) / (inv_0 - inv_1)
+
+        return self.final_value + (self.initial_value - self.final_value) * normalized

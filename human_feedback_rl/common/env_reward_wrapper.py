@@ -9,7 +9,7 @@ class _RunningMeanStd:
 
     def __init__(self):
         self.mean = 0.0
-        self.var = 1.0
+        self.var = 0.0
         self.count = 0
 
     def update(self, values: np.ndarray) -> None:
@@ -46,6 +46,12 @@ class EnvRewardWrapper(VecEnvWrapper):
         self._obs: np.ndarray | None = None
         self._actions: np.ndarray | None = None
         self._reward_stats = _RunningMeanStd()
+
+    def reset_stats(self):
+        if self._reward_stats.count > 1:
+            new_count = self._reward_stats.count // 2
+            self._reward_stats.var = self._reward_stats.var * (new_count - 1) / (self._reward_stats.count - 1)
+            self._reward_stats.count = new_count
 
     def reset(self):
         obs = self.venv.reset()

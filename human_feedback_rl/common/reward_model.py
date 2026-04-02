@@ -10,17 +10,17 @@ from .core import Segment
 # ---------------------------------------------------------------------------
 
 class RewardNet(nn.Module):
-    """Single MLP reward predictor: (obs, action_enc) -> scalar."""
-
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 64):
+    def __init__(self, obs_dim, action_dim, hidden_dim=128):
         super().__init__()
+        input_dim = obs_dim + action_dim
+
         self.net = nn.Sequential(
-            nn.Linear(obs_dim + action_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Dropout(0.4),
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            #nn.Dropout(0.4),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Dropout(0.4),
+            nn.ReLU(),
+            #nn.Dropout(0.4),
             nn.Linear(hidden_dim, 1),
         )
 
