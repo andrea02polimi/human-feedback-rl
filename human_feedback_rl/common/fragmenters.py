@@ -3,6 +3,7 @@ import random
 
 from typing import List, Tuple
 from .core import Trajectory, Segment, SegmentPair
+from .reward_model import encode_ego_status
 
 
 # ---------------------------------------------------------------------------
@@ -75,9 +76,17 @@ class ActiveFragmenter:
         all_actions = np.concatenate([
             np.array([t.action for t in seg.transitions], dtype=dtype) for seg in segments
         ])
+        all_infos = np.concatenate([
+            np.stack([
+                encode_ego_status(t.info.get("ego_status", "running"))
+                if t.info is not None else np.zeros(4, dtype=np.float32)
+                for t in seg.transitions
+            ])
+            for seg in segments
+        ])
 
-        all_rewards = self.reward_model.predict(all_obs, all_actions)
-        all_variances = self.reward_model.ensemble_variance(all_obs, all_actions)
+        all_rewards = self.reward_model.predict(all_obs, all_actions, info=all_infos)
+        all_variances = self.reward_model.ensemble_variance(all_obs, all_actions, info=all_infos)
 
         scored = []
         idx = 0

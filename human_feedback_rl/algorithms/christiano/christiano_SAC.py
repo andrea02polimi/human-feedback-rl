@@ -18,6 +18,7 @@ from human_feedback_rl.common import (
     Transition,
     UnifiedLogger,
     CustomLoggingCallback,
+    encode_ego_status,
 )
 from .preference_trainer import RewardTrainerChristiano
 
@@ -28,19 +29,14 @@ from .preference_trainer import RewardTrainerChristiano
 
 class _TrueRewardEnvWrapper(EnvRewardWrapper):
     """
-    Extends EnvRewardWrapper for SAC (continuous actions, off-policy).
-
-    - Returns normalized RM rewards to the agent so they are stored in the
-      replay buffer and used for policy updates.
-    - Also records the true environment reward in each transition so that
-      completed episodes can be used for preference labelling.
-
-    Completed episodes are accumulated and drained with collect_trajectories(),
-    called once per outer iteration after collect_rollouts().
+    Returns normalized RM rewards to the agent (stored in replay buffer) and
+    records true env rewards in transitions for preference labelling.
+    Completed episodes are drained with collect_trajectories().
     """
 
-    def __init__(self, venv, reward_model):
+    def __init__(self, venv, reward_model, pessimism: float = 0.0):
         super().__init__(venv, reward_model)
+        self.pessimism = pessimism
         self._ep_transitions: List[List[Transition]] = [[] for _ in range(venv.num_envs)]
         self._completed_trajectories: List[Trajectory] = []
 
@@ -54,7 +50,11 @@ class _TrueRewardEnvWrapper(EnvRewardWrapper):
         obs, env_rewards, dones, infos = self.venv.step_wait()
 
         if self._obs is not None and self._actions is not None:
-            rm_rewards = self.reward_model.predict(self._obs, self._actions)
+            info_arr = np.stack([
+                encode_ego_status(infos[i].get("ego_status", "running"))
+                for i in range(self.num_envs)
+            ])
+            rm_rewards = self.reward_model.predict(self._obs, self._actions, pessimism=self.pessimism, info=info_arr)
             self._reward_stats.update(rm_rewards)
             normalized = (
                 (rm_rewards - self._reward_stats.mean) / self._reward_stats.std
@@ -66,6 +66,7 @@ class _TrueRewardEnvWrapper(EnvRewardWrapper):
                         obs=self._obs[i].copy(),
                         action=self._actions[i].copy(),
                         reward=float(env_rewards[i]),
+                        info={"ego_status": infos[i].get("ego_status", "running")},
                     )
                 )
                 if dones[i]:
@@ -93,19 +94,9 @@ class _TrueRewardEnvWrapper(EnvRewardWrapper):
 class ChristianoSACAlgorithm:
     """
 
-    Outer loop per iteration:
-      1. Collect n_rollout_steps via SAC's collect_rollouts.
-         The replay buffer receives normalized RM rewards; the wrapper
-         also records true env rewards for preference labelling.
-      2. Fragment completed episodes into segment pairs.
-      3. Label pairs with the true env reward oracle (Bradley-Terry).
-      4. Update training / validation preference datasets.
-      5. Train the reward model ensemble on the training dataset.
-      6. Train SAC (gradient_steps updates on the replay buffer).
-
-    Keeping n_rollout_steps small ensures the policy does not drift far
-    between consecutive RM updates, so the reward model always trains on
-    near-on-policy data while still benefiting from SAC's replay buffer.
+    Outer loop: collect rollouts → fragment → label → update datasets →
+    train RM → train SAC. Small n_rollout_steps keeps RM training near on-policy
+    while still benefiting from the replay buffer.
     """
 
     def __init__(
@@ -121,6 +112,7 @@ class ChristianoSACAlgorithm:
         num_pairs_initial: int = 100,
         num_pairs_final: int = 0,
         decay_pairs_schedule: float = 1.0,
+        pessimism: float = 0.0,
     ):
         if hasattr(env.action_space, "n"):
             raise ValueError(
@@ -156,7 +148,8 @@ class ChristianoSACAlgorithm:
         self.preference_dataset = PreferenceDataset(max_dataset_size)
         self.preference_dataset_val = PreferenceDataset(max_dataset_size)
 
-        self.reward_wrapper = _TrueRewardEnvWrapper(self.env, self.reward_model)
+        self.pessimism = pessimism
+        self.reward_wrapper = _TrueRewardEnvWrapper(self.env, self.reward_model, pessimism=pessimism)
         self.agent.set_env(self.reward_wrapper)
         self.agent.set_logger(PrefixLogger(self.logger, "agent"))
 
@@ -184,39 +177,20 @@ class ChristianoSACAlgorithm:
     ) -> Any:
         """
         Args:
-            total_timesteps: Total environment steps for the full run.
-            n_rollout_steps: Steps collected per outer iteration. Determines
-                how often the RM is updated; smaller = fresher training data
-                for the RM but more overhead.
-            pretrain_iterations: Number of outer iterations where only the RM
-                is trained (no SAC updates). Useful to bootstrap RM quality
-                before the agent starts learning.
-            reward_model_epochs_per_it: Epochs to train the RM each iteration.
-            agent_log_interval: SAC logging interval passed to collect_rollouts.
-            segments_oversample_factor: Oversample trajectories so the fragmenter
-                can select the most informative pairs.
-            gradient_steps: SAC gradient updates per outer iteration.
-                -1 means use the same value as n_rollout_steps.
-            learning_starts: Minimum replay buffer transitions before SAC
-                training begins (mirrors SAC's own learning_starts parameter).
-            replay_buffer_iterations: If set, overrides the agent's buffer_size
-                with replay_buffer_iterations * n_rollout_steps. This is K —
-                how many outer iterations of transitions the buffer holds.
+            total_timesteps: Total env steps.
+            n_rollout_steps: Steps per outer iteration (smaller = fresher RM data).
+            pretrain_iterations: Iterations where only the RM trains (no SAC updates).
+            reward_model_epochs_per_it: RM training epochs per iteration.
+            agent_log_interval: SAC logging interval for collect_rollouts.
+            segments_oversample_factor: Oversample factor for the fragmenter.
+            gradient_steps: SAC gradient updates per iteration (-1 = n_rollout_steps).
+            learning_starts: Min buffer transitions before SAC training begins.
+            replay_buffer_iterations: If set, buffer_size = K * n_rollout_steps.
                 Smaller K = less staleness, less memory, faster relabeling.
-            relabel_replay_buffer: If True, after each RM update all rewards
-                in the replay buffer are recomputed with the new RM. Eliminates
-                reward staleness at the cost of one forward pass over the buffer.
-                Most useful when replay_buffer_iterations is small.
-            agent_update_every_n: The RM is updated every outer iteration, but
-                SAC gradient steps are performed only every N iterations.
-                agent_update_every_n=5 means 5 RM updates per agent update,
-                keeping the RM calibrated on the current policy distribution
-                before the agent is allowed to move further.
-            checkpoint_path: If set, saves the best agent (by smoothed
-                avg_true_reward) to this path, overwriting the previous best.
-                SB3 appends .zip automatically. Example: "outputs/best_model".
-            checkpoint_window: Number of recent iterations used to compute the
-                smoothed avg_true_reward for checkpoint comparison.
+            relabel_replay_buffer: Recompute all buffer rewards after each RM update.
+            agent_update_every_n: SAC updates only every N iterations (RM updates every iter).
+            checkpoint_path: Save best agent (by smoothed avg_true_reward) here (.zip appended by SB3).
+            checkpoint_window: Window size for smoothed avg_true_reward in checkpointing.
         """
         if gradient_steps == -1:
             gradient_steps = n_rollout_steps
@@ -280,22 +254,20 @@ class ChristianoSACAlgorithm:
                 iteration += 1
                 continue
 
-            avg_ep_length = float(np.mean([len(t.transitions) for t in trajectories]))
-            avg_true_reward = float(np.mean([t.total_reward() for t in trajectories]))
+            ep_lengths   = [len(t.transitions) for t in trajectories]
+            true_rewards = [t.total_reward()     for t in trajectories]
+            avg_ep_length   = float(np.mean(ep_lengths))
+            avg_true_reward = float(np.mean(true_rewards))
             print(
                 f"      trajectories={len(trajectories)}"
-                f"  avg_ep_length={avg_ep_length:.1f}"
-                f"  avg_true_reward={avg_true_reward:.3f}"
+                f"  ep_length=[{min(ep_lengths):.0f}/{avg_ep_length:.1f}/{max(ep_lengths):.0f}]"
+                f"  true_reward=[{min(true_rewards):.2f}/{avg_true_reward:.2f}/{max(true_rewards):.2f}]"
             )
 
             # 2) Fragment trajectories into segment pairs
             print("[2/5] Fragmenting trajectories...")
-            num_pairs_target = num_pairs
-            segment_pairs = self.fragmenter.fragment(
-                trajectories=trajectories,
-                num_pairs=num_pairs_target,
-            )
-            print(f"      segment_pairs={len(segment_pairs)} (requested {num_pairs_target})")
+            segment_pairs = self.fragmenter.fragment(trajectories=trajectories, num_pairs=num_pairs)
+            print(f"      segment_pairs={len(segment_pairs)} (requested {num_pairs})")
 
             # 3) Generate preferences from true env rewards
             print("[3/5] Generating preferences...")
@@ -336,7 +308,9 @@ class ChristianoSACAlgorithm:
             acc_val_global = self._compute_preference_accuracy(
                 self.preference_dataset_val.pairs, self.preference_dataset_val.preferences
             )
-            print(f"      loss_val={loss_val_reward_model:.4f}")
+            avg_ens_std, max_ens_std = self._compute_ensemble_uncertainty(trajectories)
+            print(f"      loss_val={loss_val_reward_model:.4f}"
+                  f"  ens_std=[avg={avg_ens_std:.3f}  max={max_ens_std:.3f}]")
             print(
                 f"      accuracy — train_current={acc_train:.2f}"
                 f"  val_current={acc_val:.2f}"
@@ -374,18 +348,32 @@ class ChristianoSACAlgorithm:
                 )
 
             # --- Logging ---
-            avg_model_reward = self._compute_avg_model_reward(trajectories)
+            avg_model_reward     = self._compute_avg_model_reward(trajectories)
+            avg_model_reward_raw = self._compute_avg_model_reward(trajectories, pessimism=0.0)
+            pessimistic_penalty  = avg_model_reward_raw - avg_model_reward
+            buf = self.agent.replay_buffer
+            buf_fill = (buf.pos if not buf.full else buf.buffer_size) / buf.buffer_size
             print(
                 f"      agent_steps={self.agent.num_timesteps}"
-                f"  avg_model_reward={avg_model_reward:.3f}"
+                f"  buf={buf_fill:.0%}"
+                f"  model_reward_raw={avg_model_reward_raw:.1f}"
+                f"  pessimistic_penalty={pessimistic_penalty:.1f}"
                 f"  avg_true_reward={avg_true_reward:.3f}"
             )
 
             self.logger.record("iterations", iteration + 1)
             self.logger.record("rollout/num_pairs", num_pairs)
             self.logger.record("rollout/avg_true_reward", avg_true_reward)
+            self.logger.record("rollout/min_true_reward", float(min(true_rewards)))
+            self.logger.record("rollout/max_true_reward", float(max(true_rewards)))
             self.logger.record("rollout/avg_model_reward", avg_model_reward)
+            self.logger.record("rollout/avg_model_reward_raw", avg_model_reward_raw)
+            self.logger.record("rollout/pessimistic_penalty", pessimistic_penalty)
             self.logger.record("rollout/avg_ep_length", avg_ep_length)
+            self.logger.record("rollout/min_ep_length", float(min(ep_lengths)))
+            self.logger.record("rollout/max_ep_length", float(max(ep_lengths)))
+            self.logger.record("reward_model/ensemble_std_avg", avg_ens_std)
+            self.logger.record("reward_model/ensemble_std_max", max_ens_std)
             self.logger.record("reward_model/global_epochs", reward_model_global_epochs)
             self.logger.record("reward_model/loss_validation", loss_val_reward_model)
             self.logger.record("reward_model/accuracy_train_current", acc_train)
@@ -394,6 +382,7 @@ class ChristianoSACAlgorithm:
             self.logger.record("reward_model/accuracy_val_global", acc_val_global)
             self.logger.record("reward_model/pretraining", is_pretraining)
             self.logger.record("reward_model/debug_accuracy", debug_accuracy)
+            self.logger.record("agent/replay_buffer_fill", buf_fill)
             self.logger.record("agent/time/total_timesteps", self.agent.num_timesteps)
             self.logger.record("agent/update_due", agent_update_due)
 
@@ -422,35 +411,22 @@ class ChristianoSACAlgorithm:
     # -----------------------------------------------------------------------
 
     def _relabel_replay_buffer(self) -> None:
-        """
-        Rewrite every reward stored in SAC's replay buffer using the current
-        reward model, then recompute normalization statistics from the new
-        values so that future steps and current buffer entries share the same
-        scale.
-
-        Cost: one RM forward pass over min(buf.pos, buffer_size) transitions.
-        """
+        """Rewrite all rewards in the replay buffer with the current RM and recompute norm stats."""
         buf = self.agent.replay_buffer
         n = buf.buffer_size if buf.full else buf.pos
         if n == 0:
             return
 
-        # buf.observations shape: (buffer_size, n_envs, obs_dim)
-        # buf.actions shape:      (buffer_size, n_envs, act_dim)
         obs = buf.observations[:n].reshape(n * buf.n_envs, -1)
         act = buf.actions[:n].reshape(n * buf.n_envs, -1)
+        # Replay buffer does not store ego_status: pass zeros (treated as unknown)
+        raw_rewards = self.reward_model.predict(obs, act, pessimism=self.pessimism, info=None)
 
-        raw_rewards = self.reward_model.predict(obs, act)  # (n * n_envs,)
-
-        # Recompute normalization stats from the new reward distribution
         stats = self.reward_wrapper._reward_stats
         stats.__init__()
         stats.update(raw_rewards)
 
-        normalized = (
-            (raw_rewards - stats.mean) / stats.std
-        ).astype(np.float32)
-
+        normalized = ((raw_rewards - stats.mean) / stats.std).astype(np.float32)
         buf.rewards[:n] = normalized.reshape(n, buf.n_envs)
 
     # -----------------------------------------------------------------------
@@ -483,17 +459,40 @@ class ChristianoSACAlgorithm:
         )
         return correct / len(preferences)
 
-    def _compute_avg_model_reward(self, trajectories: List[Trajectory]) -> float:
+    def _compute_avg_model_reward(self, trajectories: List[Trajectory], pessimism: Optional[float] = None) -> float:
+        p = self.pessimism if pessimism is None else pessimism
         ep_model_rewards = [
             float(
                 self.reward_model.predict(
                     np.array([t.obs for t in traj.transitions]),
                     np.array([t.action for t in traj.transitions]),
+                    pessimism=p,
+                    info=np.stack([
+                        encode_ego_status(t.info.get("ego_status", "running"))
+                        if t.info is not None else np.zeros(4, dtype=np.float32)
+                        for t in traj.transitions
+                    ]),
                 ).sum()
             )
             for traj in trajectories
         ]
         return float(np.mean(ep_model_rewards))
+
+    def _compute_ensemble_uncertainty(self, trajectories: List[Trajectory]) -> tuple[float, float]:
+        """Returns (mean_std, max_std) of ensemble predictions across all trajectory steps."""
+        all_stds = []
+        for traj in trajectories:
+            obs = np.array([t.obs    for t in traj.transitions])
+            act = np.array([t.action for t in traj.transitions])
+            info = np.stack([
+                encode_ego_status(t.info.get("ego_status", "running"))
+                if t.info is not None else np.zeros(4, dtype=np.float32)
+                for t in traj.transitions
+            ])
+            var = self.reward_model.ensemble_variance(obs, act, info=info)  # (T,)
+            all_stds.extend(np.sqrt(var).tolist())
+        all_stds = np.array(all_stds)
+        return float(all_stds.mean()), float(all_stds.max())
 
     def _train_val_split(
         self,

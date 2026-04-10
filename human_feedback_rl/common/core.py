@@ -7,6 +7,7 @@ class Transition:
     obs: Any
     action: Any
     reward: float
+    info: Any = None # (collided, running, arrived, off_road)
 
 
 @dataclass

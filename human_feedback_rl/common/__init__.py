@@ -1,17 +1,18 @@
 from .fragmenters import ActiveFragmenter
 from .base_algorithm import BaseAlgorithm
 from .base_policy import BCPolicy
-from .reward_model import RewardNet, EnsembleRewardModel
+from .reward_model import RewardNet, EnsembleRewardModel, encode_ego_status
 from .env_reward_wrapper import EnvRewardWrapper
 from .preference_model import PreferenceModelFromReward
 from .schedules import InverseSchedule
 from .loggers import UnifiedLogger, PrefixLogger
 from .custom_logging_callback import CustomLoggingCallback
+from .agent_trainer import BufferingWrapper, AgentTrainer
 
 from .core import (
-    Segment, 
-    Trajectory, 
-    SegmentPair, 
+    Segment,
+    Trajectory,
+    SegmentPair,
     Preference,
     PreferenceDataset,
     Transition,
@@ -19,9 +20,12 @@ from .core import (
 
 __all__ = [
     "ActiveFragmenter",
+    "AgentTrainer",
     "BaseAlgorithm",
+    "BufferingWrapper",
     "EnsembleRewardModel",
     "RewardNet",
+    "encode_ego_status",
     "EnvRewardWrapper",
     "PreferenceModelFromReward",
     "Segment",
