@@ -21,6 +21,7 @@ from .preference_trainer import RewardTrainerChristiano
 
 
 class ChristianoAlgorithm:
+# test
 
     def __init__(
         self,
