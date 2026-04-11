@@ -1,16 +1,15 @@
 class InverseSchedule:
-    def __init__(self, initial_value, final_value, decay_rate=1.0):
+    """
+    Decays an integer value according to 1 / (1 + decay * t).
+    Returns at least 1.
+
+    Used to reduce the number of preference queries over time as the reward
+    model becomes more accurate (fewer queries needed for fine-tuning).
+    """
+
+    def __init__(self, initial_value: int, decay: float = 1.0):
         self.initial_value = initial_value
-        self.final_value = final_value
-        self.decay_rate = decay_rate
+        self.decay = decay
 
-    def __call__(self, progress_remaining):
-        progress = 1 - progress_remaining
-
-        inv = 1 / (1 + self.decay_rate * progress)
-        inv_0 = 1
-        inv_1 = 1 / (1 + self.decay_rate)
-
-        normalized = (inv - inv_1) / (inv_0 - inv_1)
-
-        return self.final_value + (self.initial_value - self.final_value) * normalized
+    def __call__(self, t: int) -> int:
+        return max(1, int(self.initial_value / (1.0 + self.decay * t)))

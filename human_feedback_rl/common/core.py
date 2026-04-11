@@ -1,29 +1,45 @@
-from dataclasses import dataclass
-from typing import Any, List, Tuple
+from dataclasses import dataclass, field
+from typing import List
+import numpy as np
 
 
 @dataclass
 class Transition:
-    obs: Any
-    action: Any
-    reward: float
-    info: Any = None # (collided, running, arrived, off_road)
+    obs: np.ndarray
+    action: np.ndarray
+    true_reward: float
+    done: bool
+
+
+@dataclass
+class Segment:
+    transitions: List[Transition]
+
+    @property
+    def obs(self) -> np.ndarray:
+        return np.stack([t.obs for t in self.transitions])
+
+    @property
+    def actions(self) -> np.ndarray:
+        return np.stack([t.action for t in self.transitions])
+
+    @property
+    def true_return(self) -> float:
+        return float(sum(t.true_reward for t in self.transitions))
+
+    def __len__(self) -> int:
+        return len(self.transitions)
 
 
 @dataclass
 class Trajectory:
-    transitions: List[Transition]
+    transitions: List[Transition] = field(default_factory=list)
 
-    def total_reward(self) -> float:
-        return sum(t.reward for t in self.transitions)
-    
-    def length(self) -> int:
-        return len(self.transitions)
-
-    def add_transition(self, transition: Transition) -> None:
+    def add(self, transition: Transition) -> None:
         self.transitions.append(transition)
 
-Segment = Trajectory
+    def __len__(self) -> int:
+        return len(self.transitions)
 
 
 @dataclass
@@ -34,24 +50,24 @@ class SegmentPair:
 
 @dataclass
 class Preference:
-    label: Tuple[float, float]  # (1,0) or (0,1)
+    seg1: Segment
+    seg2: Segment
+    label: float  # 1.0: seg1 preferred | 0.0: seg2 preferred | 0.5: equal
 
 
 class PreferenceDataset:
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.pairs: List[SegmentPair] = []
-        self.preferences: List[Preference] = []
+    def __init__(self, max_size: int = 3000):
+        self._data: List[Preference] = []
+        self.max_size = max_size
 
-    def push(self, pairs: List[SegmentPair], preferences: List[Preference]) -> None:
-        self.pairs.extend(pairs)
-        self.preferences.extend(preferences)
-        if len(self.pairs) > self.capacity:
-            self.pairs = self.pairs[-self.capacity:]
-            self.preferences = self.preferences[-self.capacity:]
+    def add(self, preference: Preference) -> None:
+        self._data.append(preference)
+        if len(self._data) > self.max_size:
+            self._data.pop(0)
+
+    def sample(self, batch_size: int, rng: np.random.Generator) -> List[Preference]:
+        indices = rng.integers(0, len(self._data), size=batch_size)
+        return [self._data[i] for i in indices]
 
     def __len__(self) -> int:
-        return len(self.pairs)
-
-    def __iter__(self):
-        return zip(self.pairs, self.preferences)
+        return len(self._data)
