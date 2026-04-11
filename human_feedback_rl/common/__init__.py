@@ -7,7 +7,7 @@ from .core import (
     Transition,
 )
 from .fragmenters import ActiveFragmenter
-from .loggers import PrefixLogger, UnifiedLogger
+from .loggers import PrefixLogger, SB3MetricsLogger, UnifiedLogger, setup_wandb_axes
 from .preference_model import PreferenceModelFromReward
 from .reward_model import EnsembleRewardModel, RewardNet
 
@@ -29,4 +29,6 @@ __all__ = [
     # Logging
     "UnifiedLogger",
     "PrefixLogger",
+    "SB3MetricsLogger",
+    "setup_wandb_axes",
 ]

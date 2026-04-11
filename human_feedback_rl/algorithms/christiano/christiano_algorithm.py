@@ -19,19 +19,28 @@ Main loop (repeated until total_timesteps is reached):
   5. Log metrics to wandb.
 """
 
-from typing import Callable, Dict, List, Tuple
+from collections import deque
+from typing import Callable, Deque, Dict, List, Tuple
 
 import numpy as np
+
+try:
+    from sumo_gym_ego import EgoStatus
+    _HAS_EGO_STATUS = True
+except ImportError:
+    _HAS_EGO_STATUS = False
 
 from human_feedback_rl.common import (
     ActiveFragmenter,
     EnsembleRewardModel,
     PreferenceDataset,
     PreferenceModelFromReward,
+    SB3MetricsLogger,
     SegmentPair,
     Trajectory,
     Transition,
     UnifiedLogger,
+    setup_wandb_axes,
 )
 from human_feedback_rl.common.core import Preference
 
@@ -143,6 +152,15 @@ class ChristianoAlgorithm:
         self.query_schedule_fn = QUERY_SCHEDULES[query_schedule]
         self.logger = UnifiedLogger(use_wandb=True)
 
+        # Reward model gradient step counter (used as x-axis for rm/* metrics)
+        self._rm_global_epochs: int = 0
+
+        # Sliding windows for rollout metrics (last N episodes / iterations)
+        _w = 50
+        self._window_true_rewards: Deque[float] = deque(maxlen=_w)
+        self._window_ep_lengths: Deque[float] = deque(maxlen=_w)
+        self._window_model_rewards: Deque[float] = deque(maxlen=_w)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -156,7 +174,6 @@ class ChristianoAlgorithm:
         reward_model_train_steps: int = 200,
         reward_model_batch_size: int = 64,
         n_policy_train_steps: int = 1000,
-        log_interval: int = 1,
     ) -> None:
         """
         Run the full Christiano training loop.
@@ -177,11 +194,22 @@ class ChristianoAlgorithm:
             Mini-batch size for reward model training.
         n_policy_train_steps : int
             Gradient steps on the policy per iteration.
-        log_interval : int
-            Log metrics every this many iterations.
         """
         # Initialise SB3 internals (logger, _last_obs, num_timesteps, …)
         total_timesteps, _ = self.agent._setup_learn(total_timesteps)
+
+        # ── Wandb setup ────────────────────────────────────────────────
+        # Define per-group x-axes before any logging happens.
+        setup_wandb_axes()
+
+        # Replace SB3's logger so that agent.train() metrics can be forwarded
+        # to wandb.  set_logger() is the public API; fall back to _logger for
+        # versions where the property has no setter.
+        self._agent_logger = SB3MetricsLogger()
+        try:
+            self.agent.set_logger(self._agent_logger)
+        except AttributeError:
+            self.agent._logger = self._agent_logger
 
         # ── Phase 1: pre-training ──────────────────────────────────────
         self._pretraining_phase(
@@ -198,7 +226,7 @@ class ChristianoAlgorithm:
 
         while total_steps < total_timesteps:
             # 1. Collect rollout; add to replay buffer with predicted rewards
-            trajectories = self._collect_rollout(n_rollout_steps)
+            trajectories, rollout_stats = self._collect_rollout(n_rollout_steps)
             total_steps += n_rollout_steps * self.env.num_envs
 
             # 2. Gather preferences
@@ -209,7 +237,6 @@ class ChristianoAlgorithm:
                     self.preference_dataset.add(pref)
 
             # 3. Train reward model
-            rm_metrics: Dict = {}
             if len(self.preference_dataset) >= reward_model_batch_size:
                 rm_metrics = self.reward_model.train(
                     self.preference_dataset,
@@ -217,27 +244,36 @@ class ChristianoAlgorithm:
                     batch_size=reward_model_batch_size,
                     rng=self.rng,
                 )
-                rm_metrics["reward_model/dataset_size"] = len(self.preference_dataset)
-                rm_metrics["reward_model/accuracy"] = self.reward_model.accuracy(
-                    self.preference_dataset, reward_model_batch_size, self.rng
-                )
+                self._rm_global_epochs += reward_model_train_steps
+                if rm_metrics:
+                    rm_metrics["reward_model/accuracy"] = self.reward_model.accuracy(
+                        self.preference_dataset, reward_model_batch_size, self.rng
+                    )
+                    rm_metrics["reward_model/dataset_size"] = len(self.preference_dataset)
+                    rm_metrics["reward_model/global_epochs"] = self._rm_global_epochs
+            else:
+                rm_metrics = {}
 
-            # 4. Train policy
+            # 4. Train policy; flush captured metrics to wandb after training.
             if self.agent.replay_buffer.size() >= self.agent.batch_size:
                 self.agent.train(
                     gradient_steps=n_policy_train_steps,
                     batch_size=self.agent.batch_size,
                 )
+                self._agent_logger.flush_to_wandb(fallback_step=total_steps)
 
             # 5. Log
-            if iteration % log_interval == 0:
-                metrics = {
-                    **rm_metrics,
-                    "train/total_timesteps": total_steps,
-                    "train/iteration": iteration,
-                    "train/n_preferences": len(self.preference_dataset),
-                }
-                self.logger.log(metrics, step=total_steps)
+                # Reward model metrics (x-axis: global_epochs)
+                if rm_metrics:
+                    self.logger.log(rm_metrics)
+
+                # Rollout metrics (x-axis: iteration)
+                rollout_log = self._compute_rollout_metrics(
+                    trajectories, rollout_stats, iteration
+                )
+                if rollout_log:
+                    self.logger.log(rollout_log)
+
                 self._print_progress(iteration, total_steps, rm_metrics)
 
             iteration += 1
@@ -276,12 +312,14 @@ class ChristianoAlgorithm:
             f"{len(self.preference_dataset)} preferences..."
         )
         # Use 5x more gradient steps for initial training to get a good starting point
+        pretrain_steps = reward_model_train_steps * 5
         metrics = self.reward_model.train(
             self.preference_dataset,
-            n_steps=reward_model_train_steps * 5,
+            n_steps=pretrain_steps,
             batch_size=reward_model_batch_size,
             rng=self.rng,
         )
+        self._rm_global_epochs += pretrain_steps
 
         if metrics:
             acc = self.reward_model.accuracy(
@@ -292,8 +330,12 @@ class ChristianoAlgorithm:
                 f"accuracy={acc:.3f}"
             )
             self.logger.log(
-                {**metrics, "reward_model/accuracy": acc, "train/total_timesteps": 0},
-                step=0,
+                {
+                    **metrics,
+                    "reward_model/accuracy": acc,
+                    "reward_model/dataset_size": len(self.preference_dataset),
+                    "reward_model/global_epochs": self._rm_global_epochs,
+                }
             )
 
     def _collect_raw_trajectories(self, n_steps_per_env: int) -> List[Trajectory]:
@@ -302,41 +344,52 @@ class ChristianoAlgorithm:
         Records transitions with TRUE rewards but does NOT add to replay buffer.
         Updates self.agent._last_obs.
         """
-        obs, trajectories, completed = self._rollout_loop(
+        obs, trajectories, completed, _ = self._rollout_loop(
             n_steps_per_env, add_to_buffer=False
         )
         self.agent._last_obs = obs
         return completed
 
-    def _collect_rollout(self, n_steps_per_env: int) -> List[Trajectory]:
+    def _collect_rollout(
+        self, n_steps_per_env: int
+    ) -> Tuple[List[Trajectory], Dict[str, float]]:
         """
         Step through the env for n_steps_per_env steps per environment.
         Stores transitions in the agent's replay buffer with PREDICTED rewards.
         Returns trajectories with TRUE rewards for preference generation.
         Updates self.agent._last_obs.
         """
-        obs, trajectories, completed = self._rollout_loop(
+        obs, _, completed, stats = self._rollout_loop(
             n_steps_per_env, add_to_buffer=True
         )
         self.agent._last_obs = obs
         self.agent.num_timesteps += n_steps_per_env * self.env.num_envs
-        return completed
+        return completed, stats
 
     def _rollout_loop(
         self, n_steps_per_env: int, add_to_buffer: bool
-    ) -> Tuple[np.ndarray, List[Trajectory], List[Trajectory]]:
+    ) -> Tuple[np.ndarray, List[Trajectory], List[Trajectory], Dict[str, float]]:
         """
         Core loop used by both _collect_raw_trajectories and _collect_rollout.
 
-        Returns (final_obs, active_trajectories, completed_trajectories).
+        Returns (final_obs, active_trajectories, completed_trajectories, stats).
         Completed trajectories are those that ended (done=True) or, for partial
         ones, that reached at least segment_length transitions.
+        stats contains ``mean_model_reward`` (mean predicted reward per step)
+        when add_to_buffer=True.
         """
         n_envs = self.env.num_envs
         obs = self.agent._last_obs
 
         active_trajs: List[Trajectory] = [Trajectory() for _ in range(n_envs)]
         completed: List[Trajectory] = []
+        model_reward_sum = 0.0
+        model_reward_count = 0
+        n_episodes = 0
+        n_collisions = 0
+        n_off_road = 0
+        n_timeouts = 0
+        n_successes = 0
 
         for _ in range(n_steps_per_env):
             actions, _ = self.agent.predict(obs, deterministic=False)
@@ -354,12 +407,22 @@ class ChristianoAlgorithm:
                 if dones[i]:
                     completed.append(active_trajs[i])
                     active_trajs[i] = Trajectory()
+                    if _HAS_EGO_STATUS:
+                        ego_status = infos[i].get("ego_status")
+                        if ego_status is not None:
+                            n_episodes += 1
+                            n_collisions += int(ego_status == EgoStatus.COLLIDED.value)
+                            n_off_road  += int(ego_status == EgoStatus.OFF_ROAD.value)
+                            n_timeouts  += int(ego_status == EgoStatus.TIMEOUT.value)
+                            n_successes += int(ego_status == EgoStatus.ARRIVED.value)
 
             if add_to_buffer:
                 predicted_rewards = self.reward_model.predict_reward(obs, actions)
                 self.agent.replay_buffer.add(
                     obs, next_obs, actions, predicted_rewards, dones, infos
                 )
+                model_reward_sum += float(np.sum(predicted_rewards))
+                model_reward_count += n_envs
 
             obs = next_obs
 
@@ -368,7 +431,60 @@ class ChristianoAlgorithm:
             if len(traj) >= self.segment_length:
                 completed.append(traj)
 
-        return obs, active_trajs, completed
+        stats: Dict[str, float] = {}
+        if model_reward_count > 0:
+            stats["mean_model_reward"] = model_reward_sum / model_reward_count
+        if n_episodes > 0:
+            stats["event_rate/collisions"] = n_collisions / n_episodes
+            stats["event_rate/off_road"]   = n_off_road   / n_episodes
+            stats["event_rate/timeouts"]   = n_timeouts   / n_episodes
+            stats["event_rate/successes"]  = n_successes  / n_episodes
+
+        return obs, active_trajs, completed, stats
+
+    def _compute_rollout_metrics(
+        self,
+        trajectories: List[Trajectory],
+        rollout_stats: Dict[str, float],
+        iteration: int,
+    ) -> Dict[str, float]:
+        """
+        Update sliding-window buffers and return smoothed rollout metrics.
+
+        true_reward and ep_length windows are updated per-episode (appending
+        one value per completed episode).  model_reward window is updated
+        per-iteration (one mean-per-step value per rollout).
+        """
+        done_trajs = [
+            t for t in trajectories
+            if t.transitions and t.transitions[-1].done
+        ]
+        for traj in done_trajs:
+            ep_return = sum(tr.true_reward for tr in traj.transitions)
+            self._window_true_rewards.append(ep_return)
+            self._window_ep_lengths.append(float(len(traj)))
+
+        if "mean_model_reward" in rollout_stats:
+            self._window_model_rewards.append(rollout_stats["mean_model_reward"])
+
+        metrics: Dict[str, float] = {"rollout/iteration": float(iteration)}
+        if self._window_true_rewards:
+            metrics["rollout/smoothed_true_reward"] = float(
+                np.mean(self._window_true_rewards)
+            )
+        if self._window_ep_lengths:
+            metrics["rollout/smoothed_ep_length"] = float(
+                np.mean(self._window_ep_lengths)
+            )
+        if self._window_model_rewards:
+            metrics["rollout/smoothed_model_reward"] = float(
+                np.mean(self._window_model_rewards)
+            )
+        for event_key in ("event_rate/collisions", "event_rate/off_road",
+                          "event_rate/timeouts", "event_rate/successes"):
+            if event_key in rollout_stats:
+                metrics[f"rollout/{event_key}"] = rollout_stats[event_key]
+        return metrics
 
     @staticmethod
     def _print_progress(
