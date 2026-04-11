@@ -1,177 +1,219 @@
+from typing import Dict, List
+
 import numpy as np
 import torch
 import torch.nn as nn
 
-from .core import Segment
+from .core import Preference, PreferenceDataset
 
-
-# ---------------------------------------------------------------------------
-# Ego status encoding
-# ---------------------------------------------------------------------------
-
-STATUS_ORDER = ["running", "arrived", "collided", "off_road"]
-
-
-def encode_ego_status(status_str: str) -> np.ndarray:
-    """One-hot encode ego_status string → float32 array of shape (4,)."""
-    vec = np.zeros(4, dtype=np.float32)
-    if status_str in STATUS_ORDER:
-        vec[STATUS_ORDER.index(status_str)] = 1.0
-    return vec
-
-
-# ---------------------------------------------------------------------------
-# Reward network
-# ---------------------------------------------------------------------------
 
 class RewardNet(nn.Module):
-    def __init__(self, obs_dim, action_dim, info_dim, hidden_dim=128):
-        super().__init__()
-        input_dim = obs_dim + action_dim + info_dim
+    """
+    MLP reward model mapping (obs, action) -> scalar reward.
 
+    Architecture follows Christiano et al. 2017: two hidden layers with
+    tanh activations. Tanh is used instead of ReLU for smoother gradients
+    and bounded pre-activations.
+    """
+
+    def __init__(self, obs_dim: int, action_dim: int, hidden_size: int = 256):
+        super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(obs_dim + action_dim, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1),
         )
 
-    def forward(self, obs: torch.Tensor, action_enc: torch.Tensor, info: torch.Tensor) -> torch.Tensor:
+    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            obs        : (B, obs_dim)
-            action_enc : (B, action_dim)  one-hot if discrete, raw if continuous
-            info       : (B, info_dim)    one-hot ego_status
+            obs:    (batch, obs_dim)
+            action: (batch, action_dim)
         Returns:
-            rewards    : (B,)
+            reward: (batch,)
         """
-        x = torch.cat([obs, action_enc, info], dim=-1)
+        x = torch.cat([obs, action], dim=-1)
         return self.net(x).squeeze(-1)
 
 
-# ---------------------------------------------------------------------------
-# Ensemble reward model
-# ---------------------------------------------------------------------------
-
 class EnsembleRewardModel:
     """
-    Ensemble of K independent RewardNets.
+    Ensemble of RewardNets trained with the Bradley-Terry preference model.
 
-    Supports both discrete actions (one-hot encoded) and continuous actions
-    (passed through as-is). Set discrete_actions=False for continuous spaces.
+    Loss for a preference (σ1, σ2, μ):
+        R1 = Σ_t r̂(o_t^1, a_t^1)
+        R2 = Σ_t r̂(o_t^2, a_t^2)
+        loss = BCE(R1 - R2, μ)          [binary cross-entropy with logits]
+
+    where μ=1 means σ1 is preferred, μ=0 means σ2 is preferred, μ=0.5 is a tie.
+
+    Each network in the ensemble is trained on independent random mini-batches,
+    following the procedure from the paper.
     """
 
     def __init__(
         self,
         obs_dim: int,
         action_dim: int,
-        n_ensembles: int,
-        lr: float = 2e-4,
-        hidden_dim: int = 64,
-        info_dim: int = 4,
+        n_networks: int = 3,
+        hidden_size: int = 256,
+        lr: float = 3e-4,
+        l2_reg: float = 1e-4,
         device: str = "cpu",
-        discrete_actions: bool = True,
     ):
         self.obs_dim = obs_dim
         self.action_dim = action_dim
-        self.n_ensembles = n_ensembles
-        self.info_dim = info_dim
+        self.n_networks = n_networks
         self.device = torch.device(device)
-        self.discrete_actions = discrete_actions
 
-        self.nets = [
-            RewardNet(obs_dim, action_dim, info_dim, hidden_dim).to(self.device)
-            for _ in range(n_ensembles)
+        self.networks: List[RewardNet] = [
+            RewardNet(obs_dim, action_dim, hidden_size).to(self.device)
+            for _ in range(n_networks)
         ]
         self.optimizers = [
-            torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
-            for net in self.nets
+            torch.optim.Adam(net.parameters(), lr=lr, weight_decay=l2_reg)
+            for net in self.networks
         ]
 
+        for net in self.networks:
+            net.eval()
+
     # ------------------------------------------------------------------
-    # Encoding helpers
+    # Public API
     # ------------------------------------------------------------------
 
-    def _encode_actions(self, actions: np.ndarray) -> torch.Tensor:
+    def predict_reward(self, obs: np.ndarray, action: np.ndarray) -> np.ndarray:
         """
-        Encode actions for network input.
-        Discrete: one-hot vector of shape (B, action_dim).
-        Continuous: raw float array of shape (B, action_dim).
-        """
-        if self.discrete_actions:
-            actions = np.asarray(actions, dtype=np.int64).reshape(-1)
-            enc = np.zeros((len(actions), self.action_dim), dtype=np.float32)
-            enc[np.arange(len(actions)), actions] = 1.0
-            return torch.as_tensor(enc, device=self.device)
-        else:
-            return torch.as_tensor(
-                np.asarray(actions, dtype=np.float32).reshape(-1, self.action_dim),
-                device=self.device,
-            )
-
-    def _obs_tensor(self, obs: np.ndarray) -> torch.Tensor:
-        return torch.as_tensor(np.asarray(obs, dtype=np.float32), device=self.device)
-
-    def _info_tensor(self, info: np.ndarray, batch_size: int) -> torch.Tensor:
-        """Convert info array to tensor. Uses zeros if info is None."""
-        if info is None:
-            return torch.zeros(batch_size, self.info_dim, device=self.device)
-        return torch.as_tensor(np.asarray(info, dtype=np.float32), device=self.device)
-
-    def _forward_all(self, obs: np.ndarray, actions: np.ndarray, info: np.ndarray = None) -> torch.Tensor:
-        """Run all ensemble members. Returns (n_ensembles, B) tensor. No grad."""
-        obs_t = self._obs_tensor(obs)
-        act_t = self._encode_actions(actions)
-        info_t = self._info_tensor(info, obs_t.shape[0])
-        with torch.no_grad():
-            return torch.stack([net(obs_t, act_t, info_t) for net in self.nets])
-
-    # ------------------------------------------------------------------
-    # Inference
-    # ------------------------------------------------------------------
-
-    def predict(self, obs: np.ndarray, actions: np.ndarray, pessimism: float = 0.0, info: np.ndarray = None) -> np.ndarray:
-        """Mean reward across ensemble, optionally penalized by ensemble std.
+        Predict reward as mean across ensemble.
 
         Args:
-            pessimism: If > 0, returns mean - pessimism * std. This penalizes
-                       states where ensemble members disagree (OOD regions),
-                       reducing reward hacking by the policy.
-            info: (B, info_dim) one-hot ego_status array. Zeros if None.
+            obs:    (batch, obs_dim) or (obs_dim,)
+            action: (batch, action_dim) or (action_dim,)
         Returns:
-            (B,) float32 array of predicted rewards.
+            reward: (batch,) or scalar float
         """
-        all_preds = self._forward_all(obs, actions, info)  # (n_ensembles, B)
-        mean = all_preds.mean(dim=0)
-        if pessimism > 0.0:
-            std = all_preds.std(dim=0)
-            return (mean - pessimism * std).cpu().numpy()
-        return mean.cpu().numpy()
+        scalar_input = obs.ndim == 1
+        if scalar_input:
+            obs = obs[np.newaxis]
+            action = action[np.newaxis]
 
-    def ensemble_variance(self, obs: np.ndarray, actions: np.ndarray, info: np.ndarray = None) -> np.ndarray:
-        """Variance of predictions across ensemble members, shape (B,)."""
-        return self._forward_all(obs, actions, info).var(dim=0).cpu().numpy()
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        act_t = torch.tensor(action, dtype=torch.float32, device=self.device)
+
+        with torch.no_grad():
+            preds = np.stack(
+                [net(obs_t, act_t).cpu().numpy() for net in self.networks]
+            )  # (n_networks, batch)
+
+        mean_reward = preds.mean(axis=0)  # (batch,)
+        return float(mean_reward[0]) if scalar_input else mean_reward
+
+    def train(
+        self,
+        dataset: PreferenceDataset,
+        n_steps: int,
+        batch_size: int,
+        rng: np.random.Generator,
+    ) -> Dict[str, float]:
+        """
+        Train each network independently for n_steps gradient steps.
+
+        Each network samples its own random mini-batch from the dataset at every
+        step, following the independent training procedure in the paper.
+
+        Returns:
+            dict with training metrics (average loss across networks).
+        """
+        if len(dataset) < batch_size:
+            return {}
+
+        total_loss = 0.0
+
+        for net, optimizer in zip(self.networks, self.optimizers):
+            net.train()
+            net_loss = 0.0
+            for _ in range(n_steps):
+                batch = dataset.sample(batch_size, rng)
+                optimizer.zero_grad()
+                loss = self._preference_loss(net, batch)
+                loss.backward()
+                optimizer.step()
+                net_loss += loss.item()
+            net.eval()
+            total_loss += net_loss / n_steps
+
+        return {"reward_model/loss": total_loss / self.n_networks}
+
+    def accuracy(
+        self,
+        dataset: PreferenceDataset,
+        batch_size: int,
+        rng: np.random.Generator,
+    ) -> float:
+        """
+        Fraction of non-tie preferences correctly predicted by the ensemble mean.
+        Returns nan if there are no non-tie samples in the batch.
+        """
+        if len(dataset) < batch_size:
+            return float("nan")
+
+        batch = dataset.sample(batch_size, rng)
+        non_tie = [p for p in batch if p.label != 0.5]
+        if not non_tie:
+            return float("nan")
+
+        correct = 0
+        for pref in non_tie:
+            r1 = self._segment_return(pref.seg1.obs, pref.seg1.actions)
+            r2 = self._segment_return(pref.seg2.obs, pref.seg2.actions)
+            predicted = 1.0 if r1 > r2 else 0.0
+            if predicted == pref.label:
+                correct += 1
+
+        return correct / len(non_tie)
 
     # ------------------------------------------------------------------
-    # Differentiable segment returns (used by trainer)
+    # Private helpers
     # ------------------------------------------------------------------
 
-    def segment_returns(self, segment: Segment, ensemble_idx: int) -> torch.Tensor:
+    def _segment_return(self, obs: np.ndarray, actions: np.ndarray) -> float:
+        """Sum of predicted rewards over a segment, averaged across ensemble."""
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        act_t = torch.tensor(actions, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            total = sum(
+                net(obs_t, act_t).sum().item() for net in self.networks
+            )
+        return total / self.n_networks
+
+    def _preference_loss(
+        self,
+        net: RewardNet,
+        batch: List[Preference],
+    ) -> torch.Tensor:
         """
-        Sum of predicted rewards over a segment for ensemble member `ensemble_idx`.
-        Differentiable — used inside the training loss.
+        Bradley-Terry cross-entropy loss for a batch of preferences.
+
+        logit = R1 - R2  where R_i = Σ_t r̂(o_t^i, a_t^i)
+        loss  = BCE_with_logits(logit, μ)
         """
-        obs = np.stack([t.obs for t in segment.transitions])
-        actions = np.array([t.action for t in segment.transitions])
-        info = np.stack([
-            encode_ego_status(t.info.get("ego_status", "running"))
-            if t.info is not None else np.zeros(self.info_dim, dtype=np.float32)
-            for t in segment.transitions
-        ])
-        obs_t = self._obs_tensor(obs)
-        act_t = self._encode_actions(actions)
-        info_t = torch.as_tensor(info, device=self.device)
-        return self.nets[ensemble_idx](obs_t, act_t, info_t).sum()
+        logits, labels = [], []
+
+        for pref in batch:
+            obs1 = torch.tensor(pref.seg1.obs, dtype=torch.float32, device=self.device)
+            act1 = torch.tensor(pref.seg1.actions, dtype=torch.float32, device=self.device)
+            obs2 = torch.tensor(pref.seg2.obs, dtype=torch.float32, device=self.device)
+            act2 = torch.tensor(pref.seg2.actions, dtype=torch.float32, device=self.device)
+
+            r1 = net(obs1, act1).sum()
+            r2 = net(obs2, act2).sum()
+
+            logits.append(r1 - r2)
+            labels.append(pref.label)
+
+        logits_t = torch.stack(logits)
+        labels_t = torch.tensor(labels, dtype=torch.float32, device=self.device)
+
+        return nn.functional.binary_cross_entropy_with_logits(logits_t, labels_t)
