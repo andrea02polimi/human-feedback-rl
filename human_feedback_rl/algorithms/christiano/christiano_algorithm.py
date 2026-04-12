@@ -35,7 +35,6 @@ from human_feedback_rl.common import (
     EnsembleRewardModel,
     PreferenceDataset,
     PreferenceModelFromReward,
-    RunningMeanStd,
     SB3MetricsLogger,
     SegmentPair,
     Trajectory,
@@ -155,9 +154,6 @@ class ChristianoAlgorithm:
 
         # Reward model gradient step counter (used as x-axis for rm/* metrics)
         self._rm_global_epochs: int = 0
-
-        # Running z-score normaliser for predicted rewards stored in the buffer
-        self._reward_rms = RunningMeanStd()
 
         # Sliding windows for rollout metrics (last N episodes / iterations)
         _w = 50
@@ -422,13 +418,9 @@ class ChristianoAlgorithm:
 
             if add_to_buffer:
                 predicted_rewards = self.reward_model.predict_reward(obs, actions)
-                # Update running stats with raw predictions, then normalize.
-                self._reward_rms.update(predicted_rewards)
-                normalized_rewards = self._reward_rms.normalize(predicted_rewards)
                 self.agent.replay_buffer.add(
-                    obs, next_obs, actions, normalized_rewards, dones, infos
+                    obs, next_obs, actions, predicted_rewards, dones, infos
                 )
-                # Track raw predicted reward for monitoring (pre-normalization).
                 model_reward_sum += float(np.sum(predicted_rewards))
                 model_reward_count += n_envs
 
