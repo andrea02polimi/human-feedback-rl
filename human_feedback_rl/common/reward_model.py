@@ -44,9 +44,9 @@ class RunningMeanStd:
         self.count = total_count
 
     def normalize(self, values: np.ndarray) -> np.ndarray:
-        """Apply z-score: (x - mean) / std, with numerical floor on std."""
+        """Normalize by std only: x / std. Preserves sign and absolute scale."""
         std = float(np.sqrt(max(self.var, 0.0))) + self.epsilon
-        return (np.asarray(values, dtype=np.float32) - self.mean) / std
+        return np.asarray(values, dtype=np.float32) / std
 
 
 class RewardNet(nn.Module):
