@@ -24,6 +24,48 @@ from typing import Callable, Deque, Dict, List, Tuple
 
 import numpy as np
 
+
+# ---------------------------------------------------------------------------
+# Running mean/std  (Welford's online algorithm)
+# ---------------------------------------------------------------------------
+
+
+class RunningMeanStd:
+    """
+    Online estimate of mean and variance using Welford's algorithm.
+    Used to compute running z-score normalization for predicted rewards.
+    """
+
+    def __init__(self, epsilon: float = 1e-8) -> None:
+        self.mean: float = 0.0
+        self.var: float = 1.0
+        self.count: int = 0
+        self.epsilon = epsilon
+
+    def update(self, values: np.ndarray) -> None:
+        """Update running statistics with a batch of scalar values."""
+        values = np.asarray(values, dtype=np.float64).ravel()
+        if values.size == 0:
+            return
+        batch_count = int(values.size)
+        batch_mean = float(np.mean(values))
+        batch_var = float(np.var(values))
+
+        total_count = self.count + batch_count
+        delta = batch_mean - self.mean
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta ** 2 * self.count * batch_count / total_count
+        self.mean = new_mean
+        self.var = m2 / total_count
+        self.count = total_count
+
+    def normalize(self, values: np.ndarray) -> np.ndarray:
+        """Apply z-score: (x - mean) / std, with numerical floor on std."""
+        std = float(np.sqrt(max(self.var, 0.0))) + self.epsilon
+        return (np.asarray(values, dtype=np.float32) - self.mean) / std
+
 try:
     from sumo_gym_ego import EgoStatus
     _HAS_EGO_STATUS = True
@@ -155,6 +197,9 @@ class ChristianoAlgorithm:
         # Reward model gradient step counter (used as x-axis for rm/* metrics)
         self._rm_global_epochs: int = 0
 
+        # Running z-score normaliser for predicted rewards stored in the buffer
+        self._reward_rms = RunningMeanStd()
+
         # Sliding windows for rollout metrics (last N episodes / iterations)
         _w = 50
         self._window_true_rewards: Deque[float] = deque(maxlen=_w)
@@ -236,7 +281,7 @@ class ChristianoAlgorithm:
                 for pref in self.gatherer.gather(pairs):
                     self.preference_dataset.add(pref)
 
-            # 3. Train reward model
+            # 3. Train reward model; then relabel the full replay buffer.
             if len(self.preference_dataset) >= reward_model_batch_size:
                 rm_metrics = self.reward_model.train(
                     self.preference_dataset,
@@ -245,6 +290,7 @@ class ChristianoAlgorithm:
                     rng=self.rng,
                 )
                 self._rm_global_epochs += reward_model_train_steps
+                self._relabel_replay_buffer()
                 if rm_metrics:
                     rm_metrics["reward_model/accuracy"] = self.reward_model.accuracy(
                         self.preference_dataset, reward_model_batch_size, self.rng
@@ -418,9 +464,13 @@ class ChristianoAlgorithm:
 
             if add_to_buffer:
                 predicted_rewards = self.reward_model.predict_reward(obs, actions)
+                # Update running stats with raw predictions, then normalize.
+                self._reward_rms.update(predicted_rewards)
+                normalized_rewards = self._reward_rms.normalize(predicted_rewards)
                 self.agent.replay_buffer.add(
-                    obs, next_obs, actions, predicted_rewards, dones, infos
+                    obs, next_obs, actions, normalized_rewards, dones, infos
                 )
+                # Track raw predicted reward for monitoring (pre-normalization).
                 model_reward_sum += float(np.sum(predicted_rewards))
                 model_reward_count += n_envs
 
@@ -441,6 +491,52 @@ class ChristianoAlgorithm:
             stats["event_rate/successes"]  = n_successes  / n_episodes
 
         return obs, active_trajs, completed, stats
+
+    def _relabel_replay_buffer(self, batch_size: int = 4096) -> None:
+        """
+        Re-predict rewards for every transition in the replay buffer using the
+        current (updated) reward model, then overwrite ``replay_buffer.rewards``
+        with z-score-normalised values.
+
+        The running normaliser ``_reward_rms`` is NOT updated here: it was
+        already updated with fresh rollout predictions this iteration, so the
+        relabeling simply re-normalises using the current mean/std without
+        double-counting.
+
+        SB3's ReplayBuffer stores data with shape
+            observations : (buffer_size, n_envs, obs_dim)
+            actions      : (buffer_size, n_envs, action_dim)
+            rewards      : (buffer_size, n_envs)
+        where ``pos`` is the write pointer and ``full`` signals a wrapped buffer.
+        """
+        buf = self.agent.replay_buffer
+        n_valid = buf.buffer_size if buf.full else buf.pos
+        if n_valid == 0:
+            return
+
+        n_envs = buf.n_envs
+        obs_dim = buf.observations.shape[-1]
+        act_dim = buf.actions.shape[-1]
+
+        # Flatten (n_valid, n_envs, dim) → (n_valid * n_envs, dim)
+        obs_flat = buf.observations[:n_valid].reshape(-1, obs_dim)
+        act_flat = buf.actions[:n_valid].reshape(-1, act_dim)
+        n_total = obs_flat.shape[0]
+
+        # Predict in batches to keep GPU/CPU memory bounded
+        raw_rewards = np.empty(n_total, dtype=np.float32)
+        for start in range(0, n_total, batch_size):
+            end = min(start + batch_size, n_total)
+            raw_rewards[start:end] = self.reward_model.predict_reward(
+                obs_flat[start:end], act_flat[start:end]
+            )
+
+        # Normalise using current running stats (no rms update)
+        std = float(np.sqrt(max(self._reward_rms.var, 0.0))) + self._reward_rms.epsilon
+        norm_rewards = (raw_rewards - self._reward_rms.mean) / std
+
+        # Overwrite rewards in-place; reshape back to (n_valid, n_envs)
+        buf.rewards[:n_valid] = norm_rewards.reshape(n_valid, n_envs)
 
     def _compute_rollout_metrics(
         self,
