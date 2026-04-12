@@ -9,7 +9,7 @@ from .core import (
 from .fragmenters import ActiveFragmenter
 from .loggers import PrefixLogger, SB3MetricsLogger, UnifiedLogger, setup_wandb_axes
 from .preference_model import PreferenceModelFromReward
-from .reward_model import EnsembleRewardModel, RewardNet
+from .reward_model import EnsembleRewardModel, RewardNet, RunningMeanStd
 
 __all__ = [
     # Core data structures
@@ -22,6 +22,7 @@ __all__ = [
     # Reward model
     "RewardNet",
     "EnsembleRewardModel",
+    "RunningMeanStd",
     # Preference generation
     "PreferenceModelFromReward",
     # Segment sampling

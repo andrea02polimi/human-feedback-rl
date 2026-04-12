@@ -2,6 +2,22 @@
 Deep RL from Human Preferences  –  Christiano et al., 2017
 https://arxiv.org/abs/1706.03741
 
+On-policy variant using PPO as the base RL algorithm.
+
+The original paper used on-policy methods (TRPO / A3C). This implementation
+reproduces the same preference-based reward learning loop with PPO (SB3),
+and serves as a comparison baseline against the off-policy SAC variant.
+
+Key differences from the SAC version:
+  - RolloutBuffer instead of ReplayBuffer: data is collected fresh each
+    iteration and discarded after the policy update.
+  - No replay buffer relabeling: the buffer is always current-iteration data,
+    so re-labeling after RM training is not needed.
+  - policy.forward() is called manually to obtain (actions, values, log_probs)
+    required by the rollout buffer before compute_returns_and_advantage().
+  - n_policy_train_steps is not a parameter: PPO runs a fixed number of epochs
+    over the rollout buffer internally (controlled by PPO's n_epochs).
+
 Training loop
 ─────────────
 Pre-training phase:
@@ -10,25 +26,29 @@ Pre-training phase:
   3. Pre-train the reward model on those preferences.
 
 Main loop (repeated until total_timesteps is reached):
-  1. Collect n_rollout_steps transitions per environment using the current policy.
-     Transitions are stored in the agent's replay buffer with PREDICTED rewards.
-     True rewards are kept in memory for preference generation.
-  2. Sample n_queries segment pairs; get synthetic preference labels.
-  3. Train the reward model for reward_model_train_steps gradient steps.
-  4. Train the policy for n_policy_train_steps gradient steps.
-  5. Log metrics to wandb.
+  1. Collect n_rollout_steps transitions per environment using the current
+     policy. Transitions are stored in the agent's rollout buffer with
+     PREDICTED rewards. True rewards are kept for preference generation.
+  2. compute_returns_and_advantage() from the last observation's value.
+  3. Sample n_queries segment pairs; get synthetic preference labels.
+  4. Train the reward model for reward_model_train_steps gradient steps.
+  5. Train the policy (PPO update on the rollout buffer).
+  6. Log metrics to wandb.
 """
 
 from collections import deque
 from typing import Callable, Deque, Dict, List, Tuple
 
 import numpy as np
+import torch
 
 try:
     from sumo_gym_ego import EgoStatus
     _HAS_EGO_STATUS = True
 except ImportError:
     _HAS_EGO_STATUS = False
+
+from stable_baselines3.common.utils import obs_as_tensor
 
 from human_feedback_rl.common import (
     ActiveFragmenter,
@@ -47,15 +67,12 @@ from human_feedback_rl.common.core import Preference
 
 
 # ---------------------------------------------------------------------------
-# Synthetic preference gatherer
+# Synthetic preference gatherer  (identical to SAC version)
 # ---------------------------------------------------------------------------
 
 
 class SyntheticGatherer:
-    """
-    Generates preference labels from the true environment reward.
-    Serves as a drop-in replacement for a human annotator.
-    """
+    """Generates preference labels from the true environment reward."""
 
     def __init__(self):
         self._oracle = PreferenceModelFromReward()
@@ -65,13 +82,11 @@ class SyntheticGatherer:
 
 
 # ---------------------------------------------------------------------------
-# Query schedules
+# Query schedules  (identical to SAC version)
 # ---------------------------------------------------------------------------
 
 QUERY_SCHEDULES: Dict[str, Callable[[int, int], int]] = {
-    # n_queries is constant throughout training
     "constant": lambda n_queries, t: n_queries,
-    # n_queries decays as 1/(t+1); useful to concentrate queries early
     "inverse": lambda n_queries, t: max(1, n_queries // (t + 1)),
 }
 
@@ -81,21 +96,21 @@ QUERY_SCHEDULES: Dict[str, Callable[[int, int], int]] = {
 # ---------------------------------------------------------------------------
 
 
-class ChristianoAlgorithm:
+class ChristianoPPOAlgorithm:
     """
-    Implements Deep RL from Human Preferences (Christiano et al., 2017).
+    Implements Deep RL from Human Preferences (Christiano et al., 2017)
+    using PPO as the base policy algorithm.
 
-    The algorithm learns a reward model from pairwise human preferences over
-    short trajectory segments, then trains a policy with RL using the learned
-    reward. Here human preferences are approximated synthetically using the
-    true environment reward.
+    Designed as a self-contained comparison against ChristianoAlgorithm
+    (SAC-based). Shares the same reward model, preference dataset, and
+    logging infrastructure; differs only in how the policy is trained.
 
     Parameters
     ----------
     env : VecEnv
-        Vectorised environment (e.g. from sre.make_vec_env).
-    agent : stable_baselines3.SAC (or compatible off-policy algorithm)
-        RL policy that exposes predict(), replay_buffer, and train().
+        Vectorised environment.
+    agent : stable_baselines3.PPO
+        PPO policy with a RolloutBuffer.
     rng : np.random.Generator
         Random number generator for reproducibility.
     reward_model_n_networks : int
@@ -105,15 +120,15 @@ class ChristianoAlgorithm:
     reward_model_lr : float
         Learning rate for reward model optimizers.
     reward_model_l2 : float
-        L2 regularisation weight for reward model parameters.
+        L2 regularisation weight.
     segment_length : int
-        Length k of each trajectory segment used for preference queries.
+        Length of each trajectory segment used for preference queries.
     preference_dataset_max_size : int
-        Maximum number of preferences stored in the dataset (circular buffer).
+        Maximum preferences stored (circular buffer).
     query_schedule : str
-        Key into QUERY_SCHEDULES; controls how many queries are made per iter.
+        Key into QUERY_SCHEDULES.
     device : str
-        PyTorch device for reward model tensors ('cpu' or 'cuda').
+        PyTorch device for reward model tensors.
     """
 
     def __init__(
@@ -153,13 +168,13 @@ class ChristianoAlgorithm:
         self.query_schedule_fn = QUERY_SCHEDULES[query_schedule]
         self.logger = UnifiedLogger(use_wandb=True)
 
-        # Reward model gradient step counter (used as x-axis for rm/* metrics)
+        # Reward model gradient step counter (x-axis for rm/* metrics)
         self._rm_global_epochs: int = 0
 
-        # Running z-score normaliser for predicted rewards stored in the buffer
+        # Running z-score normaliser for predicted rewards
         self._reward_rms = RunningMeanStd()
 
-        # Sliding windows for rollout metrics (last N episodes / iterations)
+        # Sliding windows for rollout metrics
         _w = 50
         self._window_true_rewards: Deque[float] = deque(maxlen=_w)
         self._window_ep_lengths: Deque[float] = deque(maxlen=_w)
@@ -173,42 +188,35 @@ class ChristianoAlgorithm:
         self,
         total_timesteps: int,
         n_initial_queries: int = 200,
-        n_rollout_steps: int = 2000,
+        n_rollout_steps: int = 2048,
         n_queries_per_iter: int = 10,
         reward_model_train_steps: int = 200,
         reward_model_batch_size: int = 64,
-        n_policy_train_steps: int = 1000,
     ) -> None:
         """
-        Run the full Christiano training loop.
+        Run the full Christiano training loop with PPO.
 
         Parameters
         ----------
         total_timesteps : int
-            Total number of environment steps for the main loop.
+            Total environment steps for the main loop.
         n_initial_queries : int
-            Number of preference queries for reward model pre-training.
+            Preference queries for reward model pre-training.
         n_rollout_steps : int
             Environment steps collected per iteration, per environment.
+            Should match (or be a multiple of) PPO's n_steps.
         n_queries_per_iter : int
-            Base number of preference queries per iteration (may decay with schedule).
+            Base number of preference queries per iteration.
         reward_model_train_steps : int
             Gradient steps on the reward model per iteration.
         reward_model_batch_size : int
             Mini-batch size for reward model training.
-        n_policy_train_steps : int
-            Gradient steps on the policy per iteration.
         """
-        # Initialise SB3 internals (logger, _last_obs, num_timesteps, …)
+        # Initialise SB3 internals (rollout buffer, logger, _last_obs, …)
         total_timesteps, _ = self.agent._setup_learn(total_timesteps)
 
         # ── Wandb setup ────────────────────────────────────────────────
-        # Define per-group x-axes before any logging happens.
         setup_wandb_axes()
-
-        # Replace SB3's logger so that agent.train() metrics can be forwarded
-        # to wandb.  set_logger() is the public API; fall back to _logger for
-        # versions where the property has no setter.
         self._agent_logger = SB3MetricsLogger()
         try:
             self.agent.set_logger(self._agent_logger)
@@ -229,7 +237,7 @@ class ChristianoAlgorithm:
         print(f"Starting main loop (total_timesteps={total_timesteps})...")
 
         while total_steps < total_timesteps:
-            # 1. Collect rollout; add to replay buffer with predicted rewards
+            # 1. Collect rollout into PPO's rollout buffer with predicted rewards
             trajectories, rollout_stats = self._collect_rollout(n_rollout_steps)
             total_steps += n_rollout_steps * self.env.num_envs
 
@@ -240,7 +248,7 @@ class ChristianoAlgorithm:
                 for pref in self.gatherer.gather(pairs):
                     self.preference_dataset.add(pref)
 
-            # 3. Train reward model.
+            # 3. Train reward model
             if len(self.preference_dataset) >= reward_model_batch_size:
                 rm_metrics = self.reward_model.train(
                     self.preference_dataset,
@@ -258,28 +266,21 @@ class ChristianoAlgorithm:
             else:
                 rm_metrics = {}
 
-            # 4. Train policy; flush captured metrics to wandb after training.
-            if self.agent.replay_buffer.size() >= self.agent.batch_size:
-                self.agent.train(
-                    gradient_steps=n_policy_train_steps,
-                    batch_size=self.agent.batch_size,
-                )
-                self._agent_logger.flush_to_wandb(fallback_step=total_steps)
+            # 4. Train policy (PPO update on the rollout buffer collected in step 1)
+            self.agent.train()
+            self._agent_logger.flush_to_wandb(fallback_step=total_steps)
 
             # 5. Log
-                # Reward model metrics (x-axis: global_epochs)
-                if rm_metrics:
-                    self.logger.log(rm_metrics)
+            if rm_metrics:
+                self.logger.log(rm_metrics)
 
-                # Rollout metrics (x-axis: iteration)
-                rollout_log = self._compute_rollout_metrics(
-                    trajectories, rollout_stats, iteration
-                )
-                if rollout_log:
-                    self.logger.log(rollout_log)
+            rollout_log = self._compute_rollout_metrics(
+                trajectories, rollout_stats, iteration
+            )
+            if rollout_log:
+                self.logger.log(rollout_log)
 
-                self._print_progress(iteration, total_steps, rm_metrics)
-
+            self._print_progress(iteration, total_steps, rm_metrics)
             iteration += 1
 
         print("Training complete.")
@@ -296,7 +297,7 @@ class ChristianoAlgorithm:
     ) -> None:
         """
         Collect initial segments and pre-train the reward model.
-        Does not add transitions to the replay buffer.
+        Does NOT fill the rollout buffer (no RL update during pre-training).
         """
         steps_needed = n_initial_queries * 2 * self.segment_length
         n_steps_per_env = int(np.ceil(steps_needed / self.env.num_envs))
@@ -315,7 +316,6 @@ class ChristianoAlgorithm:
             f"[Pre-training] Training reward model on "
             f"{len(self.preference_dataset)} preferences..."
         )
-        # Use 5x more gradient steps for initial training to get a good starting point
         pretrain_steps = reward_model_train_steps * 5
         metrics = self.reward_model.train(
             self.preference_dataset,
@@ -344,11 +344,10 @@ class ChristianoAlgorithm:
 
     def _collect_raw_trajectories(self, n_steps_per_env: int) -> List[Trajectory]:
         """
-        Step through the env for n_steps_per_env steps per environment.
-        Records transitions with TRUE rewards but does NOT add to replay buffer.
-        Updates self.agent._last_obs.
+        Step through the env without filling the rollout buffer.
+        Records Trajectory objects with true rewards for preference generation.
         """
-        obs, trajectories, completed, _ = self._rollout_loop(
+        obs, _, completed, _ = self._rollout_loop(
             n_steps_per_env, add_to_buffer=False
         )
         self.agent._last_obs = obs
@@ -358,11 +357,12 @@ class ChristianoAlgorithm:
         self, n_steps_per_env: int
     ) -> Tuple[List[Trajectory], Dict[str, float]]:
         """
-        Step through the env for n_steps_per_env steps per environment.
-        Stores transitions in the agent's replay buffer with PREDICTED rewards.
+        Fill PPO's rollout buffer with n_steps_per_env steps per environment.
+        Rewards stored are z-score-normalised PREDICTED rewards from the RM.
         Returns trajectories with TRUE rewards for preference generation.
-        Updates self.agent._last_obs.
         """
+        # Reset the rollout buffer before filling it for this iteration.
+        self.agent.rollout_buffer.reset()
         obs, _, completed, stats = self._rollout_loop(
             n_steps_per_env, add_to_buffer=True
         )
@@ -374,13 +374,16 @@ class ChristianoAlgorithm:
         self, n_steps_per_env: int, add_to_buffer: bool
     ) -> Tuple[np.ndarray, List[Trajectory], List[Trajectory], Dict[str, float]]:
         """
-        Core loop used by both _collect_raw_trajectories and _collect_rollout.
+        Core collection loop shared by pre-training and main loop.
+
+        When add_to_buffer=True, each step calls policy.forward() to obtain
+        (actions, values, log_probs) needed by the PPO rollout buffer, then
+        stores z-score-normalised predicted rewards.
+
+        When add_to_buffer=False, actions are sampled with predict() and no
+        buffer writes occur (lighter pre-training collection).
 
         Returns (final_obs, active_trajectories, completed_trajectories, stats).
-        Completed trajectories are those that ended (done=True) or, for partial
-        ones, that reached at least segment_length transitions.
-        stats contains ``mean_model_reward`` (mean predicted reward per step)
-        when add_to_buffer=True.
         """
         n_envs = self.env.num_envs
         obs = self.agent._last_obs
@@ -395,9 +398,29 @@ class ChristianoAlgorithm:
         n_timeouts = 0
         n_successes = 0
 
+        # episode_starts tracks whether the current obs is the first of an episode.
+        # Needed by RolloutBuffer for GAE boundary detection.
+        episode_starts = self.agent._last_episode_starts  # (n_envs,) bool
+
         for _ in range(n_steps_per_env):
-            actions, _ = self.agent.predict(obs, deterministic=False)
-            next_obs, true_rewards, dones, infos = self.env.step(actions)
+            if add_to_buffer:
+                # policy.forward() returns actions, values (V(s)), log_probs
+                # required by PPO's rollout buffer for advantage computation.
+                obs_tensor = obs_as_tensor(obs, self.agent.device)
+                with torch.no_grad():
+                    actions_t, values, log_probs = self.agent.policy.forward(obs_tensor)
+                actions = actions_t.cpu().numpy()
+                # Clip actions to the env's action space bounds.
+                clipped_actions = np.clip(
+                    actions,
+                    self.env.action_space.low,
+                    self.env.action_space.high,
+                )
+            else:
+                clipped_actions, _ = self.agent.predict(obs, deterministic=False)
+                actions = clipped_actions
+
+            next_obs, true_rewards, dones, infos = self.env.step(clipped_actions)
 
             for i in range(n_envs):
                 active_trajs[i].add(
@@ -425,16 +448,37 @@ class ChristianoAlgorithm:
                 # Update running stats with raw predictions, then normalize.
                 self._reward_rms.update(predicted_rewards)
                 normalized_rewards = self._reward_rms.normalize(predicted_rewards)
-                self.agent.replay_buffer.add(
-                    obs, next_obs, actions, normalized_rewards, dones, infos
+
+                # RolloutBuffer.add() signature:
+                #   add(obs, action, reward, episode_start, value, log_prob)
+                self.agent.rollout_buffer.add(
+                    obs,
+                    actions,
+                    normalized_rewards,
+                    episode_starts,
+                    values,
+                    log_probs,
                 )
-                # Track raw predicted reward for monitoring (pre-normalization).
+                # Track raw reward for monitoring.
                 model_reward_sum += float(np.sum(predicted_rewards))
                 model_reward_count += n_envs
 
+            episode_starts = dones
             obs = next_obs
 
-        # Include partial trajectories that are long enough for segment sampling
+        # Compute returns and advantages using the value of the last observation.
+        # This finalises the rollout buffer so PPO can call train().
+        if add_to_buffer:
+            obs_tensor = obs_as_tensor(obs, self.agent.device)
+            with torch.no_grad():
+                last_values = self.agent.policy.predict_values(obs_tensor)
+            self.agent.rollout_buffer.compute_returns_and_advantage(
+                last_values=last_values, dones=dones
+            )
+            # Persist episode_starts for the next iteration.
+            self.agent._last_episode_starts = episode_starts
+
+        # Include partial trajectories long enough for segment sampling.
         for traj in active_trajs:
             if len(traj) >= self.segment_length:
                 completed.append(traj)
@@ -450,65 +494,13 @@ class ChristianoAlgorithm:
 
         return obs, active_trajs, completed, stats
 
-    def _relabel_replay_buffer(self, batch_size: int = 4096) -> None:
-        """
-        Re-predict rewards for every transition in the replay buffer using the
-        current (updated) reward model, then overwrite ``replay_buffer.rewards``
-        with z-score-normalised values.
-
-        The running normaliser ``_reward_rms`` is NOT updated here: it was
-        already updated with fresh rollout predictions this iteration, so the
-        relabeling simply re-normalises using the current mean/std without
-        double-counting.
-
-        SB3's ReplayBuffer stores data with shape
-            observations : (buffer_size, n_envs, obs_dim)
-            actions      : (buffer_size, n_envs, action_dim)
-            rewards      : (buffer_size, n_envs)
-        where ``pos`` is the write pointer and ``full`` signals a wrapped buffer.
-        """
-        buf = self.agent.replay_buffer
-        n_valid = buf.buffer_size if buf.full else buf.pos
-        if n_valid == 0:
-            return
-
-        n_envs = buf.n_envs
-        obs_dim = buf.observations.shape[-1]
-        act_dim = buf.actions.shape[-1]
-
-        # Flatten (n_valid, n_envs, dim) → (n_valid * n_envs, dim)
-        obs_flat = buf.observations[:n_valid].reshape(-1, obs_dim)
-        act_flat = buf.actions[:n_valid].reshape(-1, act_dim)
-        n_total = obs_flat.shape[0]
-
-        # Predict in batches to keep GPU/CPU memory bounded
-        raw_rewards = np.empty(n_total, dtype=np.float32)
-        for start in range(0, n_total, batch_size):
-            end = min(start + batch_size, n_total)
-            raw_rewards[start:end] = self.reward_model.predict_reward(
-                obs_flat[start:end], act_flat[start:end]
-            )
-
-        # Normalise using current running stats (no rms update)
-        std = float(np.sqrt(max(self._reward_rms.var, 0.0))) + self._reward_rms.epsilon
-        norm_rewards = (raw_rewards - self._reward_rms.mean) / std
-
-        # Overwrite rewards in-place; reshape back to (n_valid, n_envs)
-        buf.rewards[:n_valid] = norm_rewards.reshape(n_valid, n_envs)
-
     def _compute_rollout_metrics(
         self,
         trajectories: List[Trajectory],
         rollout_stats: Dict[str, float],
         iteration: int,
     ) -> Dict[str, float]:
-        """
-        Update sliding-window buffers and return smoothed rollout metrics.
-
-        true_reward and ep_length windows are updated per-episode (appending
-        one value per completed episode).  model_reward window is updated
-        per-iteration (one mean-per-step value per rollout).
-        """
+        """Update sliding windows and return smoothed rollout metrics."""
         done_trajs = [
             t for t in trajectories
             if t.transitions and t.transitions[-1].done

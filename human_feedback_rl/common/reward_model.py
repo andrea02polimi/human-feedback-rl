@@ -7,6 +7,48 @@ import torch.nn as nn
 from .core import Preference, PreferenceDataset
 
 
+# ---------------------------------------------------------------------------
+# Running mean/std  (Welford's online algorithm)
+# ---------------------------------------------------------------------------
+
+
+class RunningMeanStd:
+    """
+    Online estimate of mean and variance using Welford's algorithm.
+    Used to compute running z-score normalization for predicted rewards.
+    """
+
+    def __init__(self, epsilon: float = 1e-8) -> None:
+        self.mean: float = 0.0
+        self.var: float = 1.0
+        self.count: int = 0
+        self.epsilon = epsilon
+
+    def update(self, values: np.ndarray) -> None:
+        """Update running statistics with a batch of scalar values."""
+        values = np.asarray(values, dtype=np.float64).ravel()
+        if values.size == 0:
+            return
+        batch_count = int(values.size)
+        batch_mean = float(np.mean(values))
+        batch_var = float(np.var(values))
+
+        total_count = self.count + batch_count
+        delta = batch_mean - self.mean
+        new_mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta ** 2 * self.count * batch_count / total_count
+        self.mean = new_mean
+        self.var = m2 / total_count
+        self.count = total_count
+
+    def normalize(self, values: np.ndarray) -> np.ndarray:
+        """Apply z-score: (x - mean) / std, with numerical floor on std."""
+        std = float(np.sqrt(max(self.var, 0.0))) + self.epsilon
+        return (np.asarray(values, dtype=np.float32) - self.mean) / std
+
+
 class RewardNet(nn.Module):
     """
     MLP reward model mapping (obs, action) -> scalar reward.
