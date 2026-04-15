@@ -4,14 +4,14 @@ https://arxiv.org/abs/1706.03741
 
 Training loop
 ─────────────
-Pre-training phase:
+Pre-training phase (same for on and off policy algorithms):
   1. Collect initial segments using the current (randomly initialised) policy.
   2. Generate synthetic preferences from the true environment reward.
   3. Pre-train the reward model on those preferences.
 
 Main loop (repeated until total_timesteps is reached):
   1. Collect n_rollout_steps transitions per environment using the current policy.
-     Transitions are stored in the agent's replay buffer with PREDICTED rewards.
+     Transitions are stored in the agent's replay buffer/rollout buffer with PREDICTED rewards.
      True rewards are kept in memory for preference generation.
   2. Sample n_queries segment pairs; get synthetic preference labels.
   3. Train the reward model for reward_model_train_steps gradient steps.
@@ -23,6 +23,8 @@ from collections import deque
 from typing import Callable, Deque, Dict, List, Tuple
 
 import numpy as np
+
+from stable_baselines3.common.type_aliases import TrainFrequencyUnit
 
 try:
     from sumo_gym_ego import EgoStatus
@@ -40,9 +42,14 @@ from human_feedback_rl.common import (
     Trajectory,
     Transition,
     UnifiedLogger,
-    setup_wandb_axes,
+    setup_wandb_axes, RunningMeanStd,
 )
 from human_feedback_rl.common.core import Preference
+from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
+from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
+
+from stable_baselines3.common.utils import obs_as_tensor
+import torch
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +162,9 @@ class ChristianoAlgorithm:
         # Reward model gradient step counter (used as x-axis for rm/* metrics)
         self._rm_global_epochs: int = 0
 
+        # Running z-score normaliser for predicted rewards
+        self._reward_rms = RunningMeanStd()
+
         # Sliding windows for rollout metrics (last N episodes / iterations)
         _w = 50
         self._window_true_rewards: Deque[float] = deque(maxlen=_w)
@@ -169,11 +179,9 @@ class ChristianoAlgorithm:
         self,
         total_timesteps: int,
         n_initial_queries: int = 200,
-        n_rollout_steps: int = 2000,
         n_queries_per_iter: int = 10,
         reward_model_train_steps: int = 200,
         reward_model_batch_size: int = 64,
-        n_policy_train_steps: int = 1000,
     ) -> None:
         """
         Run the full Christiano training loop.
@@ -184,19 +192,23 @@ class ChristianoAlgorithm:
             Total number of environment steps for the main loop.
         n_initial_queries : int
             Number of preference queries for reward model pre-training.
-        n_rollout_steps : int
-            Environment steps collected per iteration, per environment.
         n_queries_per_iter : int
             Base number of preference queries per iteration (may decay with schedule).
         reward_model_train_steps : int
             Gradient steps on the reward model per iteration.
         reward_model_batch_size : int
             Mini-batch size for reward model training.
-        n_policy_train_steps : int
-            Gradient steps on the policy per iteration.
         """
         # Initialise SB3 internals (logger, _last_obs, num_timesteps, …)
         total_timesteps, _ = self.agent._setup_learn(total_timesteps)
+
+        if isinstance(self.agent, OnPolicyAlgorithm):
+            n_steps_per_env = self.agent.n_steps
+        elif isinstance(self.agent, OffPolicyAlgorithm):
+            tf = self.agent.train_freq
+            if tf.unit != TrainFrequencyUnit.STEP:
+                raise ValueError("Only train_freq with STEP unit is supported")
+            n_steps_per_env = max(1, tf.frequency // self.env.num_envs)
 
         # ── Wandb setup ────────────────────────────────────────────────
         # Define per-group x-axes before any logging happens.
@@ -226,8 +238,14 @@ class ChristianoAlgorithm:
 
         while total_steps < total_timesteps:
             # 1. Collect rollout; add to replay buffer with predicted rewards
-            trajectories, rollout_stats = self._collect_rollout(n_rollout_steps)
-            total_steps += n_rollout_steps * self.env.num_envs
+            if isinstance(self.agent, OffPolicyAlgorithm):
+                trajectories, rollout_stats = self._collect_rollout_off_policy(n_steps_per_env)
+                total_steps += n_steps_per_env * self.env.num_envs
+            elif isinstance(self.agent, OnPolicyAlgorithm):
+                trajectories, rollout_stats = self._collect_rollout_on_policy(n_steps_per_env)
+                total_steps += n_steps_per_env * self.env.num_envs
+            else:
+                raise ValueError(f"Unknown algorithm")
 
             # 2. Gather preferences
             n_queries = self.query_schedule_fn(n_queries_per_iter, iteration)
@@ -254,27 +272,34 @@ class ChristianoAlgorithm:
             else:
                 rm_metrics = {}
 
-            # 4. Train policy; flush captured metrics to wandb after training.
-            if self.agent.replay_buffer.size() >= self.agent.batch_size:
-                self.agent.train(
-                    gradient_steps=n_policy_train_steps,
-                    batch_size=self.agent.batch_size,
-                )
+            if isinstance(self.agent, OffPolicyAlgorithm):
+                # 4. Train policy; flush captured metrics to wandb after training.
+                if self.agent.replay_buffer.size() >= self.agent.batch_size:
+                    self.agent.train(
+                        gradient_steps=self.agent.gradient_steps,
+                        batch_size=self.agent.batch_size,
+                    )
+                    self._agent_logger.flush_to_wandb(fallback_step=total_steps)
+            elif isinstance(self.agent, OnPolicyAlgorithm):
+                # 4. Train policy (PPO update on the rollout buffer collected in step 1)
+                self.agent.train()
                 self._agent_logger.flush_to_wandb(fallback_step=total_steps)
+            else:
+                raise ValueError(f"Unknown algorithm")
 
             # 5. Log
-                # Reward model metrics (x-axis: global_epochs)
-                if rm_metrics:
-                    self.logger.log(rm_metrics)
+            # Reward model metrics (x-axis: global_epochs)
+            if rm_metrics:
+                self.logger.log(rm_metrics)
 
-                # Rollout metrics (x-axis: iteration)
-                rollout_log = self._compute_rollout_metrics(
-                    trajectories, rollout_stats, iteration
-                )
-                if rollout_log:
-                    self.logger.log(rollout_log)
+            # Rollout metrics (x-axis: iteration)
+            rollout_log = self._compute_rollout_metrics(
+                trajectories, rollout_stats, iteration
+            )
+            if rollout_log:
+                self.logger.log(rollout_log)
 
-                self._print_progress(iteration, total_steps, rm_metrics)
+            self._print_progress(iteration, total_steps, rm_metrics)
 
             iteration += 1
 
@@ -301,7 +326,13 @@ class ChristianoAlgorithm:
             f"[Pre-training] Collecting {steps_needed} steps "
             f"for {n_initial_queries} initial preference queries..."
         )
-        trajectories = self._collect_raw_trajectories(n_steps_per_env)
+
+        if isinstance(self.agent, OffPolicyAlgorithm):
+            trajectories = self._collect_raw_trajectories_off_policy(n_steps_per_env)
+        elif isinstance(self.agent, OnPolicyAlgorithm):
+            trajectories = self._collect_raw_trajectories_on_policy(n_steps_per_env)
+        else:
+            raise ValueError(f"Unknown algorithm")
 
         pairs = self.fragmenter.sample_pairs(trajectories, n_initial_queries)
         for pref in self.gatherer.gather(pairs):
@@ -338,19 +369,30 @@ class ChristianoAlgorithm:
                 }
             )
 
-    def _collect_raw_trajectories(self, n_steps_per_env: int) -> List[Trajectory]:
+    def _collect_raw_trajectories_off_policy(self, n_steps_per_env: int) -> List[Trajectory]:
         """
         Step through the env for n_steps_per_env steps per environment.
         Records transitions with TRUE rewards but does NOT add to replay buffer.
         Updates self.agent._last_obs.
         """
-        obs, trajectories, completed, _ = self._rollout_loop(
+        obs, trajectories, completed, _ = self._rollout_loop_off_policy(
             n_steps_per_env, add_to_buffer=False
         )
         self.agent._last_obs = obs
         return completed
 
-    def _collect_rollout(
+    def _collect_raw_trajectories_on_policy(self, n_steps_per_env: int) -> List[Trajectory]:
+        """
+        Step through the env without filling the rollout buffer.
+        Records Trajectory objects with true rewards for preference generation.
+        """
+        obs, _, completed, _ = self._rollout_loop_on_policy(
+            n_steps_per_env, add_to_buffer=False
+        )
+        self.agent._last_obs = obs
+        return completed
+
+    def _collect_rollout_off_policy(
         self, n_steps_per_env: int
     ) -> Tuple[List[Trajectory], Dict[str, float]]:
         """
@@ -359,14 +401,14 @@ class ChristianoAlgorithm:
         Returns trajectories with TRUE rewards for preference generation.
         Updates self.agent._last_obs.
         """
-        obs, _, completed, stats = self._rollout_loop(
+        obs, _, completed, stats = self._rollout_loop_off_policy(
             n_steps_per_env, add_to_buffer=True
         )
         self.agent._last_obs = obs
         self.agent.num_timesteps += n_steps_per_env * self.env.num_envs
         return completed, stats
 
-    def _rollout_loop(
+    def _rollout_loop_off_policy(
         self, n_steps_per_env: int, add_to_buffer: bool
     ) -> Tuple[np.ndarray, List[Trajectory], List[Trajectory], Dict[str, float]]:
         """
@@ -442,51 +484,147 @@ class ChristianoAlgorithm:
 
         return obs, active_trajs, completed, stats
 
-    def _relabel_replay_buffer(self, batch_size: int = 4096) -> None:
+    def _collect_rollout_on_policy(
+        self, n_steps_per_env: int
+    ) -> Tuple[List[Trajectory], Dict[str, float]]:
         """
-        Re-predict rewards for every transition in the replay buffer using the
-        current (updated) reward model, then overwrite ``replay_buffer.rewards``
-        with z-score-normalised values.
-
-        The running normaliser ``_reward_rms`` is NOT updated here: it was
-        already updated with fresh rollout predictions this iteration, so the
-        relabeling simply re-normalises using the current mean/std without
-        double-counting.
-
-        SB3's ReplayBuffer stores data with shape
-            observations : (buffer_size, n_envs, obs_dim)
-            actions      : (buffer_size, n_envs, action_dim)
-            rewards      : (buffer_size, n_envs)
-        where ``pos`` is the write pointer and ``full`` signals a wrapped buffer.
+        Fill PPO's rollout buffer with n_steps_per_env steps per environment.
+        Rewards stored are z-score-normalised PREDICTED rewards from the RM.
+        Returns trajectories with TRUE rewards for preference generation.
         """
-        buf = self.agent.replay_buffer
-        n_valid = buf.buffer_size if buf.full else buf.pos
-        if n_valid == 0:
-            return
+        # Reset the rollout buffer before filling it for this iteration.
+        self.agent.rollout_buffer.reset()
+        obs, _, completed, stats = self._rollout_loop_on_policy(
+            n_steps_per_env, add_to_buffer=True
+        )
+        self.agent._last_obs = obs
+        self.agent.num_timesteps += n_steps_per_env * self.env.num_envs
+        return completed, stats
 
-        n_envs = buf.n_envs
-        obs_dim = buf.observations.shape[-1]
-        act_dim = buf.actions.shape[-1]
+    def _rollout_loop_on_policy(
+        self, n_steps_per_env: int, add_to_buffer: bool
+    ) -> Tuple[np.ndarray, List[Trajectory], List[Trajectory], Dict[str, float]]:
+        """
+        Core collection loop shared by pre-training and main loop.
 
-        # Flatten (n_valid, n_envs, dim) → (n_valid * n_envs, dim)
-        obs_flat = buf.observations[:n_valid].reshape(-1, obs_dim)
-        act_flat = buf.actions[:n_valid].reshape(-1, act_dim)
-        n_total = obs_flat.shape[0]
+        When add_to_buffer=True, each step calls policy.forward() to obtain
+        (actions, values, log_probs) needed by the PPO rollout buffer, then
+        stores z-score-normalised predicted rewards.
 
-        # Predict in batches to keep GPU/CPU memory bounded
-        raw_rewards = np.empty(n_total, dtype=np.float32)
-        for start in range(0, n_total, batch_size):
-            end = min(start + batch_size, n_total)
-            raw_rewards[start:end] = self.reward_model.predict_reward(
-                obs_flat[start:end], act_flat[start:end]
+        When add_to_buffer=False, actions are sampled with predict() and no
+        buffer writes occur (lighter pre-training collection).
+
+        Returns (final_obs, active_trajectories, completed_trajectories, stats).
+        """
+        n_envs = self.env.num_envs
+        obs = self.agent._last_obs
+
+        active_trajs: List[Trajectory] = [Trajectory() for _ in range(n_envs)]
+        completed: List[Trajectory] = []
+        model_reward_sum = 0.0
+        model_reward_count = 0
+        n_episodes = 0
+        n_collisions = 0
+        n_off_road = 0
+        n_timeouts = 0
+        n_successes = 0
+
+        # episode_starts tracks whether the current obs is the first of an episode.
+        # Needed by RolloutBuffer for GAE boundary detection.
+        episode_starts = self.agent._last_episode_starts  # (n_envs,) bool
+
+        for _ in range(n_steps_per_env):
+            if add_to_buffer:
+                # policy.forward() returns actions, values (V(s)), log_probs
+                # required by PPO's rollout buffer for advantage computation.
+                obs_tensor = obs_as_tensor(obs, self.agent.device)
+                with torch.no_grad():
+                    actions_t, values, log_probs = self.agent.policy.forward(obs_tensor)
+                actions = actions_t.cpu().numpy()
+                # Clip actions to the env's action space bounds.
+                clipped_actions = np.clip(
+                    actions,
+                    self.env.action_space.low,
+                    self.env.action_space.high,
+                )
+            else:
+                clipped_actions, _ = self.agent.predict(obs, deterministic=False)
+                actions = clipped_actions
+
+            next_obs, true_rewards, dones, infos = self.env.step(clipped_actions)
+
+            for i in range(n_envs):
+                active_trajs[i].add(
+                    Transition(
+                        obs=obs[i].copy(),
+                        action=actions[i].copy(),
+                        true_reward=float(true_rewards[i]),
+                        done=bool(dones[i]),
+                    )
+                )
+                if dones[i]:
+                    completed.append(active_trajs[i])
+                    active_trajs[i] = Trajectory()
+                    if _HAS_EGO_STATUS:
+                        ego_status = infos[i].get("ego_status")
+                        if ego_status is not None:
+                            n_episodes += 1
+                            n_collisions += int(ego_status == EgoStatus.COLLIDED.value)
+                            n_off_road  += int(ego_status == EgoStatus.OFF_ROAD.value)
+                            n_timeouts  += int(ego_status == EgoStatus.TIMEOUT.value)
+                            n_successes += int(ego_status == EgoStatus.ARRIVED.value)
+
+            if add_to_buffer:
+                predicted_rewards = self.reward_model.predict_reward(obs, actions)
+                # Update running stats with raw predictions, then normalize.
+                self._reward_rms.update(predicted_rewards)
+                normalized_rewards = self._reward_rms.normalize(predicted_rewards)
+
+                # RolloutBuffer.add() signature:
+                #   add(obs, action, reward, episode_start, value, log_prob)
+                self.agent.rollout_buffer.add(
+                    obs,
+                    actions,
+                    normalized_rewards,
+                    episode_starts,
+                    values,
+                    log_probs,
+                )
+                # Track raw reward for monitoring.
+                model_reward_sum += float(np.sum(predicted_rewards))
+                model_reward_count += n_envs
+
+            episode_starts = dones
+            obs = next_obs
+
+        # Compute returns and advantages using the value of the last observation.
+        # This finalises the rollout buffer so PPO can call train().
+        if add_to_buffer:
+            obs_tensor = obs_as_tensor(obs, self.agent.device)
+            with torch.no_grad():
+                last_values = self.agent.policy.predict_values(obs_tensor)
+            self.agent.rollout_buffer.compute_returns_and_advantage(
+                last_values=last_values, dones=dones
             )
+            # Persist episode_starts for the next iteration.
+            self.agent._last_episode_starts = episode_starts
 
-        # Normalise using current running stats (no rms update)
-        std = float(np.sqrt(max(self._reward_rms.var, 0.0))) + self._reward_rms.epsilon
-        norm_rewards = (raw_rewards - self._reward_rms.mean) / std
+        # Include partial trajectories long enough for segment sampling.
+        for traj in active_trajs:
+            if len(traj) >= self.segment_length:
+                completed.append(traj)
 
-        # Overwrite rewards in-place; reshape back to (n_valid, n_envs)
-        buf.rewards[:n_valid] = norm_rewards.reshape(n_valid, n_envs)
+        stats: Dict[str, float] = {}
+        if model_reward_count > 0:
+            stats["mean_model_reward"] = model_reward_sum / model_reward_count
+        if n_episodes > 0:
+            stats["event_rate/collisions"] = n_collisions / n_episodes
+            stats["event_rate/off_road"]   = n_off_road   / n_episodes
+            stats["event_rate/timeouts"]   = n_timeouts   / n_episodes
+            stats["event_rate/successes"]  = n_successes  / n_episodes
+
+        return obs, active_trajs, completed, stats
+
 
     def _compute_rollout_metrics(
         self,

@@ -1,3 +1,3 @@
-from .christiano import ChristianoAlgorithm, ChristianoPPOAlgorithm
+from .christiano import ChristianoAlgorithm
 
-__all__ = ["ChristianoAlgorithm", "ChristianoPPOAlgorithm"]
+__all__ = ["ChristianoAlgorithm"]
