@@ -450,12 +450,16 @@ class ChristianoAlgorithm:
             actions, _ = self.agent.predict(obs, deterministic=False)
             next_obs, true_rewards, dones, infos = self.env.step(actions)
 
+            if add_to_buffer:
+                predicted_rewards = self.reward_model.predict_reward(obs, actions)
+
             for i in range(n_envs):
                 active_trajs[i].add(
                     Transition(
                         obs=obs[i].copy(),
                         action=actions[i].copy(),
                         true_reward=float(true_rewards[i]),
+                        model_reward=float(predicted_rewards[i]) if add_to_buffer else 0.0,
                         done=bool(dones[i]),
                     )
                 )
@@ -566,12 +570,16 @@ class ChristianoAlgorithm:
 
             next_obs, true_rewards, dones, infos = self.env.step(clipped_actions)
 
+            if add_to_buffer:
+                predicted_rewards = self.reward_model.predict_reward(obs, actions)
+
             for i in range(n_envs):
                 active_trajs[i].add(
                     Transition(
                         obs=obs[i].copy(),
                         action=actions[i].copy(),
                         true_reward=float(true_rewards[i]),
+                        model_reward=float(predicted_rewards[i]) if add_to_buffer else 0.0,
                         done=bool(dones[i]),
                     )
                 )
@@ -625,7 +633,7 @@ class ChristianoAlgorithm:
 
         # Include partial trajectories long enough for segment sampling.
         for traj in active_trajs:
-            if len(traj) >= self.segment_length:
+            if self.segment_length is None or len(traj) >= self.segment_length:
                 completed.append(traj)
 
         stats: Dict[str, float] = {}
@@ -659,11 +667,13 @@ class ChristianoAlgorithm:
         ]
         for traj in done_trajs:
             ep_return = sum(tr.true_reward for tr in traj.transitions)
+            ep_model_return = sum(tr.model_reward for tr in traj.transitions)
             self._window_true_rewards.append(ep_return)
             self._window_ep_lengths.append(float(len(traj)))
+            self._window_model_rewards.append(ep_model_return)
 
-        if "mean_model_reward" in rollout_stats:
-            self._window_model_rewards.append(rollout_stats["mean_model_reward"])
+        # if "mean_model_reward" in rollout_stats:
+            # self._window_model_rewards.append(rollout_stats["mean_model_reward"])
 
         metrics: Dict[str, float] = {"rollout/iteration": float(iteration)}
         if self._window_true_rewards:

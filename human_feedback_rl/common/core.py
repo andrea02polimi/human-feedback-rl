@@ -9,6 +9,7 @@ class Transition:
     action: np.ndarray
     true_reward: float
     done: bool
+    model_reward: float = 0.0
 
 
 @dataclass
