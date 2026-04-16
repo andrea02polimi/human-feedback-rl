@@ -20,7 +20,7 @@ Main loop (repeated until total_timesteps is reached):
 """
 
 from collections import deque
-from typing import Callable, Deque, Dict, List, Tuple
+from typing import Callable, Deque, Dict, List, Tuple, Optional
 
 import numpy as np
 
@@ -63,8 +63,8 @@ class SyntheticGatherer:
     Serves as a drop-in replacement for a human annotator.
     """
 
-    def __init__(self):
-        self._oracle = PreferenceModelFromReward()
+    def __init__(self, normalize_by_length: bool = False):
+        self._oracle = PreferenceModelFromReward(normalize_by_length=normalize_by_length)
 
     def gather(self, pairs: List[SegmentPair]) -> List[Preference]:
         return [self._oracle(pair) for pair in pairs]
@@ -100,8 +100,8 @@ class ChristianoAlgorithm:
     ----------
     env : VecEnv
         Vectorised environment (e.g. from sre.make_vec_env).
-    agent : stable_baselines3.SAC (or compatible off-policy algorithm)
-        RL policy that exposes predict(), replay_buffer, and train().
+    agent : stable_baselines3 off policy or on policy algorithm
+        RL policy that exposes predict(), replay_buffer, rollout_buffer and train().
     rng : np.random.Generator
         Random number generator for reproducibility.
     reward_model_n_networks : int
@@ -131,7 +131,8 @@ class ChristianoAlgorithm:
         reward_model_hidden_size: int = 256,
         reward_model_lr: float = 3e-4,
         reward_model_l2: float = 1e-4,
-        segment_length: int = 50,
+        segment_length: Optional[int] = 50,
+        episode_length_estimate: int = 200,  # used only when segment_length is None
         preference_dataset_max_size: int = 3000,
         query_schedule: str = "constant",
         device: str = "cpu",
@@ -139,10 +140,14 @@ class ChristianoAlgorithm:
         self.env = env
         self.agent = agent
         self.rng = rng
-        self.segment_length = segment_length
+        self.segment_length = None if segment_length == "None" else segment_length
+
+        self._episode_length_estimate = episode_length_estimate
 
         obs_dim: int = env.observation_space.shape[0]
         action_dim: int = env.action_space.shape[0]
+
+        _normalize = self.segment_length is None
 
         self.reward_model = EnsembleRewardModel(
             obs_dim=obs_dim,
@@ -152,9 +157,11 @@ class ChristianoAlgorithm:
             lr=reward_model_lr,
             l2_reg=reward_model_l2,
             device=device,
+            normalize_by_length=_normalize,
         )
-        self.fragmenter = ActiveFragmenter(segment_length=segment_length, rng=rng)
-        self.gatherer = SyntheticGatherer()
+        self.fragmenter = ActiveFragmenter(segment_length=self.segment_length, rng=rng)
+        # self.gatherer = SyntheticGatherer()
+        self.gatherer = SyntheticGatherer(normalize_by_length=_normalize)
         self.preference_dataset = PreferenceDataset(max_size=preference_dataset_max_size)
         self.query_schedule_fn = QUERY_SCHEDULES[query_schedule]
         self.logger = UnifiedLogger(use_wandb=True)
@@ -163,7 +170,7 @@ class ChristianoAlgorithm:
         self._rm_global_epochs: int = 0
 
         # Running z-score normaliser for predicted rewards
-        self._reward_rms = RunningMeanStd()
+        # self._reward_rms = RunningMeanStd()
 
         # Sliding windows for rollout metrics (last N episodes / iterations)
         _w = 50
@@ -240,12 +247,12 @@ class ChristianoAlgorithm:
             # 1. Collect rollout; add to replay buffer with predicted rewards
             if isinstance(self.agent, OffPolicyAlgorithm):
                 trajectories, rollout_stats = self._collect_rollout_off_policy(n_steps_per_env)
-                total_steps += n_steps_per_env * self.env.num_envs
             elif isinstance(self.agent, OnPolicyAlgorithm):
                 trajectories, rollout_stats = self._collect_rollout_on_policy(n_steps_per_env)
-                total_steps += n_steps_per_env * self.env.num_envs
             else:
                 raise ValueError(f"Unknown algorithm")
+
+            total_steps += n_steps_per_env * self.env.num_envs
 
             # 2. Gather preferences
             n_queries = self.query_schedule_fn(n_queries_per_iter, iteration)
@@ -319,7 +326,13 @@ class ChristianoAlgorithm:
         Collect initial segments and pre-train the reward model.
         Does not add transitions to the replay buffer.
         """
-        steps_needed = n_initial_queries * 2 * self.segment_length
+
+
+        if self.segment_length is not None:
+            steps_needed = n_initial_queries * 2 * self.segment_length
+        else:
+            steps_needed = n_initial_queries * 2 * self._episode_length_estimate
+
         n_steps_per_env = int(np.ceil(steps_needed / self.env.num_envs))
 
         print(
@@ -470,7 +483,7 @@ class ChristianoAlgorithm:
 
         # Include partial trajectories that are long enough for segment sampling
         for traj in active_trajs:
-            if len(traj) >= self.segment_length:
+            if self.segment_length is None or len(traj) >= self.segment_length:
                 completed.append(traj)
 
         stats: Dict[str, float] = {}
@@ -577,15 +590,16 @@ class ChristianoAlgorithm:
             if add_to_buffer:
                 predicted_rewards = self.reward_model.predict_reward(obs, actions)
                 # Update running stats with raw predictions, then normalize.
-                self._reward_rms.update(predicted_rewards)
-                normalized_rewards = self._reward_rms.normalize(predicted_rewards)
+                # self._reward_rms.update(predicted_rewards)
+                # normalized_rewards = self._reward_rms.normalize(predicted_rewards)
 
                 # RolloutBuffer.add() signature:
                 #   add(obs, action, reward, episode_start, value, log_prob)
                 self.agent.rollout_buffer.add(
                     obs,
                     actions,
-                    normalized_rewards,
+                    # normalized_rewards,
+                    predicted_rewards,
                     episode_starts,
                     values,
                     log_probs,

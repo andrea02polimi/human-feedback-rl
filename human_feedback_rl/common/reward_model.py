@@ -103,11 +103,13 @@ class EnsembleRewardModel:
         hidden_size: int = 256,
         lr: float = 3e-4,
         l2_reg: float = 1e-4,
+        normalize_by_length: bool = False,
         device: str = "cpu",
     ):
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.n_networks = n_networks
+        self.normalize_by_length = normalize_by_length
         self.device = torch.device(device)
 
         self.networks: List[RewardNet] = [
@@ -225,8 +227,10 @@ class EnsembleRewardModel:
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device)
         act_t = torch.tensor(actions, dtype=torch.float32, device=self.device)
         with torch.no_grad():
+            reduce = lambda t: t.mean() if self.normalize_by_length else t.sum()
             total = sum(
-                net(obs_t, act_t).sum().item() for net in self.networks
+                # net(obs_t, act_t).sum().item() for net in self.networks
+                reduce(net(obs_t, act_t)).item() for net in self.networks
             )
         return total / self.n_networks
 
@@ -249,8 +253,11 @@ class EnsembleRewardModel:
             obs2 = torch.tensor(pref.seg2.obs, dtype=torch.float32, device=self.device)
             act2 = torch.tensor(pref.seg2.actions, dtype=torch.float32, device=self.device)
 
-            r1 = net(obs1, act1).sum()
-            r2 = net(obs2, act2).sum()
+            # r1 = net(obs1, act1).sum()
+            # r2 = net(obs2, act2).sum()
+            reduce = lambda t: t.mean() if self.normalize_by_length else t.sum()
+            r1 = reduce(net(obs1, act1))
+            r2 = reduce(net(obs2, act2))
 
             logits.append(r1 - r2)
             labels.append(pref.label)

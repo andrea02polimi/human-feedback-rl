@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 
@@ -14,7 +14,7 @@ class ActiveFragmenter:
     segment_length is silently skipped.
     """
 
-    def __init__(self, segment_length: int, rng: np.random.Generator):
+    def __init__(self, segment_length: Optional[int], rng: np.random.Generator):
         self.segment_length = segment_length
         self.rng = rng
 
@@ -34,6 +34,16 @@ class ActiveFragmenter:
     def _sample_segments(
         self, trajectories: List[Trajectory], n: int
     ) -> List[Segment]:
+        # Full-episode mode: use only completed trajectories
+        if self.segment_length is None:
+            valid = [t for t in trajectories if t.transitions and t.transitions[-1].done]
+            if not valid:
+                return []
+            # sample n segments
+            idxs = self.rng.integers(len(valid), size=n)
+            return [Segment(valid[i].transitions) for i in idxs]
+
+        # Fixed-length mode
         valid = [t for t in trajectories if len(t) >= self.segment_length]
         if not valid:
             return []

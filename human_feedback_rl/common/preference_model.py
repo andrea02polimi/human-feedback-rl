@@ -11,9 +11,16 @@ class PreferenceModelFromReward:
     requiring actual human feedback.
     """
 
+    def __init__(self, normalize_by_length: bool = False):
+        self.normalize_by_length = normalize_by_length
+
     def __call__(self, pair: SegmentPair) -> Preference:
-        r1 = pair.seg1.true_return
-        r2 = pair.seg2.true_return
+        if self.normalize_by_length:
+            r1 = pair.seg1.true_return / len(pair.seg1)
+            r2 = pair.seg2.true_return / len(pair.seg2)
+        else:
+            r1 = pair.seg1.true_return
+            r2 = pair.seg2.true_return
         if r1 > r2:
             label = 1.0
         elif r2 > r1:
