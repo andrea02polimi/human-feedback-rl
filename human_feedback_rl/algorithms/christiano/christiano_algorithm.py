@@ -42,7 +42,7 @@ from human_feedback_rl.common import (
     Trajectory,
     Transition,
     UnifiedLogger,
-    setup_wandb_axes, RunningMeanStd,
+    setup_wandb_axes,
 )
 from human_feedback_rl.common.core import Preference
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
@@ -160,7 +160,6 @@ class ChristianoAlgorithm:
             normalize_by_length=_normalize,
         )
         self.fragmenter = ActiveFragmenter(segment_length=self.segment_length, rng=rng)
-        # self.gatherer = SyntheticGatherer()
         self.gatherer = SyntheticGatherer(normalize_by_length=_normalize)
         self.preference_dataset = PreferenceDataset(max_size=preference_dataset_max_size)
         self.query_schedule_fn = QUERY_SCHEDULES[query_schedule]
@@ -331,7 +330,8 @@ class ChristianoAlgorithm:
         if self.segment_length is not None:
             steps_needed = n_initial_queries * 2 * self.segment_length
         else:
-            steps_needed = n_initial_queries * 2 * self._episode_length_estimate
+            steps_needed = n_initial_queries * 2 * self._episode_length_estimate # usiamo la stima di quanto
+            # possono essere lunghi gli episodi all'inizio quando l'agente si comporta ancora in maniera casuale
 
         n_steps_per_env = int(np.ceil(steps_needed / self.env.num_envs))
 
@@ -476,7 +476,7 @@ class ChristianoAlgorithm:
                             n_successes += int(ego_status == EgoStatus.ARRIVED.value)
 
             if add_to_buffer:
-                predicted_rewards = self.reward_model.predict_reward(obs, actions)
+                # predicted_rewards = self.reward_model.predict_reward(obs, actions)
                 self.agent.replay_buffer.add(
                     obs, next_obs, actions, predicted_rewards, dones, infos
                 )
@@ -526,7 +526,7 @@ class ChristianoAlgorithm:
 
         When add_to_buffer=True, each step calls policy.forward() to obtain
         (actions, values, log_probs) needed by the PPO rollout buffer, then
-        stores z-score-normalised predicted rewards.
+        stores predicted rewards.
 
         When add_to_buffer=False, actions are sampled with predict() and no
         buffer writes occur (lighter pre-training collection).
@@ -564,7 +564,7 @@ class ChristianoAlgorithm:
                     self.env.action_space.low,
                     self.env.action_space.high,
                 )
-            else:
+            else: # se non serve salvare in rollout buffer si può chiamare predict
                 clipped_actions, _ = self.agent.predict(obs, deterministic=False)
                 actions = clipped_actions
 
@@ -596,7 +596,7 @@ class ChristianoAlgorithm:
                             n_successes += int(ego_status == EgoStatus.ARRIVED.value)
 
             if add_to_buffer:
-                predicted_rewards = self.reward_model.predict_reward(obs, actions)
+                # predicted_rewards = self.reward_model.predict_reward(obs, actions)
                 # Update running stats with raw predictions, then normalize.
                 # self._reward_rms.update(predicted_rewards)
                 # normalized_rewards = self._reward_rms.normalize(predicted_rewards)
