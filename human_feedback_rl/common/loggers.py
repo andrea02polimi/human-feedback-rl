@@ -1,3 +1,4 @@
+import numpy as np
 import sys
 from typing import Any, Dict, Optional
 
@@ -74,6 +75,7 @@ class UnifiedLogger:
 
     def __init__(self, use_wandb: bool = True):
         self._use_wandb = use_wandb
+        self.data = {}
 
     def log(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
         if self._use_wandb and wandb.run is not None:
@@ -81,6 +83,23 @@ class UnifiedLogger:
 
     def prefix(self, prefix: str) -> "PrefixLogger":
         return PrefixLogger(prefix=prefix, inner=self)
+
+    def record(self, key, value):
+        if key not in self.data:
+            self.data[key] = []
+        self.data[key].append(value)
+
+    def dump(self, step=None):
+        log_dict = {}
+
+        for key, values in self.data.items():
+            mean_value = float(np.mean(values))
+            log_dict[key] = mean_value
+
+        if log_dict and self._use_wandb and wandb.run is not None:
+            wandb.log(log_dict, step=step)
+
+        self.data.clear()
 
 
 class PrefixLogger:
@@ -93,3 +112,27 @@ class PrefixLogger:
     def log(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
         prefixed = {f"{self.prefix}/{k}": v for k, v in metrics.items()}
         self.inner.log(prefixed, step=step)
+
+class PrefixLoggerDagger(PrefixLogger):
+    """
+    Thin wrapper around UnifiedLogger that prepends a prefix to every key
+    and optionally remaps key names before forwarding to the unified store.
+
+    Usage::
+
+        log = PrefixLogger(logger, prefix="reward_model", key_map={"loss": "train_loss"})
+        log.record("loss", 0.5)   # stored as "reward_model/train_loss"
+    """
+    def __init__(self, inner: UnifiedLogger, prefix=None, key_map=None):
+        super().__init__(prefix, inner)
+        self.key_map = key_map or {}
+
+    def record(self, key, value, *args, **kwargs):
+        key = self.key_map.get(key, key)
+        if self.prefix:
+            self.inner.record(f"{self.prefix}/{key}", value)
+        else:
+            self.inner.record(key, value)
+
+    def dump(self, *args, **kwargs):
+        self.inner.dump()
