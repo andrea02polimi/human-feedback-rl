@@ -142,7 +142,7 @@ class ChristianoAlgorithm:
         self.rng = rng
         self.segment_length = None if segment_length == "None" else segment_length
 
-        self._episode_length_estimate = episode_length_estimate
+        # self._episode_length_estimate = episode_length_estimate
 
         obs_dim: int = env.observation_space.shape[0]
         action_dim: int = env.action_space.shape[0]
@@ -167,6 +167,11 @@ class ChristianoAlgorithm:
 
         # Reward model gradient step counter (used as x-axis for rm/* metrics)
         self._rm_global_epochs: int = 0
+
+        # Hold-out set for RM diagnostics (populated at end of pretraining)
+        self._holdout_obs: Optional[np.ndarray] = None
+        self._holdout_actions: Optional[np.ndarray] = None
+        self._holdout_true_rewards: Optional[np.ndarray] = None
 
         # Running z-score normaliser for predicted rewards
         # self._reward_rms = RunningMeanStd()
@@ -275,6 +280,14 @@ class ChristianoAlgorithm:
                     )
                     rm_metrics["reward_model/dataset_size"] = len(self.preference_dataset)
                     rm_metrics["reward_model/global_epochs"] = self._rm_global_epochs
+                    if self._holdout_obs is not None:
+                        log_scatter = (iteration % 10 == 0)
+                        rm_metrics.update(self.reward_model.compute_holdout_diagnostics(
+                            self._holdout_obs,
+                            self._holdout_actions,
+                            self._holdout_true_rewards,
+                            log_scatter=log_scatter,
+                        ))
             else:
                 rm_metrics = {}
 
@@ -327,25 +340,47 @@ class ChristianoAlgorithm:
         """
 
 
-        if self.segment_length is not None:
-            steps_needed = n_initial_queries * 2 * self.segment_length
-        else:
-            steps_needed = n_initial_queries * 2 * self._episode_length_estimate # usiamo la stima di quanto
-            # possono essere lunghi gli episodi all'inizio quando l'agente si comporta ancora in maniera casuale
+        # if self.segment_length is not None:
+        #     steps_needed = n_initial_queries * 2 * self.segment_length
+        # else:
+        #     steps_needed = n_initial_queries * 2 * self._episode_length_estimate # usiamo la stima di quanto
+        #     # possono essere lunghi gli episodi all'inizio quando l'agente si comporta ancora in maniera casuale
+        #
+        # n_steps_per_env = int(np.ceil(steps_needed / self.env.num_envs))
 
-        n_steps_per_env = int(np.ceil(steps_needed / self.env.num_envs))
+
+        if self.segment_length is None:
+            n_episode_per_env = int(np.ceil(n_initial_queries / self.env.num_envs))
+        else:
+            steps_needed = n_initial_queries * 2 * self.segment_length
+            n_steps_per_env = int(np.ceil(steps_needed / self.env.num_envs))
 
         print(
-            f"[Pre-training] Collecting {steps_needed} steps "
+            # f"[Pre-training] Collecting {steps_needed} steps "
             f"for {n_initial_queries} initial preference queries..."
         )
 
-        if isinstance(self.agent, OffPolicyAlgorithm):
-            trajectories = self._collect_raw_trajectories_off_policy(n_steps_per_env)
-        elif isinstance(self.agent, OnPolicyAlgorithm):
-            trajectories = self._collect_raw_trajectories_on_policy(n_steps_per_env)
+        # if isinstance(self.agent, OffPolicyAlgorithm):
+        #     trajectories = self._collect_raw_trajectories_off_policy(n_steps_per_env)
+        # elif isinstance(self.agent, OnPolicyAlgorithm):
+        #     trajectories = self._collect_raw_trajectories_on_policy(n_steps_per_env)
+        # else:
+        #     raise ValueError(f"Unknown algorithm")
+
+        if self.segment_length is None:
+            if isinstance(self.agent, OffPolicyAlgorithm):
+                trajectories = self._collect_raw_full_episodes_off_policy(n_episode_per_env)
+            elif isinstance(self.agent, OnPolicyAlgorithm):
+                trajectories = self._collect_raw_full_episodes_on_policy(n_episode_per_env)
+            else:
+                raise ValueError(f"Unknown algorithm")
         else:
-            raise ValueError(f"Unknown algorithm")
+            if isinstance(self.agent, OffPolicyAlgorithm):
+                trajectories = self._collect_raw_trajectories_off_policy(n_steps_per_env)
+            elif isinstance(self.agent, OnPolicyAlgorithm):
+                trajectories = self._collect_raw_trajectories_on_policy(n_steps_per_env)
+            else:
+                raise ValueError(f"Unknown algorithm")
 
         pairs = self.fragmenter.sample_pairs(trajectories, n_initial_queries)
         for pref in self.gatherer.gather(pairs):
@@ -364,6 +399,13 @@ class ChristianoAlgorithm:
             rng=self.rng,
         )
         self._rm_global_epochs += pretrain_steps
+
+        # Build hold-out set from pretraining trajectories
+        transitions = [t for traj in trajectories for t in traj.transitions]
+        if transitions:
+            self._holdout_obs = np.stack([t.obs for t in transitions])
+            self._holdout_actions = np.stack([t.action for t in transitions])
+            self._holdout_true_rewards = np.array([t.true_reward for t in transitions])
 
         if metrics:
             acc = self.reward_model.accuracy(
@@ -403,6 +445,70 @@ class ChristianoAlgorithm:
             n_steps_per_env, add_to_buffer=False
         )
         self.agent._last_obs = obs
+        return completed
+
+    def _collect_raw_full_episodes_off_policy(self, n_episodes_per_env: int) -> List[Trajectory]:
+        """
+        Step through the env until each environment has completed n_episodes_per_env episodes.
+        Does NOT add to replay buffer. Used for full-episode pre-training collection.
+        """
+        n_envs = self.env.num_envs
+        obs = self.agent._last_obs
+        active_trajs: List[Trajectory] = [Trajectory() for _ in range(n_envs)]
+        completed: List[Trajectory] = []
+        episodes_per_env = [0] * n_envs
+
+        while min(episodes_per_env) < n_episodes_per_env:
+            actions, _ = self.agent.predict(obs, deterministic=False)
+            next_obs, true_rewards, dones, _ = self.env.step(actions)
+            for i in range(n_envs):
+                active_trajs[i].add(Transition(
+                    obs=obs[i].copy(),
+                    action=actions[i].copy(),
+                    true_reward=float(true_rewards[i]),
+                    model_reward=0.0,
+                    done=bool(dones[i]),
+                ))
+                if dones[i]:
+                    completed.append(active_trajs[i])
+                    active_trajs[i] = Trajectory()
+                    episodes_per_env[i] += 1
+            obs = next_obs
+
+        self.agent._last_obs = obs
+        return completed
+
+    def _collect_raw_full_episodes_on_policy(self, n_episodes_per_env: int) -> List[Trajectory]:
+        """
+        Step through the env until each environment has completed n_episodes_per_env episodes.
+        Does NOT add to rollout buffer. Used for full-episode pre-training collection.
+        """
+        n_envs = self.env.num_envs
+        obs = self.agent._last_obs
+        active_trajs: List[Trajectory] = [Trajectory() for _ in range(n_envs)]
+        completed: List[Trajectory] = []
+        episodes_per_env = [0] * n_envs
+        dones = np.zeros(n_envs, dtype=bool)
+
+        while min(episodes_per_env) < n_episodes_per_env:
+            clipped_actions, _ = self.agent.predict(obs, deterministic=False)
+            next_obs, true_rewards, dones, _ = self.env.step(clipped_actions)
+            for i in range(n_envs):
+                active_trajs[i].add(Transition(
+                    obs=obs[i].copy(),
+                    action=clipped_actions[i].copy(),
+                    true_reward=float(true_rewards[i]),
+                    model_reward=0.0,
+                    done=bool(dones[i]),
+                ))
+                if dones[i]:
+                    completed.append(active_trajs[i])
+                    active_trajs[i] = Trajectory()
+                    episodes_per_env[i] += 1
+            obs = next_obs
+
+        self.agent._last_obs = obs
+        self.agent._last_episode_starts = np.array(dones)
         return completed
 
     def _collect_rollout_off_policy(

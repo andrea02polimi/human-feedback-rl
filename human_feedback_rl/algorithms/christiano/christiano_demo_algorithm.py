@@ -243,7 +243,7 @@ class ChristianoDemoAlgorithm(ChristianoAlgorithm):
             reward_model_lr=reward_model_lr,
             reward_model_l2=reward_model_l2,
             segment_length=segment_length,
-            episode_length_estimate=episode_length_estimate,
+            # episode_length_estimate=episode_length_estimate,
             preference_dataset_max_size=preference_dataset_max_size,
             query_schedule=query_schedule,
             device=device,
@@ -367,12 +367,16 @@ class ChristianoDemoAlgorithm(ChristianoAlgorithm):
         reward_model_batch_size: int,
     ) -> None:
         # 1. Raccolta demo esperte
-        seg_len = self.segment_length or self._episode_length_estimate
-        n_expert_steps = int(np.ceil(
-            1.5 * self._sft_batch_size * seg_len / self.env.num_envs
-        ))
-        print(f"[Pre-training] Collecting expert demos ({n_expert_steps} steps/env)...")
-        self._collect_expert_demos(n_expert_steps)
+        if self.segment_length is None:
+            n_episodes_per_env = int(np.ceil(1.5 * self._sft_batch_size / self.env.num_envs))
+            print(f"[Pre-training] Collecting expert demos ({n_episodes_per_env} episodes/env)...")
+            self._collect_expert_full_episodes(n_episodes_per_env)
+        else:
+            n_expert_steps = int(np.ceil(
+                1.5 * self._sft_batch_size * self.segment_length / self.env.num_envs
+            ))
+            print(f"[Pre-training] Collecting expert demos ({n_expert_steps} steps/env)...")
+            self._collect_expert_demos(n_expert_steps)
         print(f"[Pre-training] Expert dataset: {len(self.expert_dataset)} segments")
 
         # 2. SFT dell'agente tramite BC
@@ -418,6 +422,35 @@ class ChristianoDemoAlgorithm(ChristianoAlgorithm):
                     self.expert_dataset.add(Segment(traj))
             elif len(traj) >= self.segment_length:
                 self._store_expert_episode(traj)
+
+        self.agent._last_obs = obs
+
+    def _collect_expert_full_episodes(self, n_episodes_per_env: int) -> None:
+        """Roll out expert until each env has completed n_episodes_per_env full episodes."""
+        obs = self.env.reset()
+        self.agent._last_obs = obs
+
+        n_envs = self.env.num_envs
+        active: List[List[Transition]] = [[] for _ in range(n_envs)]
+        episodes_per_env = [0] * n_envs
+
+        while min(episodes_per_env) < n_episodes_per_env:
+            expert_actions = self.expert_policy.predict(obs)
+            next_obs, true_rewards, dones, _ = self.env.step(expert_actions)
+
+            for i in range(n_envs):
+                active[i].append(Transition(
+                    obs=obs[i].copy(),
+                    action=expert_actions[i].copy(),
+                    true_reward=float(true_rewards[i]),
+                    done=bool(dones[i]),
+                ))
+                if dones[i]:
+                    self.expert_dataset.add(Segment(active[i]))
+                    active[i] = []
+                    episodes_per_env[i] += 1
+
+            obs = next_obs
 
         self.agent._last_obs = obs
 
