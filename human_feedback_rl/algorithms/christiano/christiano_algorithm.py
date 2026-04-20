@@ -337,7 +337,7 @@ class ChristianoAlgorithm:
 
 
         if self.segment_length is None:
-            n_episode_per_env = n_initial_queries / self.env.num_envs
+            n_episode_per_env = int(np.ceil(n_initial_queries * 2 / self.env.num_envs))
         else:
             steps_needed = n_initial_queries * 2 * self.segment_length
             n_steps_per_env = int(np.ceil(steps_needed / self.env.num_envs))
