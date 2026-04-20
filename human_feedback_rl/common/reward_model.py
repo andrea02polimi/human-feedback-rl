@@ -218,46 +218,6 @@ class EnsembleRewardModel:
 
         return correct / len(non_tie)
 
-    def compute_holdout_diagnostics(
-        self,
-        obs: np.ndarray,
-        actions: np.ndarray,
-        true_rewards: np.ndarray,
-        log_scatter: bool = False,
-    ) -> Dict[str, object]:
-        """
-        Compute diagnostic metrics on a fixed hold-out set.
-
-        Returns Spearman ρ, predicted reward range, and optionally a
-        wandb scatter plot of true vs predicted reward.
-        """
-        from scipy.stats import spearmanr
-
-        predicted = self.predict_reward(obs, actions)
-        rho, _ = spearmanr(true_rewards, predicted)
-
-        result: Dict[str, object] = {
-            "reward_model/spearman_rho": float(rho),
-            "reward_model/predicted_min": float(predicted.min()),
-            "reward_model/predicted_max": float(predicted.max()),
-        }
-
-        if log_scatter:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-            import wandb
-
-            fig, ax = plt.subplots(figsize=(4, 4))
-            ax.scatter(true_rewards, predicted, alpha=0.3, s=5)
-            ax.set_xlabel("true reward")
-            ax.set_ylabel("predicted reward")
-            ax.set_title(f"Spearman ρ = {rho:.3f}")
-            plt.tight_layout()
-            result["reward_model/scatter"] = wandb.Image(fig)
-            plt.close(fig)
-
-        return result
 
     # ------------------------------------------------------------------
     # Private helpers

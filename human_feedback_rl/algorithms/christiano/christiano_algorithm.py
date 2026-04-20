@@ -168,11 +168,6 @@ class ChristianoAlgorithm:
         # Reward model gradient step counter (used as x-axis for rm/* metrics)
         self._rm_global_epochs: int = 0
 
-        # Hold-out set for RM diagnostics (populated at end of pretraining)
-        self._holdout_obs: Optional[np.ndarray] = None
-        self._holdout_actions: Optional[np.ndarray] = None
-        self._holdout_true_rewards: Optional[np.ndarray] = None
-
         # Running z-score normaliser for predicted rewards
         # self._reward_rms = RunningMeanStd()
 
@@ -280,14 +275,6 @@ class ChristianoAlgorithm:
                     )
                     rm_metrics["reward_model/dataset_size"] = len(self.preference_dataset)
                     rm_metrics["reward_model/global_epochs"] = self._rm_global_epochs
-                    if self._holdout_obs is not None:
-                        log_scatter = (iteration % 10 == 0)
-                        rm_metrics.update(self.reward_model.compute_holdout_diagnostics(
-                            self._holdout_obs,
-                            self._holdout_actions,
-                            self._holdout_true_rewards,
-                            log_scatter=log_scatter,
-                        ))
             else:
                 rm_metrics = {}
 
@@ -350,7 +337,7 @@ class ChristianoAlgorithm:
 
 
         if self.segment_length is None:
-            n_episode_per_env = int(np.ceil(n_initial_queries / self.env.num_envs))
+            n_episode_per_env = n_initial_queries / self.env.num_envs
         else:
             steps_needed = n_initial_queries * 2 * self.segment_length
             n_steps_per_env = int(np.ceil(steps_needed / self.env.num_envs))
@@ -399,13 +386,6 @@ class ChristianoAlgorithm:
             rng=self.rng,
         )
         self._rm_global_epochs += pretrain_steps
-
-        # Build hold-out set from pretraining trajectories
-        transitions = [t for traj in trajectories for t in traj.transitions]
-        if transitions:
-            self._holdout_obs = np.stack([t.obs for t in transitions])
-            self._holdout_actions = np.stack([t.action for t in transitions])
-            self._holdout_true_rewards = np.array([t.true_reward for t in transitions])
 
         if metrics:
             acc = self.reward_model.accuracy(
