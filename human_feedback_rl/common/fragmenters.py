@@ -39,9 +39,15 @@ class ActiveFragmenter:
             valid = [t for t in trajectories if t.transitions and t.transitions[-1].done]
             if not valid:
                 return []
-            # sample n segments
-            idxs = self.rng.integers(len(valid), size=n)
-            return [Segment(valid[i].transitions) for i in idxs]
+            segments = []
+            for _ in range(n // 2):
+                if len(valid) >= 2:
+                    i, j = self.rng.choice(len(valid), size=2, replace=False)
+                else:
+                    i = j = 0
+                segments.append(Segment(valid[i].transitions))
+                segments.append(Segment(valid[j].transitions))
+            return segments
 
         # Fixed-length mode
         valid = [t for t in trajectories if len(t) >= self.segment_length]

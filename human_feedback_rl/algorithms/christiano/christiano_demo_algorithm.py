@@ -262,7 +262,7 @@ class ChristianoDemoAlgorithm(ChristianoAlgorithm):
             hidden_size=reward_model_hidden_size,
             lr=reward_model_lr,
             l2_reg=reward_model_l2,
-            normalize_by_length=(segment_length is None),
+            normalize_by_length=(self.segment_length is None),
             device=device,
             expert_dataset=self.expert_dataset,
             demo_loss_weight=demo_loss_weight,

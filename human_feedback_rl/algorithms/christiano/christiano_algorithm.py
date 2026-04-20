@@ -37,6 +37,7 @@ from human_feedback_rl.common import (
     EnsembleRewardModel,
     PreferenceDataset,
     PreferenceModelFromReward,
+    RunningMeanStd,
     SB3MetricsLogger,
     SegmentPair,
     Trajectory,
@@ -571,9 +572,10 @@ class ChristianoAlgorithm:
 
             obs = next_obs
 
-        # Include partial trajectories that are long enough for segment sampling
+        # Include partial trajectories that are long enough for segment sampling.
+        # In full-episode mode (segment_length=None) partials are never valid segments.
         for traj in active_trajs:
-            if self.segment_length is None or len(traj) >= self.segment_length:
+            if self.segment_length is not None and len(traj) >= self.segment_length:
                 completed.append(traj)
 
         stats: Dict[str, float] = {}
@@ -718,8 +720,9 @@ class ChristianoAlgorithm:
             self.agent._last_episode_starts = episode_starts
 
         # Include partial trajectories long enough for segment sampling.
+        # In full-episode mode (segment_length=None) partials are never valid segments.
         for traj in active_trajs:
-            if self.segment_length is None or len(traj) >= self.segment_length:
+            if self.segment_length is not None and len(traj) >= self.segment_length:
                 completed.append(traj)
 
         stats: Dict[str, float] = {}
