@@ -138,7 +138,8 @@ class EnsembleRewardModelWithDemo(EnsembleRewardModel):
             return {}
 
         has_expert = (
-            self.expert_dataset is not None
+            self.demo_loss_weight > 0
+            and self.expert_dataset is not None
             and len(self.expert_dataset) >= self.expert_batch_size
         )
 
@@ -366,25 +367,30 @@ class ChristianoDemoAlgorithm(ChristianoAlgorithm):
         reward_model_train_steps: int,
         reward_model_batch_size: int,
     ) -> None:
-        # 1. Raccolta demo esperte
-        if self.segment_length is None:
-            n_episodes_per_env = int(np.ceil(1.5 * self._sft_batch_size / self.env.num_envs))
-            print(f"[Pre-training] Collecting expert demos ({n_episodes_per_env} episodes/env)...")
-            self._collect_expert_full_episodes(n_episodes_per_env)
-        else:
-            n_expert_steps = int(np.ceil(
-                1.5 * self._sft_batch_size * self.segment_length / self.env.num_envs
-            ))
-            print(f"[Pre-training] Collecting expert demos ({n_expert_steps} steps/env)...")
-            self._collect_expert_demos(n_expert_steps)
-        print(f"[Pre-training] Expert dataset: {len(self.expert_dataset)} segments")
+        # # 1. Raccolta demo esperte
+        # if self.segment_length is None:
+        #     n_episodes_per_env = int(np.ceil(1.5 * self._sft_batch_size / self.env.num_envs))
+        #     print(f"[Pre-training] Collecting expert demos ({n_episodes_per_env} episodes/env)...")
+        #     self._collect_expert_full_episodes(n_episodes_per_env)
+        # else:
+        #     n_expert_steps = int(np.ceil(
+        #         1.5 * self._sft_batch_size * self.segment_length / self.env.num_envs
+        #     ))
+        #     print(f"[Pre-training] Collecting expert demos ({n_expert_steps} steps/env)...")
+        #     self._collect_expert_demos(n_expert_steps)
+        # print(f"[Pre-training] Expert dataset: {len(self.expert_dataset)} segments")
 
         # 2. SFT dell'agente tramite BC
         print(f"[Pre-training] SFT: {self._n_sft_steps} BC steps...")
-        self._sft_phase(self._n_sft_steps, self._sft_batch_size)
+        # self._sft_phase(self._n_sft_steps, self._sft_batch_size)
+        self._dagger_sft_phase()
 
         # 3+4. Raccolta preferenze + pre-training RM (parent)
         super()._pretraining_phase(n_initial_queries, reward_model_train_steps, reward_model_batch_size)
+
+        # 5. Warm-start critic SAC con transizioni esperte (solo off-policy)
+        if isinstance(self.agent, OffPolicyAlgorithm):
+            self._warm_start_replay_buffer()
 
     def _collect_expert_demos(self, n_steps_per_env: int) -> None:
         """Roll out the expert for n_steps_per_env steps, storing Segments in expert_dataset.
@@ -496,3 +502,142 @@ class ChristianoDemoAlgorithm(ChristianoAlgorithm):
             bc_loss_val = bc_loss.item()
 
         print(f"[Pre-training] SFT complete, final bc_loss={bc_loss_val:.4f}")
+
+    def _warm_start_replay_buffer(self) -> None:
+        """
+        Aggiunge le transizioni esperte al replay buffer SAC con reward predetti
+        dall'RM già pre-trainato. Permette al critic di warm-startare su
+        comportamento esperto invece che su transizioni casuali.
+        Chiamare DOPO super()._pretraining_phase() così l'RM è già trainato.
+        """
+        # Raccoglie tutte le transizioni in array flat
+        all_obs, all_next_obs, all_actions, all_rewards, all_dones = [], [], [], [], []
+        for seg in self.expert_dataset._segments:
+            T = len(seg.transitions)
+            if T == 0:
+                continue
+            obs_arr      = seg.obs
+            act_arr      = seg.actions
+            next_obs_arr = np.concatenate([obs_arr[1:], obs_arr[-1:]], axis=0)
+            predicted    = self.reward_model.predict_reward(obs_arr, act_arr)
+            dones        = np.array([tr.done for tr in seg.transitions])
+
+            all_obs.append(obs_arr)
+            all_next_obs.append(next_obs_arr)
+            all_actions.append(act_arr)
+            all_rewards.append(predicted)
+            all_dones.append(dones)
+
+        if not all_obs:
+            print("[Pre-training] Replay buffer warm-start: nessuna transizione esperta.")
+            return
+
+        obs_np      = np.concatenate(all_obs,      axis=0)  # (N, obs_dim)
+        next_obs_np = np.concatenate(all_next_obs, axis=0)  # (N, obs_dim)
+        act_np      = np.concatenate(all_actions,  axis=0)  # (N, action_dim)
+        rew_np      = np.concatenate(all_rewards,  axis=0)  # (N,)
+        done_np     = np.concatenate(all_dones,    axis=0)  # (N,)
+
+        # SB3 replay_buffer.add() si aspetta batch di esattamente n_envs
+        n_envs = self.env.num_envs
+        N      = len(obs_np)
+        added  = 0
+        for i in range(0, N - (N % n_envs), n_envs):
+            self.agent.replay_buffer.add(
+                obs=obs_np[i : i + n_envs],
+                next_obs=next_obs_np[i : i + n_envs],
+                action=act_np[i : i + n_envs],
+                reward=rew_np[i : i + n_envs],
+                done=done_np[i : i + n_envs],
+                infos=[{} for _ in range(n_envs)],
+            )
+            added += n_envs
+
+        print(f"[Pre-training] Replay buffer warm-start: {added} transizioni esperte "
+              f"(buffer size: {self.agent.replay_buffer.size()})")
+
+    def _dagger_sft_phase(self):
+        """
+      DAgger: l'agente esegue rollout nei propri stati, ogni stato viene
+      labellato con l'azione esperta. Risolve il covariate shift di BC puro.
+
+      Round 0: beta=1.0 (esegue solo esperto)
+      Round k: beta=0.7^k (mix crescente agente)
+      """
+        # --- parametri hardcoded ---
+        n_rounds           = 10
+        n_episodes_per_env = 25    # episodi per env per round
+        bc_epochs_per_round = 10  # epoche su dataset cumulato per round
+        bc_batch_size      = 256
+        beta_decay         = 0.7
+        # ---------------------------
+
+        dagger_obs: List[np.ndarray] = []
+        dagger_actions: List[np.ndarray] = []
+
+        obs = self.agent._last_obs
+
+        for round_idx in range(n_rounds):
+            beta = beta_decay ** round_idx
+            episodes_per_env = [0] * self.env.num_envs
+
+            # --- raccolta: agente agisce, esperto labella ---
+            while min(episodes_per_env) < n_episodes_per_env:
+                agent_actions, _ = self.agent.predict(obs, deterministic=False)
+                expert_actions = self.expert_policy.predict(obs)
+
+                # beta-mix: con prob beta esegui esperto, altrimenti agente
+                use_expert = self.rng.random(self.env.num_envs) < beta
+                executed = np.where(use_expert[:, np.newaxis], expert_actions, agent_actions)
+
+                next_obs, _, dones, _ = self.env.step(executed)
+
+                for i in range(self.env.num_envs):
+                    # label sempre con azione esperta, indipendentemente da chi ha eseguito
+                    dagger_obs.append(obs[i].copy())
+                    dagger_actions.append(expert_actions[i].copy())
+                    if dones[i]:
+                        episodes_per_env[i] += 1
+
+                obs = next_obs
+
+            # --- BC sul dataset aggregato ---
+            if len(dagger_obs) >= bc_batch_size:
+                obs_np = np.stack(dagger_obs)
+                act_np = np.stack(dagger_actions)
+
+                n_steps = bc_epochs_per_round * len(dagger_obs) // bc_batch_size
+                for _ in range(max(n_steps, 1)):
+                    idxs = self.rng.integers(len(dagger_obs), size=bc_batch_size)
+                    obs_b = torch.tensor(obs_np[idxs], dtype=torch.float32, device=self.agent.device)
+                    act_b = torch.tensor(act_np[idxs], dtype=torch.float32, device=self.agent.device)
+
+                    if isinstance(self.agent, OffPolicyAlgorithm):
+                        # get_action_dist_params + set_actions_from_params → distribuzione completa
+                        mean_actions, log_std, _ = self.agent.actor.get_action_dist_params(obs_b)
+                        self.agent.actor.action_dist.proba_distribution(mean_actions, log_std)
+                        log_prob = self.agent.actor.action_dist.log_prob(act_b)
+                        optimizer = self.agent.actor.optimizer
+                        loss = -log_prob.mean()
+                    else:
+                        _, log_prob, _ = self.agent.policy.evaluate_actions(obs_b, act_b)
+                        optimizer = self.agent.policy.optimizer
+                        loss = -log_prob.mean()
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                    # Prevents NLL from collapsing std to ~0 (PPO only; SAC has explicit entropy bonus)
+                    if isinstance(self.agent, OnPolicyAlgorithm):
+                        with torch.no_grad():
+                            self.agent.policy.log_std.data.clamp_(min=-1.0)
+
+            print(f"[DAgger SFT] round {round_idx + 1}/{n_rounds}  beta={beta:.2f}"
+                  f"  dataset={len(dagger_obs)}  episodes/env={n_episodes_per_env}")
+
+        self.agent._last_obs = obs
+        if isinstance(self.agent, OnPolicyAlgorithm):
+            self.agent._last_episode_starts = np.array(dones)
+
+
