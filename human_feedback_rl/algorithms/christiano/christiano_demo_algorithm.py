@@ -112,6 +112,7 @@ class EnsembleRewardModelWithDemo(EnsembleRewardModel):
         expert_dataset: Optional[ExpertDataset] = None,
         demo_loss_weight: float = 0.1,
         expert_batch_size: int = 32,
+        demo_loss_type: str = "logsigmoid",
     ):
         super().__init__(
             obs_dim=obs_dim,
@@ -126,6 +127,9 @@ class EnsembleRewardModelWithDemo(EnsembleRewardModel):
         self.expert_dataset = expert_dataset
         self.demo_loss_weight = demo_loss_weight
         self.expert_batch_size = expert_batch_size
+        if demo_loss_type not in ("logsigmoid", "constant_grad"):
+            raise ValueError(f"demo_loss_type must be 'logsigmoid' or 'constant_grad', got '{demo_loss_type}'")
+        self.demo_loss_type = demo_loss_type
 
     def train(
         self,
@@ -181,7 +185,12 @@ class EnsembleRewardModelWithDemo(EnsembleRewardModel):
         return metrics
 
     def _demo_loss(self, net: RewardNet, expert_segments: List[Segment]) -> torch.Tensor:
-        """L_demo = -log σ(mean_t R_hat(o_t^expert, a_t^expert))."""
+        if self.demo_loss_type == "constant_grad":
+            return self._demo_loss_constant_grad(net, expert_segments)
+        return self._demo_loss_logsigmoid(net, expert_segments)
+
+    def _demo_loss_logsigmoid(self, net: RewardNet, expert_segments: List[Segment]) -> torch.Tensor:
+        """L_demo = -(1/|B|) Σ log σ(mean_t r̂(o_t, a_t))."""
         total = torch.tensor(0.0, device=self.device)
         for seg in expert_segments:
             obs_t = torch.tensor(seg.obs, dtype=torch.float32, device=self.device)
@@ -189,6 +198,16 @@ class EnsembleRewardModelWithDemo(EnsembleRewardModel):
             r_mean = net(obs_t, act_t).mean()
             total = total + F.logsigmoid(r_mean)
         return -total / len(expert_segments)
+
+    def _demo_loss_constant_grad(self, net: RewardNet, expert_segments: List[Segment]) -> torch.Tensor:
+        """L_demo = softplus(r̂.detach() - r̂)  →  gradient always 0.5, no vanishing."""
+        total = torch.tensor(0.0, device=self.device)
+        for seg in expert_segments:
+            obs_t = torch.tensor(seg.obs, dtype=torch.float32, device=self.device)
+            act_t = torch.tensor(seg.actions, dtype=torch.float32, device=self.device)
+            r_mean = net(obs_t, act_t).mean()
+            total = total + F.softplus(r_mean.detach() - r_mean)
+        return total / len(expert_segments)
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +241,7 @@ class ChristianoDemoAlgorithm(ChristianoAlgorithm):
         rng: np.random.Generator,
         expert_policy,
         demo_loss_weight: float = 0.1,
+        demo_loss_type: str = "logsigmoid",
         expert_dataset_max_size: int = 5000,
         expert_batch_size: int = 32,
         # ── forwarded to base class ────────────────────────────────────
@@ -268,6 +288,7 @@ class ChristianoDemoAlgorithm(ChristianoAlgorithm):
             expert_dataset=self.expert_dataset,
             demo_loss_weight=demo_loss_weight,
             expert_batch_size=expert_batch_size,
+            demo_loss_type=demo_loss_type,
         )
 
         # SFT hyper-parameters set during train()
