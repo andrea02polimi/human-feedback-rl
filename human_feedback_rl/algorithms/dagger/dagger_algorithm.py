@@ -2,7 +2,7 @@ import numpy as np
 import torch
 
 from human_feedback_rl.common import BaseAlgorithm, Transition, Trajectory
-from human_feedback_rl.common.loggers import UnifiedLogger, PrefixLogger
+from human_feedback_rl.common.loggers import MainLogger, PrefixWrapper
 
 try:
     from sumo_rl_ego.policies.base_policy import Policy as RuleBasedPolicy
@@ -43,11 +43,11 @@ class DaggerAlgorithm(BaseAlgorithm):
         )
         self._optimizer = torch.optim.Adam(agent.parameters(), lr=bc_lr)
 
-        self._logger = UnifiedLogger()
-        self._bc_log = PrefixLogger(self._logger, prefix="bc")
-        self._dagger_log = PrefixLogger(self._logger, prefix="dagger")
-        self._train_log = PrefixLogger(self._logger, prefix="train")
-        self._eval_log = PrefixLogger(self._logger, prefix="eval")
+        self._logger = MainLogger()
+        self._bc_log = PrefixWrapper(self._logger, prefix="bc")
+        self._dagger_log = PrefixWrapper(self._logger, prefix="dagger")
+        self._train_log = PrefixWrapper(self._logger, prefix="train")
+        self._eval_log = PrefixWrapper(self._logger, prefix="eval")
 
     def _beta_schedule(self, round_idx: int) -> float:
         """Exponential decay: beta=1.0 at round 0 (pure expert), approaches 0."""

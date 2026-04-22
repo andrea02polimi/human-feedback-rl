@@ -6,7 +6,7 @@ Usato dal RewardTrainerHumLrn per la demonstration loss.
 """
 
 from typing import List
-from human_feedback_rl.common.core import Trajectory
+from human_feedback_rl.common.types import Trajectory
 
 
 class DemonstrationDataset:

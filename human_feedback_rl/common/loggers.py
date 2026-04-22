@@ -3,7 +3,7 @@ import numpy as np
 from stable_baselines3.common.logger import Logger as SB3Logger
 
 
-class UnifiedLogger:
+class MainLogger:
     """
     Central metric store. Record values throughout an iteration, then call
     dump() once to average them and emit a single wandb.log() call.
@@ -37,8 +37,11 @@ class UnifiedLogger:
 
         self.data.clear()
         
+    def log(self, text):
+        print(f"{text}")
 
-class PrefixLogger:
+
+class PrefixWrapper:
     """
     Thin wrapper around UnifiedLogger that prepends a prefix to every key
     and optionally remaps key names before forwarding to the unified store.
@@ -48,18 +51,20 @@ class PrefixLogger:
         log = PrefixLogger(logger, prefix="reward_model", key_map={"loss": "train_loss"})
         log.record("loss", 0.5)   # stored as "reward_model/train_loss"
     """
-    def __init__(self, unified_logger, prefix=None, key_map=None):
-        self.unified_logger = unified_logger
+    def __init__(self, main_logger, prefix=None, key_map=None):
+        self.main_logger = main_logger
         self.prefix = prefix
         self.key_map = key_map or {}
 
     def record(self, key, value, *args, **kwargs):
         key = self.key_map.get(key, key)
         if self.prefix:
-            self.unified_logger.record(f"{self.prefix}/{key}", value)
+            self.main_logger.record(f"{self.prefix}/{key}", value)
         else:
-            self.unified_logger.record(key, value)
+            self.main_logger.record(key, value)
 
     def dump(self, *args, **kwargs):
-        self.unified_logger.dump()
+        self.main_logger.dump()
 
+    def log(self, text):
+        self.main_logger.dump()

@@ -1,38 +1,37 @@
 from .fragmenters import ActiveFragmenter
 from .base_algorithm import BaseAlgorithm
 from .base_policy import BCPolicy
-from .reward_model import RewardNet, EnsembleRewardModel
-from .env_reward_wrapper import EnvRewardWrapper
-from .preference_model import PreferenceModelFromReward
+from .reward_nets import RewardNet, RewardEnsemble
+from .env_wrappers import EnvRewardWrapper
+from .preference_models import PreferenceModelFromReward
 from .schedules import InverseSchedule
-from .loggers import UnifiedLogger, PrefixLogger
+from .loggers import MainLogger, PrefixWrapper
 from .custom_logging_callback import CustomLoggingCallback
 
-from .core import (
-    Segment, 
+from .types import (
+    Fragment, 
     Trajectory, 
-    SegmentPair, 
+    FragmentPair, 
     Preference,
-    PreferenceDataset,
     Transition,
 )
 
 __all__ = [
     "ActiveFragmenter",
     "BaseAlgorithm",
-    "EnsembleRewardModel",
+    "RewardEnsemble",
     "RewardNet",
     "EnvRewardWrapper",
     "PreferenceModelFromReward",
-    "Segment",
-    "SegmentPair",
+    "Fragment",
+    "FragmentPair",
     "Preference",
     "Trajectory",
     "Transition",
     "PreferenceDataset",
     "InverseSchedule",
-    "UnifiedLogger",
-    "PrefixLogger",
+    "MainLogger",
+    "PrefixWrapper",
     "BCPolicy",
     "CustomLoggingCallback",
 ]

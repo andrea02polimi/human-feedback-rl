@@ -2,7 +2,98 @@ import numpy as np
 import random
 
 from typing import List, Tuple
-from .core import Trajectory, Segment, SegmentPair
+from .types import Trajectory, Fragment, FragmentPair
+
+
+
+class RandomFragmenter:
+
+    def __init__(
+        self,
+        rng: np.random.Generator,
+        logger,
+    ) -> None:
+        
+        self.rng = rng
+        self.logger = logger
+
+    def __call__(
+        self,
+        trajectories: List[Trajectory],
+        fragment_length: int,
+        num_pairs: int,
+    ) -> List[FragmentPair]:
+        
+        fragments: List[Fragment] = []
+
+        weights = [len(traj) for traj in trajectories]
+
+        # number of transitions that will be contained in the fragments
+        num_transitions = 2 * num_pairs * fragment_length
+        if sum(weights) < num_transitions:
+            self.logger.warn(
+                "Fewer transitions available than needed for desired number "
+                "of fragment pairs. Some transitions will appear multiple times.",
+            )
+
+        # we need two fragments for each comparison
+        for _ in range(2 * num_pairs):
+            # NumPy's annotation here is overly-conservative, but this works at runtime
+            traj = self.rng.choice(
+                trajectories,  # type: ignore[arg-type]
+                p=np.array(weights) / sum(weights),
+            )
+
+            # if the traj is shorter than the fragment length, than takes the entire traj as the fragment
+            n = len(traj)
+            if n >= fragment_length:
+                start = self.rng.integers(0, n - fragment_length, endpoint=True)
+                end = start + fragment_length
+            else:
+                start = 0
+                end = n
+
+            fragment = Fragment(transitions=traj.transitions[start:end])
+            
+            fragments.append(fragment)
+
+        # fragments is currently a list of single fragments. We want to pair up
+        # fragments to get a list of (fragment1, fragment2) tuples. To do so,
+        # we create a single iterator of the list and zip it with itself:
+        iterator = iter(fragments)
+        return [FragmentPair(frag1=f1, frag2=f2) for f1, f2 in zip(iterator, iterator)]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -26,7 +117,7 @@ class ActiveFragmenter:
     # Public API
     # ------------------------------------------------------------------
 
-    def fragment(self, trajectories: List[Trajectory], num_pairs: int) -> List[SegmentPair]:
+    def fragment(self, trajectories: List[Trajectory], num_pairs: int) -> List[FragmentPair]:
         segments = self._extract_segments(trajectories)
 
         if len(segments) < 2:
@@ -41,20 +132,20 @@ class ActiveFragmenter:
         return self._pair_sequentially(top_segments, num_pairs)
 
     # ------------------------------------------------------------------
-    # Segment extraction
+    # Fragment extraction
     # ------------------------------------------------------------------
 
-    def _extract_segments(self, trajectories: List[Trajectory]) -> List[Segment]:
-        segments: List[Segment] = []
+    def _extract_segments(self, trajectories: List[Trajectory]) -> List[Fragment]:
+        segments: List[Fragment] = []
         for traj in trajectories:
             segments.extend(self._split_trajectory(traj))
         return segments
 
-    def _split_trajectory(self, traj: Trajectory) -> List[Segment]:
+    def _split_trajectory(self, traj: Trajectory) -> List[Fragment]:
         transitions = traj.transitions
         T = len(transitions)
         return [
-            Segment(transitions[start : min(start + self.segment_length, T)])
+            Fragment(transitions[start : min(start + self.segment_length, T)])
             for start in range(0, T, self.segment_length)
         ]
 
@@ -62,7 +153,7 @@ class ActiveFragmenter:
     # Scoring
     # ------------------------------------------------------------------
 
-    def _score_segments(self, segments: List[Segment]) -> List[Tuple[Segment, float, float]]:
+    def _score_segments(self, segments: List[Fragment]) -> List[Tuple[Fragment, float, float]]:
         """Returns list of (segment, reward_score, variance_score).
         All segments are scored in two batched forward passes for efficiency.
         """
@@ -92,20 +183,20 @@ class ActiveFragmenter:
     # Pairing
     # ------------------------------------------------------------------
 
-    def _pair_sequentially(self, segments: List[Segment], num_pairs) -> List[SegmentPair]:
-        pairs: List[SegmentPair] = []
+    def _pair_sequentially(self, segments: List[Fragment], num_pairs) -> List[FragmentPair]:
+        pairs: List[FragmentPair] = []
 
         for i in range(0, len(segments) - 1, 2):
             if len(pairs) >= num_pairs:
                 break
 
             pairs.append(
-                SegmentPair(seg1=segments[i], seg2=segments[i + 1])
+                FragmentPair(seg1=segments[i], seg2=segments[i + 1])
             )
 
         return pairs
     
-    def _pair_randomly(self, segments: List[Segment], num_pairs) -> List[SegmentPair]:
+    def _pair_randomly(self, segments: List[Fragment], num_pairs) -> List[FragmentPair]:
         segments = segments.copy()          # avoid modifying original list
         random.shuffle(segments)            # randomize order
 
