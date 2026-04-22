@@ -6,7 +6,7 @@ from typing import Any, List, Tuple, Sequence
 class Transition:
     obs: Any        # o_t
     action: Any     # a_t
-    reward: float   # r_t (true reward)
+    true_reward: float   # r_t (true reward)
 
 
 @dataclass

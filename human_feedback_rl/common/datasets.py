@@ -1,3 +1,4 @@
+import numpy as np
 import random
 from collections import deque
 from typing import Any, Deque, List, Tuple
@@ -20,9 +21,12 @@ class BaseDataset:
             else:
                 self.val_data.append(item)
 
-    def get_train(self) -> List[Any]:
-        data = list(self.train_data)
-        return data
+    def get_train(self, batch_size) -> List[Any]:
+        indices = np.random.permutation(len(self.train_data))
+        start_idx = 0
+        while start_idx < len(self.train_data):
+            yield self.train_data[indices[start_idx:start_idx + batch_size]]
+            start_idx += batch_size
 
     def get_val(self) -> List[Any]:
         data = list(self.val_data)
@@ -35,9 +39,21 @@ class BaseDataset:
     def __len__(self) -> int:
         return len(self.train_data) + len(self.val_data)
 
+class DiscountedBaseDataset(BaseDataset):
+    def __init__(self, train_frac: float = 0.8, queue_size: int = 1000):
+        super().__init__(train_frac, queue_size)
+
+    def push(self, *items: Any) -> None:
+        # incrementa contatore degli items
+        for item in self.train_data:
+            item[-1] += 1
+        for item in self.val_data:
+            item[-1] += 1
+        items = [(item,1) for item in items] # aggiungi items con contatore 1
+        super().push(*items)
 
 
-class PreferenceDataset(BaseDataset):
+class PreferenceDataset(DiscountedBaseDataset):
     def __init__(self, train_frac: float = 0.8, queue_size: int = 1000):
         super().__init__(train_frac=train_frac, queue_size=queue_size)
 
@@ -45,12 +61,3 @@ class PreferenceDataset(BaseDataset):
         assert len(pairs) == len(preferences), "pairs and preferences must have the same length"
         items = list(zip(pairs, preferences))
         super().push(*items)
-
-    def get_train(self) -> List[Tuple[FragmentPair, Preference]]:
-        return super().get_train()
-
-    def get_val(self) -> List[Tuple[FragmentPair, Preference]]:
-        return super().get_val()
-
-    def get_all(self) -> List[Tuple[FragmentPair, Preference]]:
-        return super().get_all()

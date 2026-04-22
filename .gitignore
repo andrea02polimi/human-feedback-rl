@@ -216,3 +216,4 @@ expert_policies/
 *.pth
 
 wandb/
+project

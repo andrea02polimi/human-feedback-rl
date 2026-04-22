@@ -2,7 +2,7 @@ from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.base_class import BaseAlgorithm
 from .reward_nets import RewardNet
 from .loggers import MainLogger
-from .env_wrappers import EnvRewardWrapper, EnvBufferingWrapper, EnvExplorationWrapper
+from .env_wrappers import EnvRewardWrapper, EnvBufferingWrapper, PolicyExplorationWrapper
 from . import types
 import numpy as np
 from typing import List, Tuple, Any, Dict, Sequence, Optional
@@ -57,11 +57,10 @@ class TrajectoryGeneratorFromAgent:
         # `self.algorithm` are themselves stochastic if `self.algorithm` is stochastic.
         # Otherwise, they are deterministic, and action selection is only stochastic
         # when sampling from the random policy.
-        self.exploration_wrapper = EnvExplorationWrapper(
+        self.exploration_wrapper = PolicyExplorationWrapper(
             policy=self.agent,
             venv=algo_venv,
             random_prob=random_prob,
-            switch_prob=switch_prob,
             rng=self.rng,
         )
 
@@ -76,7 +75,7 @@ class TrajectoryGeneratorFromAgent:
             RuntimeError: Transitions left in `self.buffering_wrapper`; call
                 `self.sample` first to clear them.
         """
-        n_transitions = self.buffering_wrapper.n_transitions
+        n_transitions = self.buffering_wrapper.n_steps
         if n_transitions:
             raise RuntimeError(
                 f"There are {n_transitions} transitions left in the buffer. "

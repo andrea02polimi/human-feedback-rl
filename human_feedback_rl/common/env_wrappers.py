@@ -47,13 +47,6 @@ class EnvRewardWrapper(VecEnvWrapper):
         self.reward_model = reward_model
         self._obs: np.ndarray | None = None
         self._actions: np.ndarray | None = None
-        self._reward_stats = _RunningMeanStd()
-
-    def reset_stats(self):
-        if self._reward_stats.count > 1:
-            new_count = self._reward_stats.count // 2
-            self._reward_stats.var = self._reward_stats.var * (new_count - 1) / (self._reward_stats.count - 1)
-            self._reward_stats.count = new_count
 
     def reset(self):
         obs = self.venv.reset()
@@ -65,17 +58,15 @@ class EnvRewardWrapper(VecEnvWrapper):
         self.venv.step_async(actions)
 
     def step_wait(self):
-        obs, _env_rewards, dones, infos = self.venv.step_wait()
+        obs, true_rew, dones, infos = self.venv.step_wait()
 
         if self._obs is not None and self._actions is not None:
-            rewards = self.reward_model.predict(self._obs, self._actions)
-            self._reward_stats.update(rewards)
-            rewards = ((rewards - self._reward_stats.mean) / self._reward_stats.std).astype(np.float32)
+            predicted_rew = self.reward_model.predict(self._obs, self._actions)
         else:
-            rewards = np.zeros(len(obs), dtype=np.float32)
+            predicted_rew = np.zeros(len(obs), dtype=np.float32)
 
         self._obs = np.asarray(obs, dtype=np.float32)
-        return obs, rewards, dones, infos
+        return obs, predicted_rew, dones, infos
     
 
 
@@ -104,23 +95,17 @@ class EnvBufferingWrapper(VecEnvWrapper):
         # frammenti/traiettorie correnti, una per env parallelo
         self._partial_trajectories: List[types.Trajectory] = []
 
-        # lunghezze episodi terminati
-        self._ep_lens: List[int] = []
-
         # contatore timestep per ogni env parallelo
         self._timesteps: np.ndarray | None = None
-
-        # numero totale di transizioni accumulate dall'ultimo pop
-        self.n_transitions: int = 0
 
         # ultima osservazione vista per ogni env
         self._last_obs = None
 
-    def reset(self, **kwargs):
+    def reset(self, **kwargs): #TODO da prendere ispirazione da imitation
         """
         Resetta l'ambiente e inizializza una traiettoria vuota per ogni env.
         """
-        if self._initialized and self.error_on_premature_reset and self.n_transitions > 0:
+        if self._initialized and self.error_on_premature_reset:
             raise RuntimeError(
                 "BufferingWrapper reset() called before buffered samples were accessed"
             )
@@ -131,9 +116,7 @@ class EnvBufferingWrapper(VecEnvWrapper):
         self._saved_actions = None
         self._finished_trajectories = []
         self._partial_trajectories = [types.Trajectory(transitions=[]) for _ in range(self.num_envs)]
-        self._ep_lens = []
         self._timesteps = np.zeros(self.num_envs, dtype=int)
-        self.n_transitions = 0
         self._last_obs = obs
 
         return obs
@@ -154,16 +137,15 @@ class EnvBufferingWrapper(VecEnvWrapper):
         actions = self._saved_actions
         self._saved_actions = None
 
-        obs, rewards, dones, infos = self.venv.step_wait()
+        obs, true_rew, dones, infos = self.venv.step_wait()
 
-        self.n_transitions += self.num_envs
         self._timesteps += 1
 
         for i in range(self.num_envs):
             transition = types.Transition(
                 obs=self._last_obs[i],      # o_t
                 action=actions[i],          # a_t
-                reward=float(rewards[i]),   # r_t
+                true_reward=float(true_rew[i]),   # r_t
             )
 
             self._partial_trajectories[i].add_transition(transition)
@@ -171,27 +153,23 @@ class EnvBufferingWrapper(VecEnvWrapper):
             if dones[i]:
                 # episodio finito: salva traiettoria completa
                 self._finished_trajectories.append(self._partial_trajectories[i])
-                self._ep_lens.append(int(self._timesteps[i]))
 
                 # ricomincia una nuova traiettoria vuota per quell'env
                 self._partial_trajectories[i] = types.Trajectory(transitions=[])
                 self._timesteps[i] = 0
 
         self._last_obs = obs
-        return obs, rewards, dones, infos
+        return obs, true_rew, dones, infos
 
     def pop_finished_trajectories(self) -> Tuple[List[types.Trajectory], List[int]]:
         """
         Restituisce solo le traiettorie complete terminate dall'ultimo pop.
         """
         trajectories = self._finished_trajectories
-        ep_lens = self._ep_lens
 
         self._finished_trajectories = []
-        self._ep_lens = []
-        self.n_transitions = sum(len(traj.transitions) for traj in self._partial_trajectories)
 
-        return trajectories, ep_lens
+        return trajectories
 
     def pop_trajectories(self) -> Tuple[List[types.Trajectory], List[int]]:
         """
@@ -202,11 +180,8 @@ class EnvBufferingWrapper(VecEnvWrapper):
         I frammenti correnti vengono restituiti ma NON persi: qui li svuotiamo
         e ripartiamo da traiettorie vuote.
         """
-        if self.n_transitions == 0:
-            return [], []
 
         trajectories = list(self._finished_trajectories)
-        ep_lens = list(self._ep_lens)
 
         # aggiungi anche i frammenti correnti non vuoti
         for traj in self._partial_trajectories:
@@ -215,31 +190,13 @@ class EnvBufferingWrapper(VecEnvWrapper):
 
         # reset buffer interno
         self._finished_trajectories = []
-        self._ep_lens = []
         self._partial_trajectories = [types.Trajectory(transitions=[]) for _ in range(self.num_envs)]
-        self.n_transitions = 0
 
-        return trajectories, ep_lens
-
-    def pop_transitions(self) -> List[types.Transition]:
-        """
-        Restituisce tutte le transizioni raccolte dall'ultimo pop
-        come lista piatta di Transition.
-        """
-        if self.n_transitions == 0:
-            raise RuntimeError("Called pop_transitions on an empty BufferingWrapper")
-
-        trajectories, _ = self.pop_trajectories()
-
-        transitions: List[types.Transition] = []
-        for traj in trajectories:
-            transitions.extend(traj.transitions)
-
-        return transitions
+        return trajectories
 
 
 
-class EnvExplorationWrapper:
+class PolicyExplorationWrapper:
     """
     Wrapper che rende una policy più esplorativa.
 
@@ -262,7 +219,6 @@ class EnvExplorationWrapper:
         policy: Callable,
         venv: VecEnv,
         random_prob: float,
-        switch_prob: float,
         rng: np.random.Generator,
     ):
         """
@@ -274,83 +230,22 @@ class EnvExplorationWrapper:
                 Ambiente vettorizzato, usato per campionare azioni casuali.
             random_prob:
                 Probabilità di scegliere la policy casuale quando avviene uno switch.
-            switch_prob:
-                Probabilità di cambiare policy dopo ogni chiamata.
             rng:
                 Generatore random usato per tutte le scelte casuali.
         """
         self.wrapped_policy = policy
         self.venv = venv
         self.random_prob = random_prob
-        self.switch_prob = switch_prob
         self.rng = rng
 
         # Seed dell'action space, così anche il sampling casuale dipende da rng
         seed = int(self.rng.integers(0, 2**31 - 1))
         self.venv.action_space.seed(seed)
 
-        # La policy attualmente attiva: inizialmente la impostiamo
-        # e poi la scegliamo davvero con _switch()
-        self.current_policy = self.wrapped_policy
-        self._switch()
-
-    def _random_policy(
-        self,
-        obs: Union[np.ndarray, Dict[str, np.ndarray]],
-        state: Optional[Tuple[np.ndarray, ...]],
-        episode_start: Optional[np.ndarray],
-    ) -> Tuple[np.ndarray, None]:
-        """
-        Policy casuale: ignora input e campiona un'azione random per ogni env.
-        """
-        del state, episode_start
-
-        num_envs = len(obs)
-        actions = [self.venv.action_space.sample() for _ in range(num_envs)]
-        actions = np.stack(actions, axis=0)
-        return actions, None
-
-    def _switch(self) -> None:
-        """
-        Sceglie una nuova policy corrente:
-        - random policy con probabilità random_prob
-        - wrapped policy altrimenti
-        """
+    def predict(self, observation: np.ndarray) -> np.ndarray:
         if self.rng.random() < self.random_prob:
-            self.current_policy = self._random_policy
-        else:
-            self.current_policy = self.wrapped_policy
-
-    def __call__(
-        self,
-        observation: Union[np.ndarray, Dict[str, np.ndarray]],
-        input_state: Optional[Tuple[np.ndarray, ...]],
-        episode_start: Optional[np.ndarray],
-    ) -> Tuple[np.ndarray, None]:
-        """
-        Calcola l'azione usando la policy corrente.
-
-        Dopo aver prodotto l'azione, con probabilità switch_prob
-        cambia policy per la chiamata successiva.
-
-        Non supporta policy stateful/ricorrenti.
-        """
-        del episode_start
-
-        if input_state is not None:
-            raise ValueError(
-                "ExplorationWrapper does not support stateful policies."
-            )
-
-        actions, output_state = self.current_policy(observation, None, None)
-
-        if output_state is not None:
-            raise ValueError(
-                "ExplorationWrapper does not support stateful policies."
-            )
-
-        # Con una certa probabilità cambia policy per il prossimo step
-        if self.rng.random() < self.switch_prob:
-            self._switch()
-
-        return actions, None
+            num_envs = len(observation)
+            actions = [self.venv.action_space.sample() for _ in range(num_envs)]
+            actions = np.stack(actions, axis=0)
+            return actions
+        return self.wrapped_policy.predict(observation)
