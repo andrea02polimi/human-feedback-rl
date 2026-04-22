@@ -37,6 +37,12 @@ from stable_baselines3.common.utils import obs_as_tensor
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 
+try:
+    from sumo_gym_ego import EgoStatus
+    _HAS_EGO_STATUS = True
+except ImportError:
+    _HAS_EGO_STATUS = False
+
 from human_feedback_rl.common import (
     EnsembleRewardModel,
     RewardNet,
@@ -382,6 +388,58 @@ class ChristianoDemoAlgorithm(ChristianoAlgorithm):
             reward_model_batch_size=reward_model_batch_size,
         )
 
+    def _eval_pretrained_agent(self, n_eval_episodes: int = 100) -> None:
+        """Evaluate the agent deterministically and log stats with prefix pretrain_eval/."""
+        n_envs = self.env.num_envs
+        episodes_done = 0
+        n_collisions = n_off_road = n_timeouts = n_successes = 0
+        ep_true_rewards: List[float] = []
+        ep_lengths: List[int] = []
+
+        obs = self.agent._last_obs
+        ep_reward = np.zeros(n_envs)
+        ep_length = np.zeros(n_envs, dtype=int)
+
+        while episodes_done < n_eval_episodes:
+            actions, _ = self.agent.predict(obs, deterministic=True)
+            obs, true_rewards, dones, infos = self.env.step(actions)
+            ep_reward += true_rewards
+            ep_length += 1
+
+            for i in range(n_envs):
+                if dones[i]:
+                    episodes_done += 1
+                    ep_true_rewards.append(float(ep_reward[i]))
+                    ep_lengths.append(int(ep_length[i]))
+                    ep_reward[i] = 0.0
+                    ep_length[i] = 0
+                    if _HAS_EGO_STATUS:
+                        ego_status = infos[i].get("ego_status")
+                        if ego_status is not None:
+                            n_collisions += int(ego_status == EgoStatus.COLLIDED.value)
+                            n_off_road   += int(ego_status == EgoStatus.OFF_ROAD.value)
+                            n_timeouts   += int(ego_status == EgoStatus.TIMEOUT.value)
+                            n_successes  += int(ego_status == EgoStatus.ARRIVED.value)
+
+        n = len(ep_true_rewards)
+        metrics: Dict[str, float] = {
+            "pretrain_eval/mean_true_reward": float(np.mean(ep_true_rewards)),
+            "pretrain_eval/mean_ep_length":   float(np.mean(ep_lengths)),
+        }
+        if n > 0 and _HAS_EGO_STATUS:
+            metrics["pretrain_eval/success_rate"]   = n_successes  / n
+            metrics["pretrain_eval/collision_rate"] = n_collisions / n
+            metrics["pretrain_eval/off_road_rate"]  = n_off_road   / n
+            metrics["pretrain_eval/timeout_rate"]   = n_timeouts   / n
+
+        self.logger.log(metrics)
+        print(
+            f"[Pretrain eval] {n} episodes | "
+            f"success={metrics.get('pretrain_eval/success_rate', float('nan')):.2f} | "
+            f"mean_reward={metrics['pretrain_eval/mean_true_reward']:.2f} | "
+            f"mean_ep_len={metrics['pretrain_eval/mean_ep_length']:.1f}"
+        )
+
     def _pretraining_phase(
         self,
         n_initial_queries: int,
@@ -405,6 +463,10 @@ class ChristianoDemoAlgorithm(ChristianoAlgorithm):
         print(f"[Pre-training] SFT: {self._n_sft_steps} BC steps...")
         # self._sft_phase(self._n_sft_steps, self._sft_batch_size)
         self._dagger_sft_phase()
+
+        # 2b. Valutazione agente post-DAgger (baseline prima di Christiano)
+        print("[Pre-training] Evaluating pretrained agent (100 episodes)...")
+        self._eval_pretrained_agent(n_eval_episodes=100)
 
         # 3+4. Raccolta preferenze + pre-training RM (parent)
         super()._pretraining_phase(n_initial_queries, reward_model_train_steps, reward_model_batch_size)
