@@ -175,6 +175,8 @@ class ChristianoAlgorithm:
 
             self._iteration += 1
 
+        return self.trajectory_generator.agent
+
 
     def train_reward_model(self, epoch_multiplier: float = 1.0, decay: float = 0.01):
         total_epochs = max(1, int(round(self.n_ephochs_rew * epoch_multiplier)))
