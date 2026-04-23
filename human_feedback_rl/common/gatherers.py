@@ -1,23 +1,12 @@
-import numpy as np
-from abc import ABC, abstractmethod
 from typing import List
 
 from human_feedback_rl.common.types import FragmentPair, Preference
 
 
-class PreferenceGatherer(ABC):
-    """Abstract interface for obtaining preferences."""
-
-    @abstractmethod
-    def gather(self, fragment_pairs: List[FragmentPair]) -> List[Preference]:
-        """Return preferences for fragment pairs."""
-        pass
-
-
-class PreferenceGathererFromReward(PreferenceGatherer):
+class PreferenceGathererFromReward:
     """Uses ground-truth rewards to generate preferences (for testing)."""
 
-    def gather(self, fragment_pairs: List[FragmentPair]) -> List[Preference]:
+    def __call__(self, fragment_pairs: List[FragmentPair]) -> List[Preference]:
         preferences = []
         for pair in fragment_pairs:
             reward1 = pair.frag1.total_reward()

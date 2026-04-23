@@ -4,7 +4,7 @@ from typing import List, Tuple, Any, Dict, Callable, Union, Optional
 from stable_baselines3.common.vec_env import VecEnvWrapper, VecEnv
 
 from .reward_nets import RewardEnsemble
-from . import types
+from .types import Trajectory, Transition
 
 class _RunningMeanStd:
     """Welford's online algorithm for running mean and variance."""
@@ -90,10 +90,10 @@ class EnvBufferingWrapper(VecEnvWrapper):
         self._saved_actions = None
 
         # traiettorie complete terminate
-        self._finished_trajectories: List[types.Trajectory] = []
+        self._finished_trajectories: List[Trajectory] = []
 
         # frammenti/traiettorie correnti, una per env parallelo
-        self._partial_trajectories: List[types.Trajectory] = []
+        self._partial_trajectories: List[Trajectory] = []
 
         # contatore timestep per ogni env parallelo
         self._timesteps: np.ndarray | None = None
@@ -101,25 +101,8 @@ class EnvBufferingWrapper(VecEnvWrapper):
         # ultima osservazione vista per ogni env
         self._last_obs = None
 
-    def reset(self, **kwargs): #TODO da prendere ispirazione da imitation
-        """
-        Resetta l'ambiente e inizializza una traiettoria vuota per ogni env.
-        """
-        if self._initialized and self.error_on_premature_reset:
-            raise RuntimeError(
-                "BufferingWrapper reset() called before buffered samples were accessed"
-            )
-
-        obs = self.venv.reset(**kwargs)
-
-        self._initialized = True
-        self._saved_actions = None
-        self._finished_trajectories = []
-        self._partial_trajectories = [types.Trajectory(transitions=[]) for _ in range(self.num_envs)]
-        self._timesteps = np.zeros(self.num_envs, dtype=int)
-        self._last_obs = obs
-
-        return obs
+    def is_empty(self):
+        return len(self._finished_trajectories) == 0
 
     def step_async(self, actions):
         assert self._initialized, "Call reset() before stepping."
@@ -142,8 +125,8 @@ class EnvBufferingWrapper(VecEnvWrapper):
         self._timesteps += 1
 
         for i in range(self.num_envs):
-            transition = types.Transition(
-                obs=self._last_obs[i],      # o_t
+            transition = Transition(
+                observation=self._last_obs[i],      # o_t
                 action=actions[i],          # a_t
                 true_reward=float(true_rew[i]),   # r_t
             )
@@ -155,44 +138,45 @@ class EnvBufferingWrapper(VecEnvWrapper):
                 self._finished_trajectories.append(self._partial_trajectories[i])
 
                 # ricomincia una nuova traiettoria vuota per quell'env
-                self._partial_trajectories[i] = types.Trajectory(transitions=[])
+                self._partial_trajectories[i] = Trajectory()
                 self._timesteps[i] = 0
 
         self._last_obs = obs
         return obs, true_rew, dones, infos
 
-    def pop_finished_trajectories(self) -> Tuple[List[types.Trajectory], List[int]]:
+    def pop_finished_trajectories(self) -> List[Trajectory]:
         """
         Restituisce solo le traiettorie complete terminate dall'ultimo pop.
         """
+
+        if len(self._finished_trajectories) == 0:
+            return []
+
         trajectories = self._finished_trajectories
 
         self._finished_trajectories = []
 
         return trajectories
 
-    def pop_trajectories(self) -> Tuple[List[types.Trajectory], List[int]]:
-        """
-        Restituisce:
-        - tutte le traiettorie complete
-        - tutti i frammenti correnti non vuoti
+    def reset(self, **kwargs):
+        if (
+            self._initialized
+            and self.error_on_premature_reset
+            and len(self._finished_trajectories) > 0
+        ):
+            raise RuntimeError("reset() chiamato prima di aver letto le traiettorie salvate.")
 
-        I frammenti correnti vengono restituiti ma NON persi: qui li svuotiamo
-        e ripartiamo da traiettorie vuote.
-        """
+        self._initialized = True
+        self._saved_actions = None
 
-        trajectories = list(self._finished_trajectories)
+        obs = self.venv.reset(**kwargs)
+        self._last_obs = obs
 
-        # aggiungi anche i frammenti correnti non vuoti
-        for traj in self._partial_trajectories:
-            if traj.length() > 0:
-                trajectories.append(traj)
-
-        # reset buffer interno
+        self._timesteps = np.zeros(self.num_envs, dtype=int)
+        self._partial_trajectories = [Trajectory() for _ in range(self.num_envs)]
         self._finished_trajectories = []
-        self._partial_trajectories = [types.Trajectory(transitions=[]) for _ in range(self.num_envs)]
 
-        return trajectories
+        return obs
 
 
 

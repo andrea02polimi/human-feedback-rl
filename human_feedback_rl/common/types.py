@@ -4,23 +4,25 @@ from typing import Any, List, Tuple, Sequence
 
 @dataclass
 class Transition:
-    obs: Any        # o_t
+    observation: Any        # o_t
     action: Any     # a_t
     true_reward: float   # r_t (true reward)
 
 
 @dataclass
-class Trajectory:
-    transitions: List[Transition]
+class Trajectory(List[Transition]):
 
+    def __init__(self, transitions=None):
+        super().__init__(transitions or [])
+        
     def total_reward(self) -> float:
-        return sum(t.reward for t in self.transitions)
+        return sum(t.true_reward for t in self)
     
     def length(self) -> int:
-        return len(self.transitions)
+        return len(self)
 
     def add_transition(self, transition: Transition) -> None:
-        self.transitions.append(transition)
+        self.append(transition)
 
 
 Fragment = Trajectory

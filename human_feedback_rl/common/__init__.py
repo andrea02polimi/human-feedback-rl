@@ -1,4 +1,3 @@
-from .fragmenters import ActiveFragmenter
 from .base_algorithm import BaseAlgorithm
 from .base_policy import BCPolicy
 from .reward_nets import RewardNet, RewardEnsemble
@@ -17,7 +16,6 @@ from .types import (
 )
 
 __all__ = [
-    "ActiveFragmenter",
     "BaseAlgorithm",
     "RewardEnsemble",
     "RewardNet",

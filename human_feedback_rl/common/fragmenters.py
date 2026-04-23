@@ -40,7 +40,7 @@ class RandomFragmenter:
         for _ in range(2 * num_pairs):
             # NumPy's annotation here is overly-conservative, but this works at runtime
             traj = self.rng.choice(
-                trajectories,  # type: ignore[arg-type]
+                np.array(trajectories, dtype=object),
                 p=np.array(weights) / sum(weights),
             )
 
@@ -53,7 +53,7 @@ class RandomFragmenter:
                 start = 0
                 end = n
 
-            fragment = Fragment(transitions=traj.transitions[start:end])
+            fragment = Fragment(traj[start:end])
             
             fragments.append(fragment)
 

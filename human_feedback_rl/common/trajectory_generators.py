@@ -6,6 +6,9 @@ from .env_wrappers import EnvRewardWrapper, EnvBufferingWrapper, PolicyExplorati
 from . import types
 import numpy as np
 from typing import List, Tuple, Any, Dict, Sequence, Optional
+from .custom_logging_callback import CustomLoggingCallback
+import torch as th
+
 
 class TrajectoryGeneratorFromAgent:
     """Wrapper for training an SB3 agent on an arbitrary reward function."""
@@ -18,7 +21,6 @@ class TrajectoryGeneratorFromAgent:
         rng: np.random.Generator,
         logger: MainLogger,
         exploration_frac: float = 0.0,
-        switch_prob: float = 0.5,
         random_prob: float = 0.5,
     ) -> None:
         
@@ -75,21 +77,21 @@ class TrajectoryGeneratorFromAgent:
             RuntimeError: Transitions left in `self.buffering_wrapper`; call
                 `self.sample` first to clear them.
         """
-        n_transitions = self.buffering_wrapper.n_steps
-        if n_transitions:
+        
+        if not self.buffering_wrapper.is_empty():
             raise RuntimeError(
-                f"There are {n_transitions} transitions left in the buffer. "
+                f"There are transitions left in the buffer. "
                 "Call AgentTrainer.sample() first to clear them.",
             )
         self.agent.learn(
             total_timesteps=steps,
             reset_num_timesteps=False,
-            callback=self.log_callback,
+            callback=CustomLoggingCallback(),
             **kwargs,
         )
 
     def sample(self, steps: int) -> Sequence[types.Trajectory]:
-        agent_trajs, _ = self.buffering_wrapper.pop_finished_trajectories()
+        agent_trajs = self.buffering_wrapper.pop_finished_trajectories()
         # We typically have more trajectories than are needed.
         # In that case, we use the final trajectories because
         # they are the ones with the most relevant version of
@@ -120,7 +122,7 @@ class TrajectoryGeneratorFromAgent:
                 steps=agent_steps - avail_steps,
                 deterministic_policy=False,
             )
-            additional_trajs, _ = self.buffering_wrapper.pop_finished_trajectories()
+            additional_trajs = self.buffering_wrapper.pop_finished_trajectories()
             agent_trajs = list(agent_trajs) + list(additional_trajs)
         
         agent_trajs = _get_trajectories(agent_trajs, agent_steps)
@@ -138,7 +140,7 @@ class TrajectoryGeneratorFromAgent:
                 steps=exploration_steps,
                 deterministic_policy=False,
             )
-            exploration_trajs, _ = self.buffering_wrapper.pop_finished_trajectories()
+            exploration_trajs = self.buffering_wrapper.pop_finished_trajectories()
             exploration_trajs = _get_trajectories(exploration_trajs, exploration_steps)
             # We call _get_trajectories separately on agent_trajs and exploration_trajs
             # and then just concatenate. This could mean we return slightly too many
@@ -146,8 +148,22 @@ class TrajectoryGeneratorFromAgent:
             # transitions roughly right.
             trajectories.extend(exploration_trajs)
 
+        # logs
+        true_rewards  = [traj.total_reward()  for traj in trajectories]   # se rews = env reward
+        model_rewards = [self._score_trajectory(traj) for traj in trajectories]
+        lengths       = [len(traj) for traj in trajectories]
+
+        self.logger.record("rollout/mean_true_reward",  np.mean(true_rewards))
+        self.logger.record("rollout/mean_model_reward", np.mean(model_rewards))
+        self.logger.record("rollout/mean_length",       np.mean(lengths))
+
         return trajectories
 
+
+    def _score_trajectory(self, traj: types.Trajectory) -> float:
+        obs  = np.array([t.observation for t in traj])  # (T, obs_dim)
+        acts = np.array([t.action for t in traj])        # (T, act_dim)
+        return self.reward_model.predict(obs, acts).sum()
 
 
 
@@ -184,25 +200,15 @@ def rollout_agent(
     steps: int,
     deterministic_policy: bool = False,
 ) -> None:
-    """
-    Fa interagire l'agente con il VecEnv per un certo numero di step.
-
-    Si assume che `venv` sia wrappato in modo tale da salvare automaticamente
-    transizioni / traiettorie in un buffer interno.
-
-    Args:
-        policy: policy o modello SB3 con metodo `predict(obs, deterministic=...)`.
-        venv: ambiente vettorializzato wrappato con un buffer.
-        steps: numero totale di step da simulare.
-        deterministic_policy: se True usa azioni deterministiche.
-    """
     obs = venv.reset()
     state: Optional[np.ndarray] = None
     episode_starts = np.ones(venv.num_envs, dtype=bool)
 
     collected_steps = 0
+    finishing = False
+    active_envs = np.ones(venv.num_envs, dtype=bool)  # quali env devono ancora finire
 
-    while collected_steps < steps:
+    while True:
         actions, state = policy.predict(
             obs,
             state=state,
@@ -214,3 +220,11 @@ def rollout_agent(
 
         episode_starts = dones
         collected_steps += venv.num_envs
+
+        if collected_steps >= steps:
+            finishing = True
+
+        if finishing:
+            active_envs &= ~dones  # gli env che hanno fatto done non sono più attivi
+            if not active_envs.any():
+                break  # tutti gli env hanno finito il loro episodio

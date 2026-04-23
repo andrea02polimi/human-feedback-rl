@@ -4,6 +4,8 @@ from collections import deque
 from typing import Any, Deque, List, Tuple
 from .types import FragmentPair, Preference
 
+from dataclasses import dataclass
+
 
 class BaseDataset:
     def __init__(self, train_frac: float = 0.8, queue_size: int = 1000):
@@ -21,12 +23,18 @@ class BaseDataset:
             else:
                 self.val_data.append(item)
 
-    def get_train(self, batch_size) -> List[Any]:
-        indices = np.random.permutation(len(self.train_data))
+    def get(self, batch_size):
+        data = list(self.train_data)
+        indices = np.random.permutation(len(data))
         start_idx = 0
-        while start_idx < len(self.train_data):
-            yield self.train_data[indices[start_idx:start_idx + batch_size]]
+        while start_idx < len(data):
+            batch_indices = indices[start_idx:start_idx + batch_size]
+            yield [data[i] for i in batch_indices]
             start_idx += batch_size
+
+    def get_train(self) -> List[Any]:
+        data = list(self.train_data)
+        return data
 
     def get_val(self) -> List[Any]:
         data = list(self.val_data)
@@ -39,25 +47,32 @@ class BaseDataset:
     def __len__(self) -> int:
         return len(self.train_data) + len(self.val_data)
 
-class DiscountedBaseDataset(BaseDataset):
-    def __init__(self, train_frac: float = 0.8, queue_size: int = 1000):
-        super().__init__(train_frac, queue_size)
-
-    def push(self, *items: Any) -> None:
-        # incrementa contatore degli items
-        for item in self.train_data:
-            item[-1] += 1
-        for item in self.val_data:
-            item[-1] += 1
-        items = [(item,1) for item in items] # aggiungi items con contatore 1
-        super().push(*items)
 
 
-class PreferenceDataset(DiscountedBaseDataset):
+
+@dataclass
+class PreferenceBatch:
+    fragment_pairs: List[FragmentPair]
+    preferences: List[Preference]
+    timestamps: List[int]
+
+
+class PreferenceDataset(BaseDataset):
     def __init__(self, train_frac: float = 0.8, queue_size: int = 1000):
         super().__init__(train_frac=train_frac, queue_size=queue_size)
 
-    def push(self, pairs: List[FragmentPair], preferences: List[Preference]) -> None:
-        assert len(pairs) == len(preferences), "pairs and preferences must have the same length"
-        items = list(zip(pairs, preferences))
+    def push(self, fragment_pairs: List[FragmentPair], preferences: List[Preference], timestamp: int) -> None:
+        assert len(fragment_pairs) == len(preferences), "pairs and preferences must have the same length"
+        items = [(frag, pref, timestamp) for frag, pref in zip(fragment_pairs, preferences)]
         super().push(*items)
+        
+    def get(self, batch_size):
+        data = list(self.train_data)
+        indices = np.random.permutation(len(data))
+        start_idx = 0
+        while start_idx < len(data):
+            batch_indices = indices[start_idx:start_idx + batch_size]
+            batch = [data[i] for i in batch_indices]
+            fragment_pairs, preferences, timestamps = zip(*batch)
+            yield PreferenceBatch(list(fragment_pairs), list(preferences), list(timestamps))
+            start_idx += batch_size
