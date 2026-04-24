@@ -17,11 +17,13 @@ class BaseDataset:
         self.val_data: Deque[Any] = deque(maxlen=queue_size)
 
     def push(self, *items: Any) -> None:
-        for item in items:
-            if random.random() < self.train_frac:
-                self.train_data.append(item)
-            else:
-                self.val_data.append(item)
+        items = list(items)
+        random.shuffle(items)
+        n_train = round(len(items) * self.train_frac)
+        for item in items[:n_train]:
+            self.train_data.append(item)
+        for item in items[n_train:]:
+            self.val_data.append(item)
 
     def get(self, batch_size):
         data = list(self.train_data)

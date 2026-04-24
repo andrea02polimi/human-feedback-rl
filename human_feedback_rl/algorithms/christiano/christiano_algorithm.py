@@ -40,18 +40,18 @@ class ChristianoAlgorithm:
         self,
         env,
         agent,
-        lr_rew: float = 0.01,
+        lr_rew: float = 0.1,
         batch_size_rew: int = 100,
-        n_ephochs_rew: int = 10,
+        n_ephochs_rew: int = 3,
         n_ensembles_rew: int = 4,
-        n_iterations: int = 10,
-        train_comparison_frac: int = 0.1,
-        fragment_length: int = 10,
-        transition_oversampling: float = 1,
+        n_iterations: int = 100,
+        train_comparison_frac: int = 0.7,
+        fragment_length: int = 1,
+        transition_oversampling: int = 1,
         initial_comparison_frac: float = 0.1,
-        initial_epoch_multiplier: float = 200.0,
-        query_schedule: Union[str, Callable[[float], float]] = "hyperbolic",
-        comparison_queue_size: Optional[int] = None,
+        initial_epoch_multiplier: int = 5,
+        query_schedule: Union[str, Callable[[float], float]] = "constant",
+        comparison_queue_size: int = 1_000_000,
         rng: Optional[np.random.Generator] = None,
     ):
         self.batch_size_rew = batch_size_rew
@@ -180,10 +180,9 @@ class ChristianoAlgorithm:
 
     def train_reward_model(self, epoch_multiplier: float = 1.0, decay: float = 0.01):
         total_epochs = max(1, int(round(self.n_ephochs_rew * epoch_multiplier)))
-
+        
         for epoch in range(total_epochs):
             for batch in self.dataset.get(self.batch_size_rew):
-                
                 bt_probs = self.preference_model(batch.fragment_pairs)  # (batch_size, 2)
                 
                 labels = th.tensor(
