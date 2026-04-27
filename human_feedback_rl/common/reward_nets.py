@@ -54,16 +54,18 @@ class RewardNet(nn.Module, abc.ABC):
 
 
 class SimpleRewardNet(RewardNet):
-    def __init__(self, observation_space, action_space):
+    def __init__(self, observation_space, action_space, hidden_size: int = 256):
         super().__init__(observation_space, action_space)
 
         obs_dim = observation_space.shape[0]
         act_dim = action_space.shape[0]
 
         self.net = nn.Sequential(
-            nn.Linear(obs_dim + act_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(obs_dim + act_dim, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1),
         )
 
     def forward(self, state, action):
