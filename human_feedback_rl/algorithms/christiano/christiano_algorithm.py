@@ -226,7 +226,7 @@ class ChristianoAlgorithm:
 
                     w = all_weights[batch_idx]
                     w = w / w.sum()
-                    batch_weights = th.tensor(w, dtype=th.float32, device=logits.device)
+                    batch_weights = th.tensor(w, dtype=th.float32)
 
                     r1_list, r2_list = [], []
                     for pair in fragment_pairs:
