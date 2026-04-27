@@ -47,6 +47,7 @@ class EnvRewardWrapper(VecEnvWrapper):
         self.reward_model = reward_model
         self._obs: np.ndarray | None = None
         self._actions: np.ndarray | None = None
+        self._debug_step = 0
 
     def reset(self):
         obs = self.venv.reset()
@@ -64,6 +65,14 @@ class EnvRewardWrapper(VecEnvWrapper):
             predicted_rew = self.reward_model.predict(self._obs, self._actions)
         else:
             predicted_rew = np.zeros(len(obs), dtype=np.float32)
+
+
+        self._debug_step += 1
+        if self._debug_step % 500 == 0:
+            print(
+                f"[DEBUG EnvRew] step={self._debug_step:6d} | "
+                f"raw=[{predicted_rew.min():.3f}, {predicted_rew.max():.3f}] mean={predicted_rew.mean():.3f} | "
+            )
 
         self._obs = np.asarray(obs, dtype=np.float32)
         return obs, predicted_rew, dones, infos

@@ -37,12 +37,14 @@ class RandomFragmenter:
             )
 
         # we need two fragments for each comparison
+        chosen_traj_ids = []
         for _ in range(2 * num_pairs):
             # NumPy's annotation here is overly-conservative, but this works at runtime
             traj = self.rng.choice(
                 np.array(trajectories, dtype=object),
                 p=np.array(weights) / sum(weights),
             )
+            chosen_traj_ids.append(id(traj))
 
             # if the traj is shorter than the fragment length, than takes the entire traj as the fragment
             n = len(traj)
@@ -54,8 +56,16 @@ class RandomFragmenter:
                 end = n
 
             fragment = Fragment(traj[start:end])
-            
+
             fragments.append(fragment)
+
+        n_unique = len(set(chosen_traj_ids))
+        traj_lengths = [len(t) for t in trajectories]
+        print(
+            f"[DEBUG Fragmenter] num_pairs={num_pairs} fragment_length={fragment_length} | "
+            f"pool: {len(trajectories)} trajs (len min={min(traj_lengths)} mean={sum(traj_lengths)/len(traj_lengths):.1f} max={max(traj_lengths)}) | "
+            f"unique trajs used for {2*num_pairs} fragments: {n_unique} ({100*n_unique/max(len(trajectories),1):.0f}%)"
+        )
 
         # fragments is currently a list of single fragments. We want to pair up
         # fragments to get a list of (fragment1, fragment2) tuples. To do so,
