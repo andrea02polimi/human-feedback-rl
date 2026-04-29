@@ -1,7 +1,7 @@
 import numpy as np
 import random
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from .types import Trajectory, Fragment, FragmentPair
 
 
@@ -20,15 +20,50 @@ class RandomFragmenter:
     def __call__(
         self,
         trajectories: List[Trajectory],
+        fragment_length: Optional[int],
+        num_pairs: int,
+    ) -> List[FragmentPair]:
+        if fragment_length is None:
+            return self._full_episode_pairs(trajectories, num_pairs)
+        return self._fixed_length_pairs(trajectories, fragment_length, num_pairs)
+
+    def _full_episode_pairs(
+        self,
+        trajectories: List[Trajectory],
+        num_pairs: int,
+    ) -> List[FragmentPair]:
+        if not trajectories:
+            return []
+
+        traj_lengths = [len(t) for t in trajectories]
+        print(
+            f"[DEBUG Fragmenter] full-episode mode | num_pairs={num_pairs} | "
+            f"pool: {len(trajectories)} episodes "
+            f"(len min={min(traj_lengths)} mean={sum(traj_lengths)/len(traj_lengths):.1f} max={max(traj_lengths)})"
+        )
+
+        pairs = []
+        for _ in range(num_pairs):
+            if len(trajectories) >= 2:
+                i, j = self.rng.choice(len(trajectories), size=2, replace=False)
+            else:
+                i = j = 0
+            pairs.append(FragmentPair(
+                frag1=Fragment(list(trajectories[i])),
+                frag2=Fragment(list(trajectories[j])),
+            ))
+        return pairs
+
+    def _fixed_length_pairs(
+        self,
+        trajectories: List[Trajectory],
         fragment_length: int,
         num_pairs: int,
     ) -> List[FragmentPair]:
-        
         fragments: List[Fragment] = []
 
         weights = [len(traj) for traj in trajectories]
 
-        # number of transitions that will be contained in the fragments
         num_transitions = 2 * num_pairs * fragment_length
         if sum(weights) < num_transitions:
             self.logger.warn(
@@ -36,17 +71,14 @@ class RandomFragmenter:
                 "of fragment pairs. Some transitions will appear multiple times.",
             )
 
-        # we need two fragments for each comparison
         chosen_traj_ids = []
         for _ in range(2 * num_pairs):
-            # NumPy's annotation here is overly-conservative, but this works at runtime
             traj = self.rng.choice(
                 np.array(trajectories, dtype=object),
                 p=np.array(weights) / sum(weights),
             )
             chosen_traj_ids.append(id(traj))
 
-            # if the traj is shorter than the fragment length, than takes the entire traj as the fragment
             n = len(traj)
             if n >= fragment_length:
                 start = self.rng.integers(0, n - fragment_length, endpoint=True)
@@ -55,9 +87,7 @@ class RandomFragmenter:
                 start = 0
                 end = n
 
-            fragment = Fragment(traj[start:end])
-
-            fragments.append(fragment)
+            fragments.append(Fragment(traj[start:end]))
 
         n_unique = len(set(chosen_traj_ids))
         traj_lengths = [len(t) for t in trajectories]
@@ -67,16 +97,7 @@ class RandomFragmenter:
             f"unique trajs used for {2*num_pairs} fragments: {n_unique} ({100*n_unique/max(len(trajectories),1):.0f}%)"
         )
 
-        # fragments is currently a list of single fragments. We want to pair up
-        # fragments to get a list of (fragment1, fragment2) tuples. To do so,
-        # we create a single iterator of the list and zip it with itself:
         pairs = []
-        for i in range(0, len(fragments) - 1, 2): # range(start, stop, step)
-            pairs.append(
-                FragmentPair(
-                    frag1=fragments[i],
-                    frag2=fragments[i + 1]
-                )
-            )
-
+        for i in range(0, len(fragments) - 1, 2):
+            pairs.append(FragmentPair(frag1=fragments[i], frag2=fragments[i + 1]))
         return pairs

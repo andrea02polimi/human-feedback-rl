@@ -42,23 +42,24 @@ class ChristianoAlgorithm:
         agent,
         lr_rew: float = 0.1,
         batch_size_rew: int = 100,
-        n_ephochs_rew: int = 3,
+        n_steps_rew: int = 200,
         n_ensembles_rew: int = 4,
         n_iterations: int = 100,
         train_comparison_frac: int = 0.7,
-        fragment_length: int = 1,
+        fragment_length: Optional[int] = 1,
         transition_oversampling: int = 1,
         initial_comparison_frac: float = 0.1,
-        initial_epoch_multiplier: int = 5,
+        initial_step_multiplier: float = 1.0,
         query_schedule: Union[str, Callable[[float], float]] = "constant",
         comparison_queue_size: int = 1_000_000,
         rng: Optional[np.random.Generator] = np.random.default_rng(),
     ):
         self.batch_size_rew = batch_size_rew
-        self.n_ephochs_rew = n_ephochs_rew
-        self.fragment_length = fragment_length
+        self.n_steps_rew = n_steps_rew
+        self.fragment_length = fragment_length if fragment_length != "None" else None
+        self._normalize_by_length = False
         self.initial_comparison_frac = initial_comparison_frac
-        self.initial_epoch_multiplier = initial_epoch_multiplier
+        self.initial_step_multiplier = initial_step_multiplier
         self.n_iterations = n_iterations
         self.transition_oversampling = transition_oversampling
         self._iteration = 0
@@ -71,7 +72,10 @@ class ChristianoAlgorithm:
 
         self.reward_model = make_reward_ensemble(env, n_ensembles=n_ensembles_rew)
 
-        self.preference_model = PreferenceModelFromReward(self.reward_model)
+        self.preference_model = PreferenceModelFromReward(
+            self.reward_model,
+            normalize_by_length=self._normalize_by_length,
+        )
 
         self.optimizers = [
             th.optim.Adam(member.parameters(), lr=lr_rew, weight_decay=1e-4)
@@ -96,7 +100,9 @@ class ChristianoAlgorithm:
             train_frac=train_comparison_frac,
         )
 
-        self.preference_gatherer = PreferenceGathererFromReward()
+        self.preference_gatherer = PreferenceGathererFromReward(
+            normalize_by_length=self._normalize_by_length,
+        )
 
 
 
@@ -118,7 +124,7 @@ class ChristianoAlgorithm:
 
         timesteps_per_iteration, extra_timesteps = divmod(
             total_timesteps,
-            self.n_iterations,
+            len(schedule),
         )
 
         for i, num_pairs in enumerate(schedule):
@@ -127,7 +133,8 @@ class ChristianoAlgorithm:
             ##########################
             # Gather new preferences #
             ##########################
-            num_steps = math.ceil(self.transition_oversampling * 2 * num_pairs * self.fragment_length)
+            effective_length = 1 if self.fragment_length is None else self.fragment_length
+            num_steps = math.ceil(self.transition_oversampling * 2 * num_pairs * effective_length)
             
             self.logger.log(f"- Collecting {2 * num_pairs} fragments ({num_steps} transitions)")
             trajectories = self.trajectory_generator.sample(num_steps)
@@ -156,14 +163,13 @@ class ChristianoAlgorithm:
             # Train the reward model #
             ##########################
 
-            # On the first iteration, we train the reward model for longer,
-            # as specified by initial_epoch_multiplier.
-            epoch_multiplier = 1.0
+            step_multiplier = 1.0
             if i == 0:
-                epoch_multiplier = self.initial_epoch_multiplier
+                step_multiplier = self.initial_step_multiplier
 
-            self.logger.log(f"- Training reward model for {epoch_multiplier*self.n_ephochs_rew} epochs")
-            self.train_reward_model(epoch_multiplier, decay=0.01)
+            total_steps = int(round(step_multiplier * self.n_steps_rew))
+            self.logger.log(f"- Training reward model for {total_steps} steps")
+            self.train_reward_model(step_multiplier, decay=0.01)
 
 
             ###################
@@ -174,7 +180,7 @@ class ChristianoAlgorithm:
             # if the number of timesteps per iterations doesn't exactly divide
             # the desired total number of timesteps, we train the agent a bit longer
             # at the end of training (where the reward model is presumably best)
-            if i == self.n_iterations - 1:
+            if i == len(schedule) - 1:
                 num_steps += extra_timesteps
                 
             self.logger.log(f"- Training agent for {num_steps} timesteps")
@@ -191,100 +197,99 @@ class ChristianoAlgorithm:
     def _weight_norm(self, member) -> float:
         return float(sum(p.data.norm().item() for p in member.parameters()))
 
-    def train_reward_model(self, epoch_multiplier: float = 1.0, decay: float = 0.01):
-        total_epochs = max(1, int(round(self.n_ephochs_rew * epoch_multiplier)))
+    def train_reward_model(self, step_multiplier: float = 1.0, decay: float = 0.01):
+        total_steps = max(1, int(round(self.n_steps_rew * step_multiplier)))
 
         train_data = self.dataset.get_train()
         if not train_data:
             return
 
-        # Compute time-decay weights over the full training set once
+        n_samples = len(train_data)
+
         t_vals = np.array([item[2] for item in train_data], dtype=np.float32)
         t_normalized = (t_vals - t_vals.min()) / (t_vals.max() - t_vals.min() + 1e-8)
-        all_weights = np.exp(decay * t_normalized)  # (N,) unnormalized
+        sample_probs = np.exp(decay * t_normalized)
+        sample_probs = sample_probs / sample_probs.sum()
 
         norms_before = [self._weight_norm(m) for m in self.reward_model.members]
         print(
-            f"[DEBUG RM iter={self._iteration}] train_data={len(train_data)} total_epochs={total_epochs} "
+            f"[DEBUG RM iter={self._iteration}] train_data={n_samples} "
+            f"total_steps={total_steps} "
             f"weight_norms_before={[f'{n:.2f}' for n in norms_before]}"
         )
 
-        all_member_losses = []  # track loss trajectory for each member
+        all_member_losses = []
 
         for mi, (member, optimizer) in enumerate(zip(self.reward_model.members, self.optimizers)):
             member.train()
             step_losses = []
-            grad_step = 0
-            for epoch in range(total_epochs):
-                # Independent random permutation per member per epoch
-                indices = self.rng.permutation(len(train_data))
-                for start in range(0, len(indices), self.batch_size_rew):
-                    batch_idx = indices[start : start + self.batch_size_rew]
 
-                    fragment_pairs = [train_data[i][0] for i in batch_idx]
-                    preferences    = [train_data[i][1] for i in batch_idx]
+            for step in range(total_steps):
+                batch_idx = self.rng.choice(
+                    n_samples,
+                    size=self.batch_size_rew,
+                    replace=True,
+                    p=sample_probs,
+                )
 
-                    w = all_weights[batch_idx]
-                    w = w / w.sum()
-                    batch_weights = th.tensor(w, dtype=th.float32)
+                fragment_pairs = [train_data[i][0] for i in batch_idx]
+                preferences    = [train_data[i][1] for i in batch_idx]
 
-                    r1_list, r2_list = [], []
-                    for pair in fragment_pairs:
-                        obs1 = th.tensor(np.array([t.observation for t in pair.frag1]), dtype=th.float32)
-                        act1 = th.tensor(np.array([t.action      for t in pair.frag1]), dtype=th.float32)
-                        obs2 = th.tensor(np.array([t.observation for t in pair.frag2]), dtype=th.float32)
-                        act2 = th.tensor(np.array([t.action      for t in pair.frag2]), dtype=th.float32)
-                        r1_list.append(member(obs1, act1).sum())
-                        r2_list.append(member(obs2, act2).sum())
+                r1_list, r2_list = [], []
+                for pair in fragment_pairs:
+                    obs1 = th.tensor(np.array([t.observation for t in pair.frag1]), dtype=th.float32)
+                    act1 = th.tensor(np.array([t.action      for t in pair.frag1]), dtype=th.float32)
+                    obs2 = th.tensor(np.array([t.observation for t in pair.frag2]), dtype=th.float32)
+                    act2 = th.tensor(np.array([t.action      for t in pair.frag2]), dtype=th.float32)
+                    aggregate = (lambda r: r.mean()) if self._normalize_by_length else (lambda r: r.sum())
+                    r1_list.append(aggregate(member(obs1, act1)))
+                    r2_list.append(aggregate(member(obs2, act2)))
 
-                    logits = th.stack(r1_list) - th.stack(r2_list)
-                    labels = th.tensor([p.pref1 for p in preferences], dtype=th.float32)
+                logits = th.stack(r1_list) - th.stack(r2_list)
+                labels = th.tensor([p.pref1 for p in preferences], dtype=th.float32)
 
-                    per_pair_loss = th.nn.functional.binary_cross_entropy_with_logits(
-                        logits, labels, reduction='none'
+                loss = th.nn.functional.binary_cross_entropy_with_logits(logits, labels)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                step_losses.append(loss.item())
+
+                if step == 0 and mi == 0:
+                    print(
+                        f"[DEBUG RM iter={self._iteration}] step=0 member=0 | "
+                        f"logits: min={logits.min().item():.3f} max={logits.max().item():.3f} "
+                        f"abs_mean={logits.abs().mean().item():.3f} | loss={loss.item():.4f}"
                     )
-                    loss = (batch_weights * per_pair_loss).sum()
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-
-                    step_losses.append(loss.item())
-
-                    # print logit scale at first step to detect explosion early
-                    if grad_step == 0 and mi == 0:
-                        print(
-                            f"[DEBUG RM iter={self._iteration}] epoch=0 step=0 member=0 | "
-                            f"logits: min={logits.min().item():.3f} max={logits.max().item():.3f} "
-                            f"abs_mean={logits.abs().mean().item():.3f} | loss={loss.item():.4f}"
-                        )
-                    grad_step += 1
 
             member.eval()
             all_member_losses.append(step_losses)
 
         norms_after = [self._weight_norm(m) for m in self.reward_model.members]
-        # Summarize loss trajectory per member: first, mid, last
+
         loss_summary = []
         for losses in all_member_losses:
             if losses:
-                mid = losses[len(losses)//2]
-                loss_summary.append(f"[{losses[0]:.3f}->{mid:.3f}->{losses[-1]:.3f}]")
+                mid = losses[len(losses) // 2]
+                loss_summary.append(
+                    f"[{losses[0]:.3f}->{mid:.3f}->{losses[-1]:.3f}]"
+                )
+
         print(
             f"[DEBUG RM iter={self._iteration}] DONE | "
             f"loss first->mid->last per member: {loss_summary} | "
             f"weight_norms_after={[f'{n:.2f}' for n in norms_after]} "
-            f"(delta={[f'{a-b:.2f}' for a,b in zip(norms_after, norms_before)]})"
+            f"(delta={[f'{a - b:.2f}' for a, b in zip(norms_after, norms_before)]})"
         )
 
-        # logs
         train_loss, train_acc = self._evaluate_reward_model(split="train")
-        val_loss, val_acc     = self._evaluate_reward_model(split="val")
+        val_loss, val_acc = self._evaluate_reward_model(split="val")
 
         self.logger.record("reward/train_loss", train_loss)
-        self.logger.record("reward/train_acc",  train_acc)
-        self.logger.record("reward/val_loss",   val_loss)
-        self.logger.record("reward/val_acc",    val_acc)
+        self.logger.record("reward/train_acc", train_acc)
+        self.logger.record("reward/val_loss", val_loss)
+        self.logger.record("reward/val_acc", val_acc)
 
 
     def _evaluate_reward_model(self, split: str) -> tuple[float, float]:
@@ -300,8 +305,8 @@ class ChristianoAlgorithm:
             [[p.pref1, p.pref2] for p in preferences],
             dtype=th.float32
         )
-
-        loss = -(labels * bt_probs.log()).sum(dim=1).mean().item()
+        # bt_probs potrebbe essere 0 e quindi logaritmo restituisce -inf, lo clippiamo
+        loss = -(labels * bt_probs.clamp(min=1e-8).log()).sum(dim=1).mean().item()
         acc  = (bt_probs.argmax(dim=1) == labels.argmax(dim=1)).float().mean().item()
 
         return loss, acc

@@ -32,7 +32,7 @@ class RewardNet(nn.Module, abc.ABC):
         self,
         state: np.ndarray,
         action: np.ndarray
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+    ) -> Tuple[th.Tensor, th.Tensor]:
         """Convert NumPy arrays to torch tensors."""
         state_th = th.as_tensor(state, dtype=th.float32)
         action_th = th.as_tensor(action, dtype=th.float32)
@@ -138,7 +138,7 @@ class RewardEnsemble(RewardNet):
         Reward of each ensemble member.
         Output shape: (batch_size, num_members)
         """
-        state_th, action_th, next_state_th, done_th = self.preprocess(state, action)
+        state_th, action_th = self.preprocess(state, action)
 
         member_rewards = [
             member(state_th, action_th).cpu().numpy()

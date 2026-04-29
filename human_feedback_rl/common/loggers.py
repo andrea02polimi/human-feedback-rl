@@ -67,4 +67,4 @@ class PrefixWrapper:
         self.main_logger.dump()
 
     def log(self, text):
-        self.main_logger.dump()
+        self.main_logger.log(text)
