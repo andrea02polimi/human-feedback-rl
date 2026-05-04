@@ -13,7 +13,13 @@ class Transition:
 class Trajectory(List[Transition]):
 
     def __init__(self, transitions=None):
-        super().__init__(transitions or [])
+        # Explicitly check for None instead of using 'or'
+        if transitions is None:
+            super().__init__([])
+        else:
+            # Ensure we always initialize with an iterable (like a list)
+            # converting it to a list handles numpy arrays safely.
+            super().__init__(list(transitions))
         
     def total_reward(self) -> float:
         return sum(t.true_reward for t in self)

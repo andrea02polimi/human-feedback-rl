@@ -49,6 +49,8 @@ class EnvRewardWrapper(VecEnvWrapper):
         self._actions: np.ndarray | None = None
         self._debug_step = 0
 
+        self.rms = _RunningMeanStd()
+
     def reset(self):
         obs = self.venv.reset()
         self._obs = np.asarray(obs, dtype=np.float32)
@@ -61,21 +63,25 @@ class EnvRewardWrapper(VecEnvWrapper):
     def step_wait(self):
         obs, true_rew, dones, infos = self.venv.step_wait()
 
-        if self._obs is not None and self._actions is not None:
-            predicted_rew = self.reward_model.predict(self._obs, self._actions)
-        else:
-            predicted_rew = np.zeros(len(obs), dtype=np.float32)
+        predicted_rew = self.reward_model.predict(self._obs, self._actions)
 
+        self.rms.update(predicted_rew)
+
+        # Dividiamo per la std, ma NON sottraiamo la media (self.rms.mean).
+        # Sottrarre una costante continua dalla reward cambia l'MDP penalizzando
+        # artificiosamente la sopravvivenza o le azioni.
+        normalized_rew = predicted_rew / (self.rms.std + 1e-8)
 
         self._debug_step += 1
         if self._debug_step % 500 == 0:
             print(
                 f"[DEBUG EnvRew] step={self._debug_step:6d} | "
                 f"raw=[{predicted_rew.min():.3f}, {predicted_rew.max():.3f}] mean={predicted_rew.mean():.3f} | "
+                f"ensemble_std={predicted_rew.std():.3f} | "
             )
 
         self._obs = np.asarray(obs, dtype=np.float32)
-        return obs, predicted_rew, dones, infos
+        return obs, normalized_rew, dones, infos
     
 
 

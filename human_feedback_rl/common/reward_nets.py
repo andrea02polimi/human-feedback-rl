@@ -9,6 +9,7 @@ import torch.nn as nn
 from stable_baselines3.common.vec_env import VecEnv
 
 
+
 class RewardNet(nn.Module, abc.ABC):
     """Minimal abstract reward network."""
 
@@ -65,34 +66,12 @@ class SimpleRewardNet(RewardNet):
             nn.Tanh(),
             nn.Linear(hidden_size, hidden_size),
             nn.Tanh(),
-            nn.Linear(hidden_size, 1),
+            nn.Linear(hidden_size, 1, bias=False),
         )
 
     def forward(self, state, action):
-        x = th.cat([state, action], dim=1)
+        x = th.cat([state, action], dim=-1)
         return self.net(x).squeeze(-1)
-    
-
-
-
-class SumoSimpleRewardNet(RewardNet):
-    def __init__(self, observation_space, action_space):
-        super().__init__(observation_space, action_space)
-
-        obs_dim = observation_space.shape[0]
-        act_dim = action_space.shape[0]
-        status_dim = 5  # status is one-hot vector for arrived, collided, off_road, timeout, running
-
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim + act_dim + status_dim + 1, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
-
-    def forward(self, state, action, next_status, done):
-        x = th.cat([state, action, next_status, done.unsqueeze(-1)], dim=1)
-        return self.net(x).squeeze(-1)
-    
 
 
 
@@ -106,8 +85,8 @@ class RewardEnsemble(RewardNet):
         members: Iterable[RewardNet],
     ):
         members = list(members)
-        if len(members) < 2:
-            raise ValueError("RewardEnsemble needs at least 2 members.")
+        if len(members) < 1:
+            raise ValueError("RewardEnsemble needs at least 1 members.")
 
         super().__init__(observation_space, action_space)
         self.members = nn.ModuleList(members)
@@ -138,7 +117,7 @@ class RewardEnsemble(RewardNet):
         Reward of each ensemble member.
         Output shape: (batch_size, num_members)
         """
-        state_th, action_th, next_state_th, done_th = self.preprocess(state, action)
+        state_th, action_th = self.preprocess(state, action)
 
         member_rewards = [
             member(state_th, action_th).cpu().numpy()
@@ -157,4 +136,11 @@ class RewardEnsemble(RewardNet):
         mean = all_rewards.mean(axis=1)
         std = all_rewards.std(axis=1)
         return mean, std
-    
+
+
+def make_reward_ensemble(venv: VecEnv, n_ensembles: int = 3) -> RewardEnsemble:
+    """Factory: build a SimpleRewardNet ensemble matching the given environment spaces."""
+    obs_space = venv.observation_space
+    act_space = venv.action_space
+    members = [SimpleRewardNet(obs_space, act_space) for _ in range(n_ensembles)]
+    return RewardEnsemble(obs_space, act_space, members)

@@ -1,38 +1,28 @@
 import math
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 
 import numpy as np
-from stable_baselines3.common.vec_env import VecEnv
+from scipy.stats import pearsonr, spearmanr
 
+from human_feedback_rl.common.types import FragmentPair, Trajectory
 from human_feedback_rl.common.datasets import PreferenceDataset
 from human_feedback_rl.common.fragmenters import RandomFragmenter
 from human_feedback_rl.common.loggers import MainLogger, PrefixWrapper
-from human_feedback_rl.common.reward_nets import RewardEnsemble, SimpleRewardNet
+from human_feedback_rl.common.reward_nets import RewardEnsemble, make_reward_ensemble
+from human_feedback_rl.common.schedules import QUERY_SCHEDULES
 from human_feedback_rl.common.trajectory_generators import TrajectoryGeneratorFromAgent
 from human_feedback_rl.common.preference_models import PreferenceModelFromReward
 from human_feedback_rl.common.gatherers import PreferenceGathererFromReward
+from human_feedback_rl.algorithms.christiano._shared import (
+    save_reward_model as _save_reward_model,
+    collect_debug_data as _collect_debug_data,
+    compute_time_decay_weights,
+    build_bootstrap_indices,
+)
 
 import torch as th
+import wandb
 
-
-
-def make_reward_ensemble(venv: VecEnv, n_ensembles: int = 3) -> RewardEnsemble:
-    obs_space = venv.observation_space
-    act_space = venv.action_space
-
-    members = [
-        SimpleRewardNet(obs_space, act_space)
-        for _ in range(n_ensembles)
-    ]
-
-    return RewardEnsemble(obs_space, act_space, members)
-
-
-QUERY_SCHEDULES: Dict[str, Callable[[float], float]] = {
-    "constant": lambda t: 1.0,
-    "hyperbolic": lambda t: 1.0 / (1.0 + t),
-    "inverse_quadratic": lambda t: 1.0 / (1.0 + t**2),
-}
 
 
 class ChristianoAlgorithm:
@@ -52,9 +42,13 @@ class ChristianoAlgorithm:
         initial_epoch_multiplier: int = 5,
         query_schedule: Union[str, Callable[[float], float]] = "constant",
         comparison_queue_size: int = 1_000_000,
+        use_reward_reg: bool = True,
+        reward_mean_reg: float = 0.1,
         rng: Optional[np.random.Generator] = np.random.default_rng(),
     ):
         self.batch_size_rew = batch_size_rew
+        self.use_reward_reg = use_reward_reg
+        self.reward_mean_reg = reward_mean_reg
         self.n_ephochs_rew = n_ephochs_rew
         self.fragment_length = fragment_length
         self.initial_comparison_frac = initial_comparison_frac
@@ -62,10 +56,20 @@ class ChristianoAlgorithm:
         self.n_iterations = n_iterations
         self.transition_oversampling = transition_oversampling
         self._iteration = 0
+        self._rm_global_epoch = 0
+        self._cumulative_timesteps = 0
         self.rng = rng
-        
-        self.logger = MainLogger()
-            
+
+        self.logger    = MainLogger()   # iteration-level metrics (env/, agent/, hack/)
+        self.rm_logger = MainLogger()   # per-epoch RM metrics (rm/)
+
+        if wandb.run is not None:
+            wandb.define_metric("rm/*",   step_metric="rm/epoch")
+            wandb.define_metric("agent/*",  step_metric="total_timesteps")
+            wandb.define_metric("env/*",  step_metric="iteration")
+            wandb.define_metric("hack/*", step_metric="iteration")
+            wandb.define_metric("total_timesteps")
+
         self.query_schedule = QUERY_SCHEDULES[query_schedule]
         self.query_schedule_name = query_schedule
 
@@ -83,7 +87,7 @@ class ChristianoAlgorithm:
             reward_model=self.reward_model,
             venv=env,
             rng=rng if rng is not None else np.random.default_rng(),
-            logger=PrefixWrapper(self.logger, "agent"),
+            logger=self.logger,
         )
 
         self.fragmenter = RandomFragmenter(
@@ -180,7 +184,11 @@ class ChristianoAlgorithm:
             self.logger.log(f"- Training agent for {num_steps} timesteps")
             self.trajectory_generator.train(steps=num_steps)
 
+            # Update cumulative timesteps
+            self._cumulative_timesteps += num_steps
+
             self.logger.record("iteration", i)
+            self.logger.record("total_timesteps", self._cumulative_timesteps)
             self.logger.dump()
 
             self._iteration += 1
@@ -198,10 +206,7 @@ class ChristianoAlgorithm:
         if not train_data:
             return
 
-        # Compute time-decay weights over the full training set once
-        t_vals = np.array([item[2] for item in train_data], dtype=np.float32)
-        t_normalized = (t_vals - t_vals.min()) / (t_vals.max() - t_vals.min() + 1e-8)
-        all_weights = np.exp(decay * t_normalized)  # (N,) unnormalized
+        all_weights = compute_time_decay_weights(train_data, timestamp_idx=2, decay=decay)
 
         norms_before = [self._weight_norm(m) for m in self.reward_model.members]
         print(
@@ -209,17 +214,23 @@ class ChristianoAlgorithm:
             f"weight_norms_before={[f'{n:.2f}' for n in norms_before]}"
         )
 
-        all_member_losses = []  # track loss trajectory for each member
-
-        for mi, (member, optimizer) in enumerate(zip(self.reward_model.members, self.optimizers)):
+        for member in self.reward_model.members:
             member.train()
-            step_losses = []
-            grad_step = 0
-            for epoch in range(total_epochs):
-                # Independent random permutation per member per epoch
-                indices = self.rng.permutation(len(train_data))
-                for start in range(0, len(indices), self.batch_size_rew):
-                    batch_idx = indices[start : start + self.batch_size_rew]
+
+        grad_steps   = [0] * len(self.reward_model.members)
+        step_losses  = [[] for _ in self.reward_model.members]
+
+        n_train = len(train_data)
+        bootstrap_indices = build_bootstrap_indices(self.rng, n_train, len(self.reward_model.members))
+
+        for epoch in range(total_epochs):
+            epoch_pref_losses = []
+            epoch_reg_losses  = []
+            for mi, (member, optimizer) in enumerate(zip(self.reward_model.members, self.optimizers)):
+                boot_idx = bootstrap_indices[mi]
+                perm = self.rng.permutation(len(boot_idx))
+                for start in range(0, len(perm), self.batch_size_rew):
+                    batch_idx = boot_idx[perm[start : start + self.batch_size_rew]]
 
                     fragment_pairs = [train_data[i][0] for i in batch_idx]
                     preferences    = [train_data[i][1] for i in batch_idx]
@@ -228,14 +239,23 @@ class ChristianoAlgorithm:
                     w = w / w.sum()
                     batch_weights = th.tensor(w, dtype=th.float32)
 
-                    r1_list, r2_list = [], []
+                    r1_list, r2_list, all_rewards = [], [], []
+                    step_rewards_list = []
                     for pair in fragment_pairs:
                         obs1 = th.tensor(np.array([t.observation for t in pair.frag1]), dtype=th.float32)
                         act1 = th.tensor(np.array([t.action      for t in pair.frag1]), dtype=th.float32)
                         obs2 = th.tensor(np.array([t.observation for t in pair.frag2]), dtype=th.float32)
                         act2 = th.tensor(np.array([t.action      for t in pair.frag2]), dtype=th.float32)
-                        r1_list.append(member(obs1, act1).sum())
-                        r2_list.append(member(obs2, act2).sum())
+                        r1_raw = member(obs1, act1)
+                        r2_raw = member(obs2, act2)
+                        r1_list.append(r1_raw.sum())
+                        r2_list.append(r2_raw.sum())
+
+                        # Creiamo la lista per i singoli step SOLO se la regolarizzazione è attiva
+                        # per risparmiare memoria ed evitare computazioni nel grafo se non serve.
+                        if self.use_reward_reg:
+                            step_rewards_list.append(r1_raw)
+                            step_rewards_list.append(r2_raw)
 
                     logits = th.stack(r1_list) - th.stack(r2_list)
                     labels = th.tensor([p.pref1 for p in preferences], dtype=th.float32)
@@ -243,30 +263,72 @@ class ChristianoAlgorithm:
                     per_pair_loss = th.nn.functional.binary_cross_entropy_with_logits(
                         logits, labels, reduction='none'
                     )
-                    loss = (batch_weights * per_pair_loss).sum()
+
+                    # loss base (binary cross entropy pesata)
+                    pref_loss = (batch_weights * per_pair_loss).sum()
+
+                    # Applichiamo la regolarizzazione in modo condizionale
+                    if self.use_reward_reg:
+                        all_step_rewards = th.cat(step_rewards_list)
+                        reg_loss = self.reward_mean_reg * all_step_rewards.mean().pow(2)
+                        loss = pref_loss + reg_loss
+                        epoch_reg_losses.append(reg_loss.item())
+                    else:
+                        loss = pref_loss
+                        epoch_reg_losses.append(0.0)
 
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
 
-                    step_losses.append(loss.item())
+                    step_losses[mi].append(loss.item())
+                    epoch_pref_losses.append(pref_loss.item())
 
                     # print logit scale at first step to detect explosion early
-                    if grad_step == 0 and mi == 0:
+                    if grad_steps[mi] == 0 and mi == 0 and epoch == 0:
                         print(
                             f"[DEBUG RM iter={self._iteration}] epoch=0 step=0 member=0 | "
                             f"logits: min={logits.min().item():.3f} max={logits.max().item():.3f} "
                             f"abs_mean={logits.abs().mean().item():.3f} | loss={loss.item():.4f}"
                         )
-                    grad_step += 1
+                    grad_steps[mi] += 1
 
+            # Log per-epoch metrics on a global epoch axis
+            train_loss, train_acc = self._evaluate_reward_model(split="train")
+            val_loss, val_acc     = self._evaluate_reward_model(split="val")
+            train_loss_s1, train_acc_s1 = self._evaluate_reward_model_seg1(split="train")
+            val_loss_s1,   val_acc_s1   = self._evaluate_reward_model_seg1(split="val")
+
+            # Calcolo delle correlazioni
+            val_pearson, val_spearman = self._evaluate_reward_correlation(split="val")
+
+            mean_pref_loss = float(np.mean(epoch_pref_losses))
+            mean_reg_loss  = float(np.mean(epoch_reg_losses)) if epoch_reg_losses else 0.0
+
+            self.rm_logger.record("rm/epoch",            self._rm_global_epoch)
+            self.rm_logger.record("rm/train_loss",       train_loss)
+            self.rm_logger.record("rm/train_acc",        train_acc)
+            self.rm_logger.record("rm/val_loss",         val_loss)
+            self.rm_logger.record("rm/val_acc",          val_acc)
+            self.rm_logger.record("rm/overfit_gap_loss", val_loss - train_loss)
+            self.rm_logger.record("rm/overfit_gap_acc",  train_acc - val_acc)
+            #self.rm_logger.record("rm/train_loss_seg1",  train_loss_s1)
+            #self.rm_logger.record("rm/val_loss_seg1",    val_loss_s1)
+            #self.rm_logger.record("rm/train_acc_seg1",   train_acc_s1)
+            #self.rm_logger.record("rm/val_acc_seg1",     val_acc_s1)
+            self.rm_logger.record("rm/loss_pref",        mean_pref_loss)
+            self.rm_logger.record("rm/loss_reg",         mean_reg_loss)
+            self.rm_logger.record("rm/loss_total",       mean_pref_loss + mean_reg_loss)
+            self.rm_logger.dump()
+            self._rm_global_epoch += 1
+
+        for member in self.reward_model.members:
             member.eval()
-            all_member_losses.append(step_losses)
 
         norms_after = [self._weight_norm(m) for m in self.reward_model.members]
         # Summarize loss trajectory per member: first, mid, last
         loss_summary = []
-        for losses in all_member_losses:
+        for losses in step_losses:
             if losses:
                 mid = losses[len(losses)//2]
                 loss_summary.append(f"[{losses[0]:.3f}->{mid:.3f}->{losses[-1]:.3f}]")
@@ -276,15 +338,6 @@ class ChristianoAlgorithm:
             f"weight_norms_after={[f'{n:.2f}' for n in norms_after]} "
             f"(delta={[f'{a-b:.2f}' for a,b in zip(norms_after, norms_before)]})"
         )
-
-        # logs
-        train_loss, train_acc = self._evaluate_reward_model(split="train")
-        val_loss, val_acc     = self._evaluate_reward_model(split="val")
-
-        self.logger.record("reward/train_loss", train_loss)
-        self.logger.record("reward/train_acc",  train_acc)
-        self.logger.record("reward/val_loss",   val_loss)
-        self.logger.record("reward/val_acc",    val_acc)
 
 
     def _evaluate_reward_model(self, split: str) -> tuple[float, float]:
@@ -305,4 +358,104 @@ class ChristianoAlgorithm:
         acc  = (bt_probs.argmax(dim=1) == labels.argmax(dim=1)).float().mean().item()
 
         return loss, acc
+
+    def _evaluate_reward_model_seg1(self, split: str) -> tuple[float, float]:
+        """Evaluate the reward model on single-step pairs, identical method to
+        _evaluate_reward_model but with fragments of length 1.
+
+        Each original fragment pair (frag1, frag2) is expanded into len(frag) single-step
+        pairs (frag1[i], frag2[i]), each inheriting the same dataset label p.pref1.
+        When fragment_length=1 this is identical to _evaluate_reward_model.
+        """
+        data = self.dataset.get_train() if split == "train" else self.dataset.get_val()
+        fragment_pairs, preferences, _ = zip(*data)
+
+        single_step_pairs = []
+        for pair, _ in zip(fragment_pairs, preferences):
+            for t1, t2 in zip(pair.frag1, pair.frag2):
+                single_step_pairs.append(FragmentPair(
+                    frag1=Trajectory([t1]),
+                    frag2=Trajectory([t2]),
+                ))
+
+        self.preference_model.eval()
+        with th.no_grad():
+            bt_probs = self.preference_model(single_step_pairs)
+        self.preference_model.train()
+
+        label_list = []
+        for pair in single_step_pairs:
+            r1 = pair.frag1[0].true_reward
+            r2 = pair.frag2[0].true_reward
+            if r1 > r2:
+                label_list.append([1.0, 0.0])
+            elif r2 > r1:
+                label_list.append([0.0, 1.0])
+            else:
+                label_list.append([0.5, 0.5])
+        labels = th.tensor(label_list, dtype=th.float32)
+
+        loss = -(labels * bt_probs.log()).sum(dim=1).mean().item()
+        acc  = (bt_probs.argmax(dim=1) == labels.argmax(dim=1)).float().mean().item()
+
+        return loss, acc
+
+    def _evaluate_reward_correlation(self, split: str) -> tuple[float, float]:
+        """
+        Calcola la correlazione (Pearson e Spearman) tra la True Reward e la
+        Predicted Reward per tutti i frammenti nel dataset indicato.
+        """
+        data = self.dataset.get_train() if split == "train" else self.dataset.get_val()
+        if not data:
+            return 0.0, 0.0
+
+        fragment_pairs, _, _ = zip(*data)
+
+        # Estraiamo tutti i frammenti individuali dalle coppie
+        fragments = []
+        for pair in fragment_pairs:
+            fragments.append(pair.frag1)
+            fragments.append(pair.frag2)
+
+        # Calcoliamo la true_reward per ogni frammento
+        true_rewards = [f.total_reward() for f in fragments]
+
+        self.reward_model.eval()
+        device = next(self.reward_model.parameters()).device
+
+        pred_rewards = []
+        with th.no_grad():
+            for f in fragments:
+                obs = th.tensor(np.array([t.observation for t in f]), dtype=th.float32, device=device)
+                act = th.tensor(np.array([t.action for t in f]), dtype=th.float32, device=device)
+                # Calcoliamo la predicted reward (somma sui timestep)
+                pred_rew = self.reward_model(obs, act).sum().item()
+                pred_rewards.append(pred_rew)
+
+        self.reward_model.train()
+
+        # Sicurezza matematica: se tutte le true_reward o pred_reward sono uguali
+        # (varianza zero), scipy lancia un warning e ritorna NaN. Ritorniamo 0.
+        if np.std(true_rewards) < 1e-6 or np.std(pred_rewards) < 1e-6:
+            return 0.0, 0.0
+
+        p_corr, _ = pearsonr(true_rewards, pred_rewards)
+        s_corr, _ = spearmanr(true_rewards, pred_rewards)
+
+        # Protezione addizionale contro eventuali NaN derivanti da scipy
+        if np.isnan(p_corr): p_corr = 0.0
+        if np.isnan(s_corr): s_corr = 0.0
+
+        return float(p_corr), float(s_corr)
+
+    # ------------------------------------------------------------------
+    # Serialisation helpers
+    # ------------------------------------------------------------------
+
+    def save_reward_model(self, path) -> None:
+        _save_reward_model(self.reward_model, path)
+
+    def collect_debug_data(self, n_steps: int = 2000) -> dict:
+        return _collect_debug_data(self.trajectory_generator, self.reward_model, n_steps)
+
 

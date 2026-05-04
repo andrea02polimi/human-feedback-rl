@@ -1,13 +1,13 @@
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.base_class import BaseAlgorithm
 from .reward_nets import RewardNet
-from .loggers import MainLogger
+from .loggers import MainLogger, make_sb3_logger
 from .env_wrappers import EnvRewardWrapper, EnvBufferingWrapper, PolicyExplorationWrapper
+from .custom_logging_callback import CustomLoggingCallback
+from .metrics import log_ensemble_uncertainty, log_hacking_signals
 from . import types
 import numpy as np
-from typing import List, Tuple, Any, Dict, Sequence, Optional
-from .custom_logging_callback import CustomLoggingCallback
-import torch as th
+from typing import List, Any, Sequence, Optional
 
 
 class TrajectoryGeneratorFromAgent:
@@ -23,24 +23,19 @@ class TrajectoryGeneratorFromAgent:
         exploration_frac: float = 0.0,
         random_prob: float = 0.5,
     ) -> None:
-        
-        self.agent = agent
-        self.logger = logger
-        
+
+        self.agent        = agent
+        self.main_logger  = logger
         self.reward_model = reward_model
         self.exploration_frac = exploration_frac
         self.rng = rng
 
-        # The BufferingWrapper records all trajectories, so we can return
-        # them after training. This should come first (before the wrapper that
-        # changes the reward function), so that we return the original environment
-        # rewards.
-        # When applying BufferingWrapper and RewardVecEnvWrapper, we should use `venv`
-        # instead of `agent.get_env()` because SB3 may apply some wrappers to
-        # `agent`'s env under the hood. In particular, in image-based environments,
-        # SB3 may move the image-channel dimension in the observation space, making
-        # `agent.get_env()` not match with `reward_fn`.
+        # Wire the SB3 agent's internal logger to forward ppo/* metrics to our MainLogger.
+        # This intercepts PPO's own logger.dump() calls without subclassing PPO.
+        agent.set_logger(make_sb3_logger(logger))
 
+        # BufferingWrapper must come before RewardWrapper so that env (true) rewards
+        # are captured, not the learned ones.
         self.buffering_wrapper = EnvBufferingWrapper(venv)
 
         self.venv = EnvRewardWrapper(
@@ -49,16 +44,9 @@ class TrajectoryGeneratorFromAgent:
         )
 
         self.agent.set_env(self.venv)
-        
-        # Unlike with BufferingWrapper, we should use `algorithm.get_env()` instead
-        # of `venv` when interacting with `algorithm`.
+
         algo_venv = self.agent.get_env()
         assert algo_venv is not None
-        # This wrapper will be used to ensure that rollouts are collected from a mixture
-        # of `self.algorithm` and a policy that acts randomly. The samples from
-        # `self.algorithm` are themselves stochastic if `self.algorithm` is stochastic.
-        # Otherwise, they are deterministic, and action selection is only stochastic
-        # when sampling from the random policy.
         self.exploration_wrapper = PolicyExplorationWrapper(
             policy=self.agent,
             venv=algo_venv,
@@ -67,50 +55,33 @@ class TrajectoryGeneratorFromAgent:
         )
 
     def train(self, steps: int, **kwargs) -> None:
-        """Train the agent using the reward function specified during instantiation.
-
-        Args:
-            steps: number of environment timesteps to train for
-            **kwargs: other keyword arguments to pass to BaseAlgorithm.train()
-
-        Raises:
-            RuntimeError: Transitions left in `self.buffering_wrapper`; call
-                `self.sample` first to clear them.
-        """
-        
         if not self.buffering_wrapper.is_empty():
             raise RuntimeError(
-                f"There are transitions left in the buffer. "
+                "There are transitions left in the buffer. "
                 "Call AgentTrainer.sample() first to clear them.",
             )
         self.agent.learn(
             total_timesteps=steps,
             reset_num_timesteps=False,
-            callback=CustomLoggingCallback(),
+            callback=CustomLoggingCallback(main_logger=self.main_logger),
             **kwargs,
         )
 
     def sample(self, steps: int) -> Sequence[types.Trajectory]:
         agent_trajs = self.buffering_wrapper.pop_finished_trajectories()
-        # We typically have more trajectories than are needed.
-        # In that case, we use the final trajectories because
-        # they are the ones with the most relevant version of
-        # the agent.
-        # The easiest way to do this will be to first invert the
-        # list and then later just take the first trajectories:
         agent_trajs = agent_trajs[::-1]
         avail_steps = sum(len(traj) for traj in agent_trajs)
 
         exploration_steps = int(self.exploration_frac * steps)
         if self.exploration_frac > 0 and exploration_steps == 0:
-            self.logger.warn(
-                "No exploration steps included: exploration_frac = "
-                f"{self.exploration_frac} > 0 but steps={steps} is too small.",
+            self.main_logger.log(
+                f"WARNING: No exploration steps included — exploration_frac="
+                f"{self.exploration_frac} but steps={steps} is too small."
             )
         agent_steps = steps - exploration_steps
 
         if avail_steps < agent_steps:
-            self.logger.log(
+            self.main_logger.log(
                 f"Requested {agent_steps} transitions but only {avail_steps} in buffer."
                 f" Sampling {agent_steps - avail_steps} additional transitions.",
             )
@@ -124,14 +95,12 @@ class TrajectoryGeneratorFromAgent:
             )
             additional_trajs = self.buffering_wrapper.pop_finished_trajectories()
             agent_trajs = list(agent_trajs) + list(additional_trajs)
-        
-        agent_trajs = _get_trajectories(agent_trajs, agent_steps)
 
+        agent_trajs = _get_trajectories(agent_trajs, agent_steps)
         trajectories = list(agent_trajs)
 
         if exploration_steps > 0:
-            self.logger.log(f"Sampling {exploration_steps} exploratory transitions.")
-            
+            self.main_logger.log(f"Sampling {exploration_steps} exploratory transitions.")
             algo_venv = self.agent.get_env()
             assert algo_venv is not None
             rollout_agent(
@@ -142,54 +111,42 @@ class TrajectoryGeneratorFromAgent:
             )
             exploration_trajs = self.buffering_wrapper.pop_finished_trajectories()
             exploration_trajs = _get_trajectories(exploration_trajs, exploration_steps)
-            # We call _get_trajectories separately on agent_trajs and exploration_trajs
-            # and then just concatenate. This could mean we return slightly too many
-            # transitions, but it gets the proportion of exploratory and agent
-            # transitions roughly right.
             trajectories.extend(exploration_trajs)
 
-        # logs
-        true_rewards  = [traj.total_reward()  for traj in trajectories]   # se rews = env reward
-        model_rewards = [self._score_trajectory(traj) for traj in trajectories]
-        lengths       = [len(traj) for traj in trajectories]
+        true_rewards  = [traj.total_reward()           for traj in trajectories]
+        model_rewards = [self._score_trajectory(traj)  for traj in trajectories]
+        lengths       = [len(traj)                     for traj in trajectories]
 
-        self.logger.record("rollout/mean_true_reward",  np.mean(true_rewards))
-        self.logger.record("rollout/mean_model_reward", np.mean(model_rewards))
-        self.logger.record("rollout/mean_length",       np.mean(lengths))
+        self.main_logger.record("env/true_reward_mean",  float(np.mean(true_rewards)))
+        self.main_logger.record("env/model_reward_mean", float(np.mean(model_rewards)))
+        self.main_logger.record("env/ep_length_mean",    float(np.mean(lengths)))
+
+        #log_ensemble_uncertainty(self.reward_model, trajectories, self.main_logger)
+        log_hacking_signals(true_rewards, model_rewards, self.main_logger)
 
         return trajectories
 
-
     def _score_trajectory(self, traj: types.Trajectory) -> float:
-        obs  = np.array([t.observation for t in traj])  # (T, obs_dim)
-        acts = np.array([t.action for t in traj])        # (T, act_dim)
-        return self.reward_model.predict(obs, acts).sum()
-
+        obs  = np.array([t.observation for t in traj])
+        acts = np.array([t.action      for t in traj])
+        return float(self.reward_model.predict(obs, acts).sum())
 
 
 def _get_trajectories(
     trajectories: List[types.Trajectory],
     steps: int,
-    ) -> List[types.Trajectory]:
-    
-    """Get enough trajectories to have at least `steps` transitions in total."""
+) -> List[types.Trajectory]:
+    """Return enough trajectories to cover at least `steps` transitions."""
     if steps == 0:
         return []
-
     available_steps = sum(len(traj) for traj in trajectories)
     if available_steps < steps:
         raise RuntimeError(
             f"Asked for {steps} transitions but only {available_steps} available",
         )
-    # We need the cumulative sum of trajectory lengths
-    # to determine how many trajectories to return:
     steps_cumsum = np.cumsum([len(traj) for traj in trajectories])
-    # Now we find the first index that gives us enough
-    # total steps:
     idx = int((steps_cumsum >= steps).argmax())
-    # we need to include the element at position idx
     trajectories = trajectories[: idx + 1]
-    # sanity check
     assert sum(len(traj) for traj in trajectories) >= steps
     return trajectories
 
@@ -206,7 +163,7 @@ def rollout_agent(
 
     collected_steps = 0
     finishing = False
-    active_envs = np.ones(venv.num_envs, dtype=bool)  # quali env devono ancora finire
+    active_envs = np.ones(venv.num_envs, dtype=bool)
 
     while True:
         actions, state = policy.predict(
@@ -215,9 +172,7 @@ def rollout_agent(
             episode_start=episode_starts,
             deterministic=deterministic_policy,
         )
-
         obs, rewards, dones, infos = venv.step(actions)
-
         episode_starts = dones
         collected_steps += venv.num_envs
 
@@ -225,6 +180,6 @@ def rollout_agent(
             finishing = True
 
         if finishing:
-            active_envs &= ~dones  # gli env che hanno fatto done non sono più attivi
+            active_envs &= ~dones
             if not active_envs.any():
-                break  # tutti gli env hanno finito il loro episodio
+                break

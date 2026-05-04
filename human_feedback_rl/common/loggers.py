@@ -1,6 +1,6 @@
 import wandb
 import numpy as np
-from stable_baselines3.common.logger import Logger as SB3Logger
+from stable_baselines3.common.logger import Logger as SB3Logger, KVWriter
 
 
 class MainLogger:
@@ -40,6 +40,9 @@ class MainLogger:
     def log(self, text):
         print(f"{text}")
 
+    def warn(self, text):
+        print(f"WARNING: {text}")
+
 
 class PrefixWrapper:
     """
@@ -67,4 +70,41 @@ class PrefixWrapper:
         self.main_logger.dump()
 
     def log(self, text):
-        self.main_logger.dump()
+        self.main_logger.log(text)
+
+    def warn(self, text):
+        self.main_logger.warn(text)
+
+
+class _SB3WandBBridge(KVWriter):
+    """
+    Intercepts SB3's logger.dump() to forward selected PPO training metrics
+    into our MainLogger.  Does NOT flush MainLogger — the outer iteration loop
+    is responsible for calling dump() at the right cadence.
+    """
+
+    _KEY_MAP = {
+        "train/approx_kl":          "ppo/kl",
+        "train/clip_fraction":       "ppo/clip_fraction",
+        "train/entropy_loss":        "ppo/entropy",
+        "train/explained_variance":  "ppo/explained_variance",
+        "train/value_loss":          "ppo/value_loss",
+        "train/policy_gradient_loss": "ppo/policy_loss",
+    }
+
+    def __init__(self, main_logger: "MainLogger"):
+        self.main_logger = main_logger
+
+    def write(self, key_values, key_excluded, step: int = 0) -> None:
+        for sb3_key, our_key in self._KEY_MAP.items():
+            val = key_values.get(sb3_key)
+            if val is not None:
+                self.main_logger.record(our_key, float(val))
+
+    def close(self) -> None:
+        pass
+
+
+def make_sb3_logger(main_logger: "MainLogger") -> SB3Logger:
+    """Return an SB3 Logger that forwards PPO metrics to our MainLogger."""
+    return SB3Logger(folder=None, output_formats=[_SB3WandBBridge(main_logger)])

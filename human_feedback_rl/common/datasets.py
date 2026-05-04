@@ -2,7 +2,7 @@ import numpy as np
 import random
 from collections import deque
 from typing import Any, Deque, List, Tuple
-from .types import FragmentPair, Preference
+from .types import Fragment, FragmentPair, Preference
 
 from dataclasses import dataclass
 
@@ -78,3 +78,21 @@ class PreferenceDataset(BaseDataset):
             fragment_pairs, preferences, timestamps = zip(*batch)
             yield PreferenceBatch(list(fragment_pairs), list(preferences), list(timestamps))
             start_idx += batch_size
+
+
+class DemonstrationDataset(BaseDataset):
+    """
+    Stores demonstration segments paired with the original agent fragments.
+
+    Each stored item is ((demo_fragment, agent_fragment), timestamp) where:
+        demo_fragment  — Fragment with expert actions substituted
+        agent_fragment — original agent fragment (same observations, agent actions)
+        timestamp      — outer-loop iteration index for time-decay weighting
+    """
+
+    def __init__(self, train_frac: float = 0.8, queue_size: int = 1_000_000):
+        super().__init__(train_frac=train_frac, queue_size=queue_size)
+
+    def push(self, fragments: List[Fragment], demos: List[Fragment], timestamp: int) -> None:
+        items = [((demo, frag), timestamp) for demo, frag in zip(demos, fragments)]
+        super().push(*items)
