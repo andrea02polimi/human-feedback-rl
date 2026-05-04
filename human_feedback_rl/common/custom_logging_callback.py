@@ -33,10 +33,7 @@ class CustomLoggingCallback(BaseCallback):
             if self.main_logger is not None:
                 for key, value in ep.items():
                     self.main_logger.record(f"env/{key}", value)
-                self.main_logger.record("env/ep_length",     float(ep_length))
-                self.main_logger.record("env/ep_duration",   float(ep_duration))
                 self.main_logger.record("env/collision_rate", float(ego_status == EgoStatus.COLLIDED.value))
-                self.main_logger.record("env/off_road_rate",  float(ego_status == EgoStatus.OFF_ROAD.value))
                 self.main_logger.record("env/timeout_rate",   float(ego_status == EgoStatus.TIMEOUT.value))
                 self.main_logger.record("env/success_rate",   float(ego_status == EgoStatus.ARRIVED.value))
             else:

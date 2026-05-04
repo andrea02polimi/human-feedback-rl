@@ -84,12 +84,7 @@ class _SB3WandBBridge(KVWriter):
     """
 
     _KEY_MAP = {
-        "train/approx_kl":          "ppo/kl",
-        "train/clip_fraction":       "ppo/clip_fraction",
-        "train/entropy_loss":        "ppo/entropy",
-        "train/explained_variance":  "ppo/explained_variance",
-        "train/value_loss":          "ppo/value_loss",
-        "train/policy_gradient_loss": "ppo/policy_loss",
+        "train/explained_variance": "ppo/explained_variance",
     }
 
     def __init__(self, main_logger: "MainLogger"):

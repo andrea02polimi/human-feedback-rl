@@ -30,11 +30,7 @@ def log_hacking_signals(
     model_mean = float(np.mean(model_arr))
     gap        = model_mean - true_mean
 
-    logger.record("hack/reward_gap",         gap)
     logger.record("hack/exploitation_index", gap / (true_std + 1e-8))
-    logger.record("hack/true_reward_mean",   true_mean)
-    logger.record("hack/true_reward_std",    true_std)
-    logger.record("hack/model_reward_mean",  model_mean)
 
     if len(true_arr) > 2 and true_std > 1e-6 and np.std(model_arr) > 1e-6:
         corr, _ = pearsonr(true_arr, model_arr)

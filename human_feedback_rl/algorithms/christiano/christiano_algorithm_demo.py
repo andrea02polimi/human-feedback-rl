@@ -218,8 +218,8 @@ class ChristianoAlgorithmDemo:
                     epoch_pref_losses.append(pref_loss.item())
                     epoch_reg_losses.append(reg_loss.item())
 
-            train_loss, train_mean_rew = self._evaluate_demo_loss("train")
-            val_loss,   val_mean_rew   = self._evaluate_demo_loss("val")
+            train_loss, _ = self._evaluate_demo_loss("train")
+            val_loss, val_mean_rew = self._evaluate_demo_loss("val")
 
             mean_pref_loss = float(np.mean(epoch_pref_losses))
             mean_reg_loss  = float(np.mean(epoch_reg_losses))
@@ -231,15 +231,11 @@ class ChristianoAlgorithmDemo:
                     commit=False,
                 )
 
-            self.rm_logger.record("rm/epoch",             self._rm_global_epoch)
-            self.rm_logger.record("rm/train_loss",        train_loss)
-            self.rm_logger.record("rm/val_loss",          val_loss)
-            self.rm_logger.record("rm/overfit_gap_loss",  val_loss - train_loss)
-            self.rm_logger.record("rm/train_mean_reward", train_mean_rew)
-            self.rm_logger.record("rm/val_mean_reward",   val_mean_rew)
-            self.rm_logger.record("rm/loss_pref",         mean_pref_loss)
-            self.rm_logger.record("rm/loss_reg",          mean_reg_loss)
-            self.rm_logger.record("rm/loss_total",        mean_pref_loss + mean_reg_loss)
+            self.rm_logger.record("rm/epoch",            self._rm_global_epoch)
+            self.rm_logger.record("rm/val_loss",         val_loss)
+            self.rm_logger.record("rm/overfit_gap_loss", val_loss - train_loss)
+            self.rm_logger.record("rm/val_mean_reward",  val_mean_rew)
+            self.rm_logger.record("rm/loss_total",       mean_pref_loss + mean_reg_loss)
             self.rm_logger.dump()
 
             self._rm_global_epoch += 1

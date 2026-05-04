@@ -4,7 +4,7 @@ from .reward_nets import RewardNet
 from .loggers import MainLogger, make_sb3_logger
 from .env_wrappers import EnvRewardWrapper, EnvBufferingWrapper, PolicyExplorationWrapper
 from .custom_logging_callback import CustomLoggingCallback
-from .metrics import log_ensemble_uncertainty, log_hacking_signals
+from .metrics import log_hacking_signals
 from . import types
 import numpy as np
 from typing import List, Any, Sequence, Optional
@@ -117,9 +117,8 @@ class TrajectoryGeneratorFromAgent:
         model_rewards = [self._score_trajectory(traj)  for traj in trajectories]
         lengths       = [len(traj)                     for traj in trajectories]
 
-        self.main_logger.record("env/true_reward_mean",  float(np.mean(true_rewards)))
-        self.main_logger.record("env/model_reward_mean", float(np.mean(model_rewards)))
-        self.main_logger.record("env/ep_length_mean",    float(np.mean(lengths)))
+        self.main_logger.record("env/true_reward_mean", float(np.mean(true_rewards)))
+        self.main_logger.record("env/ep_length_mean",   float(np.mean(lengths)))
 
         #log_ensemble_uncertainty(self.reward_model, trajectories, self.main_logger)
         log_hacking_signals(true_rewards, model_rewards, self.main_logger)

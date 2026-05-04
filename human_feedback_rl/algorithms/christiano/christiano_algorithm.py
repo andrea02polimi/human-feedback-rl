@@ -293,31 +293,17 @@ class ChristianoAlgorithm:
                         )
                     grad_steps[mi] += 1
 
-            # Log per-epoch metrics on a global epoch axis
-            train_loss, train_acc = self._evaluate_reward_model(split="train")
-            val_loss, val_acc     = self._evaluate_reward_model(split="val")
-            train_loss_s1, train_acc_s1 = self._evaluate_reward_model_seg1(split="train")
-            val_loss_s1,   val_acc_s1   = self._evaluate_reward_model_seg1(split="val")
-
-            # Calcolo delle correlazioni
-            val_pearson, val_spearman = self._evaluate_reward_correlation(split="val")
+            train_loss, _ = self._evaluate_reward_model(split="train")
+            val_loss, _   = self._evaluate_reward_model(split="val")
+            _, val_spearman = self._evaluate_reward_correlation(split="val")
 
             mean_pref_loss = float(np.mean(epoch_pref_losses))
             mean_reg_loss  = float(np.mean(epoch_reg_losses)) if epoch_reg_losses else 0.0
 
             self.rm_logger.record("rm/epoch",            self._rm_global_epoch)
-            self.rm_logger.record("rm/train_loss",       train_loss)
-            self.rm_logger.record("rm/train_acc",        train_acc)
             self.rm_logger.record("rm/val_loss",         val_loss)
-            self.rm_logger.record("rm/val_acc",          val_acc)
             self.rm_logger.record("rm/overfit_gap_loss", val_loss - train_loss)
-            self.rm_logger.record("rm/overfit_gap_acc",  train_acc - val_acc)
-            #self.rm_logger.record("rm/train_loss_seg1",  train_loss_s1)
-            #self.rm_logger.record("rm/val_loss_seg1",    val_loss_s1)
-            #self.rm_logger.record("rm/train_acc_seg1",   train_acc_s1)
-            #self.rm_logger.record("rm/val_acc_seg1",     val_acc_s1)
-            self.rm_logger.record("rm/loss_pref",        mean_pref_loss)
-            self.rm_logger.record("rm/loss_reg",         mean_reg_loss)
+            self.rm_logger.record("rm/val_spearman",     val_spearman)
             self.rm_logger.record("rm/loss_total",       mean_pref_loss + mean_reg_loss)
             self.rm_logger.dump()
             self._rm_global_epoch += 1
