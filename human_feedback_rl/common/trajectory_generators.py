@@ -99,6 +99,17 @@ class TrajectoryGeneratorFromAgent:
         agent_trajs = _get_trajectories(agent_trajs, agent_steps)
         trajectories = list(agent_trajs)
 
+        while len(trajectories) < 3:
+            algo_venv = self.agent.get_env()
+            rollout_agent(
+                policy=self.agent,
+                venv=algo_venv,
+                steps=1,
+                deterministic_policy=False,
+            )
+            extra_trajs = self.buffering_wrapper.pop_finished_trajectories()
+            trajectories += list(extra_trajs)
+
         if exploration_steps > 0:
             self.main_logger.log(f"Sampling {exploration_steps} exploratory transitions.")
             algo_venv = self.agent.get_env()
