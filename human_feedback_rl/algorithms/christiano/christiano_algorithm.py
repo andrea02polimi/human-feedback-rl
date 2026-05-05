@@ -270,7 +270,7 @@ class ChristianoAlgorithm:
                     # Applichiamo la regolarizzazione in modo condizionale
                     if self.use_reward_reg:
                         all_step_rewards = th.cat(step_rewards_list)
-                        reg_loss = self.reward_mean_reg * all_step_rewards.mean().pow(2)
+                        reg_loss = self.reward_mean_reg * all_step_rewards.pow(2).mean()
                         loss = pref_loss + reg_loss
                         epoch_reg_losses.append(reg_loss.item())
                     else:
