@@ -68,9 +68,11 @@ class EnvRewardWrapper(VecEnvWrapper):
         self.rms.update(predicted_rew)
 
         # Dividiamo per la std, ma NON sottraiamo la media (self.rms.mean).
-        # Sottrarre una costante continua dalla reward cambia l'MDP penalizzando
-        # artificiosamente la sopravvivenza o le azioni.
-        normalized_rew = predicted_rew / (self.rms.std + 1e-8)
+        # se la media che riceve l'agente è 0 non gli si dà l'incentivo di rimanere in vita
+        normalized_rew = (predicted_rew - self.rms.mean) / (self.rms.std + 1e-8)
+
+        # diamo un incentivo all'agente a rimanere in vita
+        normalized_rew += 0.5
 
         self._debug_step += 1
         if self._debug_step % 500 == 0:
