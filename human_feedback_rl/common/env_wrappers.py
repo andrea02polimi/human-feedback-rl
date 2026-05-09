@@ -69,17 +69,15 @@ class EnvRewardWrapper(VecEnvWrapper):
 
         # Dividiamo per la std, ma NON sottraiamo la media (self.rms.mean).
         # se la media che riceve l'agente è 0 non gli si dà l'incentivo di rimanere in vita
-        normalized_rew = (predicted_rew - self.rms.mean) / (self.rms.std + 1e-8)
-
-        # diamo un incentivo all'agente a rimanere in vita
-        normalized_rew += 0.5
+        normalized_rew = predicted_rew / (self.rms.std + 1e-8)
 
         self._debug_step += 1
         if self._debug_step % 500 == 0:
             print(
                 f"[DEBUG EnvRew] step={self._debug_step:6d} | "
-                f"raw=[{predicted_rew.min():.3f}, {predicted_rew.max():.3f}] mean={predicted_rew.mean():.3f} | "
-                f"ensemble_std={predicted_rew.std():.3f} | "
+                f"raw=[{predicted_rew.min():.4f}, {predicted_rew.max():.4f}] mean={predicted_rew.mean():.4f} std={predicted_rew.std():.4f} | "
+                f"rms.std={self.rms.std:.4f} | "
+                f"norm=[{normalized_rew.min():.3f}, {normalized_rew.max():.3f}] mean={normalized_rew.mean():.3f}"
             )
 
         self._obs = np.asarray(obs, dtype=np.float32)

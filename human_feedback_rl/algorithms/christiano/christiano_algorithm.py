@@ -43,12 +43,14 @@ class ChristianoAlgorithm:
         query_schedule: Union[str, Callable[[float], float]] = "constant",
         comparison_queue_size: int = 1_000_000,
         use_reward_reg: bool = True,
-        reward_mean_reg: float = 0.1,
+        reward_mean_reg: float = 0.001,
+        label_smoothing: float = 0.0,
         rng: Optional[np.random.Generator] = np.random.default_rng(),
     ):
         self.batch_size_rew = batch_size_rew
         self.use_reward_reg = use_reward_reg
         self.reward_mean_reg = reward_mean_reg
+        self.label_smoothing = label_smoothing
         self.n_ephochs_rew = n_ephochs_rew
         self.fragment_length = fragment_length
         self.initial_comparison_frac = initial_comparison_frac
@@ -259,6 +261,10 @@ class ChristianoAlgorithm:
 
                     logits = th.stack(r1_list) - th.stack(r2_list)
                     labels = th.tensor([p.pref1 for p in preferences], dtype=th.float32)
+                    if self.label_smoothing > 0.0:
+                        # Smoothing formula: l' = l*(1-2ε) + ε
+                        # preserves ties at 0.5, maps 1→(1-ε), 0→ε
+                        labels = labels * (1.0 - 2 * self.label_smoothing) + self.label_smoothing
 
                     per_pair_loss = th.nn.functional.binary_cross_entropy_with_logits(
                         logits, labels, reduction='none'
@@ -279,6 +285,7 @@ class ChristianoAlgorithm:
 
                     optimizer.zero_grad()
                     loss.backward()
+                    th.nn.utils.clip_grad_norm_(member.parameters(), max_norm=1.0)
                     optimizer.step()
 
                     step_losses[mi].append(loss.item())
@@ -295,7 +302,7 @@ class ChristianoAlgorithm:
 
             train_loss, _ = self._evaluate_reward_model(split="train")
             val_loss, _   = self._evaluate_reward_model(split="val")
-            _, val_spearman = self._evaluate_reward_correlation(split="val")
+            val_pearson, val_spearman, pred_mean, pred_std, pred_max, pred_min = self._evaluate_reward_correlation(split="val")
 
             mean_pref_loss = float(np.mean(epoch_pref_losses))
             mean_reg_loss  = float(np.mean(epoch_reg_losses)) if epoch_reg_losses else 0.0
@@ -304,6 +311,11 @@ class ChristianoAlgorithm:
             self.rm_logger.record("rm/val_loss",         val_loss)
             self.rm_logger.record("rm/overfit_gap_loss", val_loss - train_loss)
             self.rm_logger.record("rm/val_spearman",     val_spearman)
+            self.rm_logger.record("rm/val_pearson", val_pearson)
+            self.rm_logger.record("rm/val_pred_mean",    pred_mean)
+            self.rm_logger.record("rm/val_pred_std",     pred_std)
+            self.rm_logger.record("rm/val_pred_max",     pred_max)
+            self.rm_logger.record("rm/val_pred_min",     pred_min)
             self.rm_logger.record("rm/loss_total",       mean_pref_loss + mean_reg_loss)
             self.rm_logger.dump()
             self._rm_global_epoch += 1
@@ -420,10 +432,16 @@ class ChristianoAlgorithm:
 
         self.reward_model.train()
 
+        arr = np.array(pred_rewards, dtype=np.float32)
+        pred_mean = float(arr.mean())
+        pred_std  = float(arr.std())
+        pred_max  = float(arr.max())
+        pred_min  = float(arr.min())
+
         # Sicurezza matematica: se tutte le true_reward o pred_reward sono uguali
         # (varianza zero), scipy lancia un warning e ritorna NaN. Ritorniamo 0.
-        if np.std(true_rewards) < 1e-6 or np.std(pred_rewards) < 1e-6:
-            return 0.0, 0.0
+        if np.std(true_rewards) < 1e-6 or pred_std < 1e-6:
+            return 0.0, 0.0, pred_mean, pred_std, pred_max, pred_min
 
         p_corr, _ = pearsonr(true_rewards, pred_rewards)
         s_corr, _ = spearmanr(true_rewards, pred_rewards)
@@ -432,7 +450,7 @@ class ChristianoAlgorithm:
         if np.isnan(p_corr): p_corr = 0.0
         if np.isnan(s_corr): s_corr = 0.0
 
-        return float(p_corr), float(s_corr)
+        return float(p_corr), float(s_corr), pred_mean, pred_std, pred_max, pred_min
 
     # ------------------------------------------------------------------
     # Serialisation helpers
