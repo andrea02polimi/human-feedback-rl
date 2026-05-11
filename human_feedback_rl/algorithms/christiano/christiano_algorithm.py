@@ -131,13 +131,13 @@ class ChristianoAlgorithm:
 
 
     def train(self,
-            n_iterations: int = 100,
+            total_timesteps: int = 1_000_000,
             timesteps_per_iteration: int = 1024,
             comparisons_per_iteration: int = 10,
             log_interval: int = 1,
         ) -> Any:
 
-        total_comparisons = comparisons_per_iteration * n_iterations
+        n_iterations = int(total_timesteps / comparisons_per_iteration)
         initial_comparisons = int(total_comparisons * self.initial_comparison_frac)
         total_comparisons = total_comparisons - initial_comparisons
 
