@@ -44,13 +44,11 @@ class ChristianoAlgorithm:
         comparison_queue_size: int = 1_000_000,
         use_reward_reg: bool = True,
         reward_mean_reg: float = 0.001,
-        label_smoothing: float = 0.0,
         rng: Optional[np.random.Generator] = np.random.default_rng(),
     ):
         self.batch_size_rew = batch_size_rew
         self.use_reward_reg = use_reward_reg
         self.reward_mean_reg = reward_mean_reg
-        self.label_smoothing = label_smoothing
         self.n_ephochs_rew = n_ephochs_rew
         self.fragment_length = fragment_length
         self.initial_comparison_frac = initial_comparison_frac
@@ -261,10 +259,6 @@ class ChristianoAlgorithm:
 
                     logits = th.stack(r1_list) - th.stack(r2_list)
                     labels = th.tensor([p.pref1 for p in preferences], dtype=th.float32)
-                    if self.label_smoothing > 0.0:
-                        # Smoothing formula: l' = l*(1-2ε) + ε
-                        # preserves ties at 0.5, maps 1→(1-ε), 0→ε
-                        labels = labels * (1.0 - 2 * self.label_smoothing) + self.label_smoothing
 
                     per_pair_loss = th.nn.functional.binary_cross_entropy_with_logits(
                         logits, labels, reduction='none'
