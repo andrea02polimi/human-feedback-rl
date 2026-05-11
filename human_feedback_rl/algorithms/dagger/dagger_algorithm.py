@@ -2,7 +2,6 @@ import numpy as np
 import torch
 
 from human_feedback_rl.common import BaseAlgorithm, Transition, Trajectory
-from human_feedback_rl.common.loggers import MainLogger, PrefixWrapper
 
 try:
     from sumo_rl_ego.policies.base_policy import Policy as RuleBasedPolicy
@@ -11,6 +10,9 @@ except ImportError:
     RuleBasedPolicy = None
     _ModelPolicy = None
 
+from human_feedback_rl.common.loggers import WandbWriter, PrefixedLogger
+from stable_baselines3.common.logger import Logger, HumanOutputFormat
+import sys
 
 class DaggerAlgorithm(BaseAlgorithm):
 
@@ -43,11 +45,18 @@ class DaggerAlgorithm(BaseAlgorithm):
         )
         self._optimizer = torch.optim.Adam(agent.parameters(), lr=bc_lr)
 
-        self._logger = MainLogger()
-        self._bc_log = PrefixWrapper(self._logger, prefix="bc")
-        self._dagger_log = PrefixWrapper(self._logger, prefix="dagger")
-        self._train_log = PrefixWrapper(self._logger, prefix="train")
-        self._eval_log = PrefixWrapper(self._logger, prefix="eval")
+        self._logger = Logger(
+                    folder=None,
+                    output_formats=[
+                        HumanOutputFormat(sys.stdout),  # print to terminal
+                        WandbWriter(),                  # send to WandB
+                    ]
+                )
+
+        self._bc_log = PrefixedLogger(self._logger, prefix="bc")
+        self._dagger_log = PrefixedLogger(self._logger, prefix="dagger")
+        self._train_log = PrefixedLogger(self._logger, prefix="train")
+        self._eval_log = PrefixedLogger(self._logger, prefix="eval")
 
     def _beta_schedule(self, round_idx: int) -> float:
         """Exponential decay: beta=1.0 at round 0 (pure expert), approaches 0."""

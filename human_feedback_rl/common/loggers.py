@@ -1,70 +1,85 @@
+from stable_baselines3.common.logger import HumanOutputFormat
+from stable_baselines3.common.logger import KVWriter
+import sys
 import wandb
-import numpy as np
-from stable_baselines3.common.logger import Logger as SB3Logger
 
 
-class MainLogger:
-    """
-    Central metric store. Record values throughout an iteration, then call
-    dump() once to average them and emit a single wandb.log() call.
+class PrefixedLogger:
+    """Wraps an SB3 logger and prepends a prefix to every recorded key."""
 
-    Usage::
-
-        logger = UnifiedLogger()
-        logger.record("loss", 0.4)
-        logger.record("loss", 0.3)  # multiple records are averaged
-        logger.dump()               # logs {"loss": 0.35} to wandb
-    """
-    def __init__(self):
-        self.data = {}
-
-    def record(self, key, value):
-        if key not in self.data:
-            self.data[key] = []
-        self.data[key].append(value)
-
-
-    def dump(self, step=None):
-        log_dict = {}
-
-        for key, values in self.data.items():
-            mean_value = float(np.mean(values))
-            log_dict[key] = mean_value
-
-        if wandb.run is not None:
-            wandb.log(log_dict)
-            # print(f"log_dict: {log_dict}")
-
-        self.data.clear()
-        
-    def log(self, text):
-        print(f"{text}")
-
-
-class PrefixWrapper:
-    """
-    Thin wrapper around UnifiedLogger that prepends a prefix to every key
-    and optionally remaps key names before forwarding to the unified store.
-
-    Usage::
-
-        log = PrefixLogger(logger, prefix="reward_model", key_map={"loss": "train_loss"})
-        log.record("loss", 0.5)   # stored as "reward_model/train_loss"
-    """
-    def __init__(self, main_logger, prefix=None, key_map=None):
-        self.main_logger = main_logger
+    def __init__(self, logger, prefix: str):
+        self._logger = logger
         self.prefix = prefix
-        self.key_map = key_map or {}
 
-    def record(self, key, value, *args, **kwargs):
-        key = self.key_map.get(key, key)
-        if self.prefix:
-            self.main_logger.record(f"{self.prefix}/{key}", value)
-        else:
-            self.main_logger.record(key, value)
+    def record(self, key, value, exclude=None):
+        self._logger.record(f"{self.prefix}/{key}", value, exclude)
 
-    def dump(self, *args, **kwargs):
-        self.main_logger.dump()
+    def record_mean(self, key, value, exclude=None):
+        self._logger.record_mean(f"{self.prefix}/{key}", value, exclude)
 
-    def log(self, text):
-        self.main_logger.dump()
+    def dump(self, step=0):
+        self._logger.dump(step)
+
+    def __getattr__(self, name):
+        return getattr(self._logger, name)
+
+
+class ExcludedLogger:
+    """Wraps an SB3 logger and injects a fixed exclude tag into every record call."""
+
+    def __init__(self, logger, exclude):
+        self._logger = logger
+        self._exclude = exclude
+
+    def _merge(self, exclude):
+        if exclude is None:
+            return self._exclude
+        a = (self._exclude,) if isinstance(self._exclude, str) else tuple(self._exclude)
+        b = (exclude,) if isinstance(exclude, str) else tuple(exclude)
+        return tuple(set(a) | set(b))
+
+    def record(self, key, value, exclude=None):
+        self._logger.record(key, value, self._merge(exclude))
+
+    def record_mean(self, key, value, exclude=None):
+        self._logger.record_mean(key, value, self._merge(exclude))
+
+    def dump(self, step=0):
+        self._logger.dump(step)
+
+    def __getattr__(self, name):
+        return getattr(self._logger, name)
+
+
+class FilteredHumanOutput(KVWriter):
+    """HumanOutputFormat that respects SB3 exclude flags (keys excluded from 'stdout' are hidden)."""
+
+    def __init__(self):
+        self._inner = HumanOutputFormat(sys.stdout)
+
+    def write(self, key_values: dict, key_excluded: dict, step: int = 0) -> None:
+        visible = {
+            k for k in key_values
+            if key_excluded.get(k) is None or "stdout" not in key_excluded[k]
+        }
+        if visible:
+            self._inner.write(key_values, key_excluded, step)
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+class WandbWriter(KVWriter):
+    def write(self, key_values: dict, key_excluded: dict, step: int = 0):
+        metrics = {}
+        for k, v in key_values.items():
+            excluded = key_excluded.get(k)
+            if excluded is not None:
+                formats = (excluded,) if isinstance(excluded, str) else excluded
+                if "wandb" in formats:
+                    continue
+            metrics[k] = v
+        wandb.log(metrics)
+
+    def close(self):
+        wandb.finish()

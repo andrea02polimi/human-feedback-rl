@@ -1,5 +1,5 @@
 import abc
-from typing import Iterable, Tuple
+from typing import Iterable, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -21,7 +21,9 @@ class RewardNet(nn.Module, abc.ABC):
     def forward(
         self,
         state: th.Tensor,
-        action: th.Tensor
+        action: th.Tensor,
+        next_status: Optional[th.Tensor] = None,
+        done: Optional[th.Tensor] = None,
     ) -> th.Tensor:
         """
         Compute rewards for a batch of transitions.
@@ -31,66 +33,101 @@ class RewardNet(nn.Module, abc.ABC):
     def preprocess(
         self,
         state: np.ndarray,
-        action: np.ndarray
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
-        """Convert NumPy arrays to torch tensors."""
+        action: np.ndarray,
+        next_status: Optional[np.ndarray] = None,
+        done: Optional[np.ndarray] = None,
+    ) -> Tuple[th.Tensor, th.Tensor, Optional[th.Tensor], Optional[th.Tensor]]:
         state_th = th.as_tensor(state, dtype=th.float32)
         action_th = th.as_tensor(action, dtype=th.float32)
-
-        return state_th, action_th
+        next_status_th = th.as_tensor(next_status, dtype=th.float32) if next_status is not None else None
+        done_th = th.as_tensor(done, dtype=th.float32) if done is not None else None
+        return state_th, action_th, next_status_th, done_th
 
     @th.no_grad()
     def predict(
         self,
         state: np.ndarray,
-        action: np.ndarray
+        action: np.ndarray,
+        next_status: Optional[np.ndarray] = None,
+        done: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Compute rewards without gradients."""
-        state_th, action_th = self.preprocess(state, action)
-        rewards = self.forward(state_th, action_th)
+        state_th, action_th, next_status_th, done_th = self.preprocess(state, action, next_status, done)
+        rewards = self.forward(state_th, action_th, next_status_th, done_th)
         return rewards.cpu().numpy()
-    
+
 
 
 
 class SimpleRewardNet(RewardNet):
-    def __init__(self, observation_space, action_space):
+    def __init__(
+        self,
+        observation_space,
+        action_space,
+        net_arch: list[int] = [64, 64],
+        activation_fn: str = "tanh",
+    ):
         super().__init__(observation_space, action_space)
 
         obs_dim = observation_space.shape[0]
         act_dim = action_space.shape[0]
 
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim + act_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
+        act = {"relu": nn.ReLU, "tanh": nn.Tanh}[activation_fn]
 
-    def forward(self, state, action):
+        layers = []
+        in_dim = obs_dim + act_dim
+        for out_dim in net_arch:
+            layers += [nn.Linear(in_dim, out_dim), act()]
+            in_dim = out_dim
+        layers.append(nn.Linear(in_dim, 1))
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, state, action, _next_status=None, _done=None):
         x = th.cat([state, action], dim=1)
         return self.net(x).squeeze(-1)
-    
+
 
 
 
 class SumoSimpleRewardNet(RewardNet):
-    def __init__(self, observation_space, action_space):
+    """
+    Reward network for SUMO ego-vehicle tasks.
+
+    Input: observation, action, and the vehicle status of the next state
+    encoded as a 7-dim one-hot vector
+    [arrived, collided, off_road, timeout, running, teleported, removed_unknown],
+    plus a scalar done flag.
+    """
+
+    STATUS_DIM = 7  # arrived, collided, off_road, timeout, running, teleported, removed_unknown
+
+    def __init__(
+        self,
+        observation_space,
+        action_space,
+        net_arch: list[int] = [64, 64],
+        activation_fn: str = "tanh",
+    ):
         super().__init__(observation_space, action_space)
 
         obs_dim = observation_space.shape[0]
         act_dim = action_space.shape[0]
-        status_dim = 5  # status is one-hot vector for arrived, collided, off_road, timeout, running
+        in_dim = obs_dim + act_dim + self.STATUS_DIM + 1  # +1 for done flag
 
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim + act_dim + status_dim + 1, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
+        act = {"relu": nn.ReLU, "tanh": nn.Tanh}[activation_fn]
 
-    def forward(self, state, action, next_status, done):
+        layers = []
+        for out_dim in net_arch:
+            layers += [nn.Linear(in_dim, out_dim), act()]
+            in_dim = out_dim
+        layers.append(nn.Linear(in_dim, 1))
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, state, action, next_status=None, done=None):
         x = th.cat([state, action, next_status, done.unsqueeze(-1)], dim=1)
         return self.net(x).squeeze(-1)
-    
+
 
 
 
@@ -114,13 +151,12 @@ class RewardEnsemble(RewardNet):
         self,
         state: th.Tensor,
         action: th.Tensor,
+        next_status: Optional[th.Tensor] = None,
+        done: Optional[th.Tensor] = None,
     ) -> th.Tensor:
-        """
-        Mean reward across ensemble members.
-        Output shape: (batch_size,)
-        """
+        """Mean reward across ensemble members. Output shape: (batch_size,)"""
         member_rewards = [
-            member(state, action)
+            member(state, action, next_status, done)
             for member in self.members
         ]
         rewards_stack = th.stack(member_rewards, dim=0)  # (num_members, batch_size)
@@ -130,16 +166,14 @@ class RewardEnsemble(RewardNet):
     def predict_all(
         self,
         state: np.ndarray,
-        action: np.ndarray
+        action: np.ndarray,
+        next_status: Optional[np.ndarray] = None,
+        done: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """
-        Reward of each ensemble member.
-        Output shape: (batch_size, num_members)
-        """
-        state_th, action_th, next_state_th, done_th = self.preprocess(state, action)
-
+        """Reward of each ensemble member. Output shape: (batch_size, num_members)"""
+        state_th, action_th, next_status_th, done_th = self.preprocess(state, action, next_status, done)
         member_rewards = [
-            member(state_th, action_th).cpu().numpy()
+            member(state_th, action_th, next_status_th, done_th).cpu().numpy()
             for member in self.members
         ]
         return np.stack(member_rewards, axis=1)
@@ -148,11 +182,12 @@ class RewardEnsemble(RewardNet):
     def predict_mean_std(
         self,
         state: np.ndarray,
-        action: np.ndarray
+        action: np.ndarray,
+        next_status: Optional[np.ndarray] = None,
+        done: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Return mean and std across ensemble members."""
-        all_rewards = self.predict_all(state, action)
+        all_rewards = self.predict_all(state, action, next_status, done)
         mean = all_rewards.mean(axis=1)
         std = all_rewards.std(axis=1)
         return mean, std
-    

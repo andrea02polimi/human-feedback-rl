@@ -5,15 +5,17 @@ from typing import Any, List, Tuple, Sequence
 @dataclass
 class Transition:
     observation: Any        # o_t
-    action: Any     # a_t
-    true_reward: float   # r_t (true reward)
+    action: Any             # a_t
+    true_reward: float      # r_t (true reward)
+    next_status: Any = None # 7-dim one-hot: [arrived, collided, off_road, timeout, running, teleported, removed_unknown]
+    done: bool = False
 
 
 @dataclass
 class Trajectory(List[Transition]):
 
     def __init__(self, transitions=None):
-        super().__init__(transitions or [])
+        super().__init__(list(transitions) if transitions is not None else [])
         
     def total_reward(self) -> float:
         return sum(t.true_reward for t in self)

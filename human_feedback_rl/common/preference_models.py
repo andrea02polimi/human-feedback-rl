@@ -1,20 +1,16 @@
 from typing import List
 
-import torch as th
-import torch.nn as nn
-
 import numpy as np
-
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 from .types import FragmentPair, Fragment
 
-from .reward_nets import RewardEnsemble
+from .reward_nets import RewardNet
 
 
 class PreferenceModelFromReward(nn.Module):
-    def __init__(self, reward_model: RewardEnsemble):
+    def __init__(self, reward_model: RewardNet):
         super().__init__()
         self.reward_model = reward_model
 
@@ -31,6 +27,8 @@ class PreferenceModelFromReward(nn.Module):
         return F.softmax(logits, dim=1)       # Bradley-Terry probs
 
     def _sum_rewards(self, fragment: Fragment) -> th.Tensor:
-        obs = th.tensor(np.array([t.observation for t in fragment]), dtype=th.float32)
-        actions = th.tensor(np.array([t.action      for t in fragment]), dtype=th.float32)
-        return self.reward_model(obs, actions).sum()
+        obs         = th.tensor(np.array([t.observation  for t in fragment]), dtype=th.float32)
+        actions     = th.tensor(np.array([t.action       for t in fragment]), dtype=th.float32)
+        next_status = th.tensor(np.array([t.next_status  for t in fragment]), dtype=th.float32)
+        done        = th.tensor(np.array([float(t.done)  for t in fragment]), dtype=th.float32)
+        return self.reward_model(obs, actions, next_status, done).sum() / len(fragment)

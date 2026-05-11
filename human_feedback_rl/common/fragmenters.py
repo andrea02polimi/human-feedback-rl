@@ -1,8 +1,15 @@
 import numpy as np
 import random
+import time
 
+from dataclasses import dataclass
 from typing import List, Tuple
 from .types import Trajectory, Fragment, FragmentPair
+
+
+@dataclass
+class FragmenterMetrics:
+    time_fragmenter: float
 
 
 
@@ -22,8 +29,8 @@ class RandomFragmenter:
         trajectories: List[Trajectory],
         fragment_length: int,
         num_pairs: int,
-    ) -> List[FragmentPair]:
-        
+    ) -> Tuple[List[FragmentPair], FragmenterMetrics]:
+        t0 = time.perf_counter()
         fragments: List[Fragment] = []
 
         weights = [len(traj) for traj in trajectories]
@@ -69,4 +76,4 @@ class RandomFragmenter:
                 )
             )
 
-        return pairs
+        return pairs, FragmenterMetrics(time_fragmenter=time.perf_counter() - t0)

@@ -1,55 +1,40 @@
 import numpy as np
-import random
 from collections import deque
-from typing import Any, Deque, List, Tuple
+from typing import Any, Deque, List, Optional
 from .types import FragmentPair, Preference
-
 from dataclasses import dataclass
 
 
 class BaseDataset:
-    def __init__(self, train_frac: float = 0.8, queue_size: int = 1000):
-        assert 0.0 < train_frac < 1.0, "train_frac must be in (0, 1)"
-        self.train_frac = train_frac
+    def __init__(self, queue_size: int = 1000):
         self.queue_size = queue_size
-
-        self.train_data: Deque[Any] = deque(maxlen=queue_size)
-        self.val_data: Deque[Any] = deque(maxlen=queue_size)
+        self._data: Deque[Any] = deque(maxlen=queue_size)
 
     def push(self, *items: Any) -> None:
-        items = list(items)
-        random.shuffle(items)
-        n_train = round(len(items) * self.train_frac)
-        for item in items[:n_train]:
-            self.train_data.append(item)
-        for item in items[n_train:]:
-            self.val_data.append(item)
+        for item in items:
+            self._data.append(item)
 
-    def get(self, batch_size):
-        data = list(self.train_data)
+    def get(self, batch_size: int):
+        """Yield all data in sequential batches."""
+        data = list(self._data)
         indices = np.random.permutation(len(data))
         start_idx = 0
         while start_idx < len(data):
-            batch_indices = indices[start_idx:start_idx + batch_size]
+            batch_indices = indices[start_idx : start_idx + batch_size]
             yield [data[i] for i in batch_indices]
             start_idx += batch_size
 
-    def get_train(self) -> List[Any]:
-        data = list(self.train_data)
-        return data
-
-    def get_val(self) -> List[Any]:
-        data = list(self.val_data)
-        return data
+    def sample(self, batch_size: int):
+        """Return a single random batch of batch_size items."""
+        data = list(self._data)
+        indices = np.random.choice(len(data), size=min(batch_size, len(data)), replace=False)
+        return [data[i] for i in indices]
 
     def get_all(self) -> List[Any]:
-        data = list(self.train_data) + list(self.val_data)
-        return data
+        return list(self._data)
 
     def __len__(self) -> int:
-        return len(self.train_data) + len(self.val_data)
-
-
+        return len(self._data)
 
 
 @dataclass
@@ -60,21 +45,57 @@ class PreferenceBatch:
 
 
 class PreferenceDataset(BaseDataset):
-    def __init__(self, train_frac: float = 0.8, queue_size: int = 1000):
-        super().__init__(train_frac=train_frac, queue_size=queue_size)
+    def __init__(self, queue_size: int = 1000):
+        super().__init__(queue_size=queue_size)
 
     def push(self, fragment_pairs: List[FragmentPair], preferences: List[Preference], timestamp: int) -> None:
         assert len(fragment_pairs) == len(preferences), "pairs and preferences must have the same length"
         items = [(frag, pref, timestamp) for frag, pref in zip(fragment_pairs, preferences)]
         super().push(*items)
-        
-    def get(self, batch_size):
-        data = list(self.train_data)
+
+    def _filter(self, timestamp: Optional[int] = None) -> List[Any]:
+        data = list(self._data)
+        if timestamp is not None:
+            data = [item for item in data if item[2] == timestamp]
+        return data
+
+    def _to_batch(self, items: List) -> PreferenceBatch:
+        fragment_pairs, preferences, timestamps = zip(*items)
+        return PreferenceBatch(list(fragment_pairs), list(preferences), list(timestamps))
+
+    def get(self, batch_size: int, timestamp: Optional[int] = None):
+        """Yield all data in sequential batches, optionally filtered by timestamp."""
+        data = self._filter(timestamp)
         indices = np.random.permutation(len(data))
         start_idx = 0
         while start_idx < len(data):
-            batch_indices = indices[start_idx:start_idx + batch_size]
-            batch = [data[i] for i in batch_indices]
-            fragment_pairs, preferences, timestamps = zip(*batch)
-            yield PreferenceBatch(list(fragment_pairs), list(preferences), list(timestamps))
+            batch_indices = indices[start_idx : start_idx + batch_size]
+            yield self._to_batch([data[i] for i in batch_indices])
             start_idx += batch_size
+
+    def sample(self, batch_size: int, timestamp: Optional[int] = None) -> PreferenceBatch:
+        """Return a single random batch of batch_size items, optionally filtered by timestamp."""
+        data = self._filter(timestamp)
+        indices = np.random.choice(len(data), size=min(batch_size, len(data)), replace=False)
+        return self._to_batch([data[i] for i in indices])
+
+    def get_all(self, timestamp: Optional[int] = None) -> PreferenceBatch:
+        """Return all items as a PreferenceBatch, optionally filtered by timestamp."""
+        data = self._filter(timestamp)
+        return self._to_batch(data)
+
+    def bootstrap(self) -> "PreferenceDataset":
+        """Return a new dataset of the same size sampled with replacement."""
+        all_data = self.get_all()
+        n = len(all_data.fragment_pairs)
+        indices = np.random.choice(n, size=n, replace=True)
+        boot = PreferenceDataset(queue_size=n)
+        for i in indices:
+            boot.push([all_data.fragment_pairs[i]], [all_data.preferences[i]], all_data.timestamps[i])
+        return boot
+
+    def max_timestamp(self) -> Optional[int]:
+        """Return the highest timestamp present in the dataset."""
+        if not self._data:
+            return None
+        return max(item[2] for item in self._data)

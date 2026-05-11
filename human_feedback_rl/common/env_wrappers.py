@@ -6,6 +6,20 @@ from stable_baselines3.common.vec_env import VecEnvWrapper, VecEnv
 from .reward_nets import RewardEnsemble
 from .types import Trajectory, Transition
 
+# order: arrived, collided, off_road, timeout, running, teleported, removed_unknown
+_STATUS_ONEHOT = {
+    "arrived":         np.array([1, 0, 0, 0, 0, 0, 0], dtype=np.float32),
+    "collided":        np.array([0, 1, 0, 0, 0, 0, 0], dtype=np.float32),
+    "offroad":         np.array([0, 0, 1, 0, 0, 0, 0], dtype=np.float32),
+    "timeout":         np.array([0, 0, 0, 1, 0, 0, 0], dtype=np.float32),
+    "running":         np.array([0, 0, 0, 0, 1, 0, 0], dtype=np.float32),
+    "teleported":      np.array([0, 0, 0, 0, 0, 1, 0], dtype=np.float32),
+    "removed_unknown": np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32),
+}
+
+def ego_status_to_onehot(status: str) -> np.ndarray:
+    return _STATUS_ONEHOT.get(status, _STATUS_ONEHOT["running"])
+
 class _RunningMeanStd:
     """Welford's online algorithm for running mean and variance."""
 
@@ -61,7 +75,8 @@ class EnvRewardWrapper(VecEnvWrapper):
         obs, true_rew, dones, infos = self.venv.step_wait()
 
         if self._obs is not None and self._actions is not None:
-            predicted_rew = self.reward_model.predict(self._obs, self._actions)
+            next_status = np.array([ego_status_to_onehot(i.get("ego_status", "running")) for i in infos])
+            predicted_rew = self.reward_model.predict(self._obs, self._actions, next_status, dones.astype(np.float32))
         else:
             predicted_rew = np.zeros(len(obs), dtype=np.float32)
 
@@ -126,9 +141,11 @@ class EnvBufferingWrapper(VecEnvWrapper):
 
         for i in range(self.num_envs):
             transition = Transition(
-                observation=self._last_obs[i],      # o_t
-                action=actions[i],          # a_t
-                true_reward=float(true_rew[i]),   # r_t
+                observation=self._last_obs[i],
+                action=actions[i],
+                true_reward=float(true_rew[i]),
+                next_status=ego_status_to_onehot(infos[i].get("ego_status", "running")),
+                done=bool(dones[i]),
             )
 
             self._partial_trajectories[i].add_transition(transition)
@@ -226,10 +243,9 @@ class PolicyExplorationWrapper:
         seed = int(self.rng.integers(0, 2**31 - 1))
         self.venv.action_space.seed(seed)
 
-    def predict(self, observation: np.ndarray) -> np.ndarray:
+    def predict(self, observation: np.ndarray, **kwargs) -> tuple:
         if self.rng.random() < self.random_prob:
             num_envs = len(observation)
-            actions = [self.venv.action_space.sample() for _ in range(num_envs)]
-            actions = np.stack(actions, axis=0)
-            return actions
-        return self.wrapped_policy.predict(observation)
+            actions = np.stack([self.venv.action_space.sample() for _ in range(num_envs)])
+            return actions, None
+        return self.wrapped_policy.predict(observation, **kwargs)

@@ -1,13 +1,33 @@
-from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.vec_env import VecEnv, VecMonitor
 from stable_baselines3.common.base_class import BaseAlgorithm
 from .reward_nets import RewardNet
-from .loggers import MainLogger
+from .loggers import PrefixedLogger
 from .env_wrappers import EnvRewardWrapper, EnvBufferingWrapper, PolicyExplorationWrapper
 from . import types
 import numpy as np
+import time
 from typing import List, Tuple, Any, Dict, Sequence, Optional
 from .custom_logging_callback import CustomLoggingCallback
 import torch as th
+from dataclasses import dataclass
+
+
+@dataclass
+class RolloutMetrics:
+    true_rewards: List[float]
+    model_rewards: List[float]
+    lengths: List[int]
+    mean_true_reward: float
+    mean_model_reward: float
+    mean_length: float
+    time_sample: float
+
+
+@dataclass
+class TrainMetrics:
+    total_timesteps: int
+    current_timesteps: int
+    time_train: float
 
 
 class TrajectoryGeneratorFromAgent:
@@ -19,13 +39,13 @@ class TrajectoryGeneratorFromAgent:
         reward_model: RewardNet,
         venv: VecEnv,
         rng: np.random.Generator,
-        logger: MainLogger,
+        logger: PrefixedLogger,
         exploration_frac: float = 0.0,
         random_prob: float = 0.5,
     ) -> None:
         
-        self.agent = agent
         self.logger = logger
+        self.agent = agent
         
         self.reward_model = reward_model
         self.exploration_frac = exploration_frac
@@ -43,10 +63,10 @@ class TrajectoryGeneratorFromAgent:
 
         self.buffering_wrapper = EnvBufferingWrapper(venv)
 
-        self.venv = EnvRewardWrapper(
+        self.venv = VecMonitor(EnvRewardWrapper(
             self.buffering_wrapper,
             reward_model=self.reward_model,
-        )
+        ))
 
         self.agent.set_env(self.venv)
         
@@ -66,7 +86,7 @@ class TrajectoryGeneratorFromAgent:
             rng=self.rng,
         )
 
-    def train(self, steps: int, **kwargs) -> None:
+    def train(self, steps: int, log_interval: int, **kwargs) -> None:
         """Train the agent using the reward function specified during instantiation.
 
         Args:
@@ -83,6 +103,10 @@ class TrajectoryGeneratorFromAgent:
                 f"There are transitions left in the buffer. "
                 "Call AgentTrainer.sample() first to clear them.",
             )
+
+        num_timesteps_before = self.agent.num_timesteps
+
+        t0 = time.perf_counter()
         self.agent.learn(
             total_timesteps=steps,
             reset_num_timesteps=False,
@@ -90,15 +114,16 @@ class TrajectoryGeneratorFromAgent:
             **kwargs,
         )
 
+        return TrainMetrics(
+            total_timesteps=self.agent.num_timesteps,
+            current_timesteps=self.agent.num_timesteps-num_timesteps_before,
+            time_train=time.perf_counter() - t0,
+        )
+
+
     def sample(self, steps: int) -> Sequence[types.Trajectory]:
+        t0 = time.perf_counter()
         agent_trajs = self.buffering_wrapper.pop_finished_trajectories()
-        # We typically have more trajectories than are needed.
-        # In that case, we use the final trajectories because
-        # they are the ones with the most relevant version of
-        # the agent.
-        # The easiest way to do this will be to first invert the
-        # list and then later just take the first trajectories:
-        agent_trajs = agent_trajs[::-1]
         avail_steps = sum(len(traj) for traj in agent_trajs)
 
         exploration_steps = int(self.exploration_frac * steps)
@@ -153,17 +178,25 @@ class TrajectoryGeneratorFromAgent:
         model_rewards = [self._score_trajectory(traj) for traj in trajectories]
         lengths       = [len(traj) for traj in trajectories]
 
-        self.logger.record("rollout/mean_true_reward",  np.mean(true_rewards))
-        self.logger.record("rollout/mean_model_reward", np.mean(model_rewards))
-        self.logger.record("rollout/mean_length",       np.mean(lengths))
+        logs_metrics = RolloutMetrics(
+            true_rewards=true_rewards,
+            model_rewards=model_rewards,
+            lengths=lengths,
+            mean_true_reward=float(np.mean(true_rewards)),
+            mean_model_reward=float(np.mean(model_rewards)),
+            mean_length=float(np.mean(lengths)),
+            time_sample=time.perf_counter() - t0,
+        )
 
-        return trajectories
+        return trajectories, logs_metrics
 
 
     def _score_trajectory(self, traj: types.Trajectory) -> float:
-        obs  = np.array([t.observation for t in traj])  # (T, obs_dim)
-        acts = np.array([t.action for t in traj])        # (T, act_dim)
-        return self.reward_model.predict(obs, acts).sum()
+        obs         = np.array([t.observation for t in traj])
+        acts        = np.array([t.action for t in traj])
+        next_status = np.array([t.next_status for t in traj])
+        done        = np.array([float(t.done) for t in traj])
+        return self.reward_model.predict(obs, acts, next_status, done).sum()
 
 
 
@@ -181,16 +214,6 @@ def _get_trajectories(
         raise RuntimeError(
             f"Asked for {steps} transitions but only {available_steps} available",
         )
-    # We need the cumulative sum of trajectory lengths
-    # to determine how many trajectories to return:
-    steps_cumsum = np.cumsum([len(traj) for traj in trajectories])
-    # Now we find the first index that gives us enough
-    # total steps:
-    idx = int((steps_cumsum >= steps).argmax())
-    # we need to include the element at position idx
-    trajectories = trajectories[: idx + 1]
-    # sanity check
-    assert sum(len(traj) for traj in trajectories) >= steps
     return trajectories
 
 
