@@ -61,6 +61,7 @@ class EnvRewardWrapper(VecEnvWrapper):
         self.reward_model = reward_model
         self._obs: np.ndarray | None = None
         self._actions: np.ndarray | None = None
+        self._rms = _RunningMeanStd()
 
     def reset(self):
         obs = self.venv.reset()
@@ -77,6 +78,8 @@ class EnvRewardWrapper(VecEnvWrapper):
         if self._obs is not None and self._actions is not None:
             next_status = np.array([ego_status_to_onehot(i.get("ego_status", "running")) for i in infos])
             predicted_rew = self.reward_model.predict(self._obs, self._actions, next_status, dones.astype(np.float32))
+            self._rms.update(predicted_rew)
+            predicted_rew = (predicted_rew - self._rms.mean) / self._rms.std
         else:
             predicted_rew = np.zeros(len(obs), dtype=np.float32)
 
