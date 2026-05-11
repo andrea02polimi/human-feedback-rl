@@ -64,6 +64,7 @@ class ChristianoAlgorithm:
         batch_size_rew: int = 100,
         n_epochs_rew: int = 5,
         n_ensembles_rew: int = 2,
+        net_arch_rew: list[int] = [128, 128],
         decay_rew: float = 0.0,
         l2_rew: float = 0.01,
         train_comparison_frac: int = 0.7,
@@ -99,7 +100,7 @@ class ChristianoAlgorithm:
         self.query_schedule = QUERY_SCHEDULES[query_schedule]
         self.query_schedule_name = query_schedule
 
-        self.reward_model = make_reward_ensemble(env, n_ensembles=n_ensembles_rew)
+        self.reward_model = make_reward_ensemble(env, n_ensembles=n_ensembles_rew, net_arch=net_arch_rew)
 
         self.preference_model = PreferenceModelFromReward(self.reward_model)
 
@@ -137,7 +138,8 @@ class ChristianoAlgorithm:
             log_interval: int = 1,
         ) -> Any:
 
-        n_iterations = int(total_timesteps / comparisons_per_iteration)
+        n_iterations = int(total_timesteps / timesteps_per_iteration)
+        total_comparisons = comparisons_per_iteration * n_iterations
         initial_comparisons = int(total_comparisons * self.initial_comparison_frac)
         total_comparisons = total_comparisons - initial_comparisons
 
