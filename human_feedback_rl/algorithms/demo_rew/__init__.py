@@ -1,5 +1,5 @@
-from .demo_rew_algorithm import ChristianoAlgorithm
+from .demo_rew_algorithm import ZhangAlgorithm
 
 __all__ = [
-    "ChristianoAlgorithm",
+    "ZhangAlgorithm",
 ]
