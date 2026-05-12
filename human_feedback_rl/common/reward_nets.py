@@ -132,7 +132,13 @@ class SumoSimpleRewardNet(RewardNet):
 
 
 class RewardEnsemble(RewardNet):
-    """Ensemble of reward networks that returns the mean reward."""
+    """Ensemble of reward networks that returns the mean reward.
+
+    Supports online reward normalization via set_mean / set_std.
+    Normalization is applied only in predict() so the agent (PPO/SAC) sees
+    normalized rewards, while forward() always returns raw values so the
+    reward-model loss is not affected.
+    """
 
     def __init__(
         self,
@@ -146,6 +152,14 @@ class RewardEnsemble(RewardNet):
 
         super().__init__(observation_space, action_space)
         self.members = nn.ModuleList(members)
+        self._norm_mean: float = 0.0
+        self._norm_std:  float = 1.0
+
+    def set_mean(self, mean: float) -> None:
+        self._norm_mean = float(mean)
+
+    def set_std(self, std: float) -> None:
+        self._norm_std = float(std)
 
     def forward(
         self,
@@ -154,13 +168,44 @@ class RewardEnsemble(RewardNet):
         next_status: Optional[th.Tensor] = None,
         done: Optional[th.Tensor] = None,
     ) -> th.Tensor:
-        """Mean reward across ensemble members. Output shape: (batch_size,)"""
+        """Raw mean reward across ensemble members. Output shape: (batch_size,)"""
         member_rewards = [
             member(state, action, next_status, done)
             for member in self.members
         ]
         rewards_stack = th.stack(member_rewards, dim=0)  # (num_members, batch_size)
         return rewards_stack.mean(dim=0)
+
+    @th.no_grad()
+    def predict(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        next_status: Optional[np.ndarray] = None,
+        done: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Normalized ensemble mean reward used by the agent.
+
+        Applies (raw - mean) / std where mean/std are set via set_mean/set_std.
+        Default mean=0, std=1 → no-op until normalization stats are injected.
+        """
+        raw = super().predict(state, action, next_status, done)
+        return (raw - self._norm_mean) / (self._norm_std + 1e-8)
+
+    @th.no_grad()
+    def predict_unnormalized(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        next_status: Optional[np.ndarray] = None,
+        done: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Raw ensemble mean without normalization.
+
+        Used to compute normalization statistics from the rollout before
+        injecting them via set_mean / set_std.
+        """
+        return super().predict(state, action, next_status, done)
 
     @th.no_grad()
     def predict_all(

@@ -194,6 +194,10 @@ class ZhangAlgorithm:
             # Train the reward model #
             ##########################
 
+            # Update per-step normalization stats from the current rollout
+            # before training so both RM and PPO see rewards at consistent scale.
+            self._update_reward_norm(trajectories)
+
             t0_val = time.perf_counter()
             self.rew_model_correlation(trajectories)
             time_rew_model_correlation = time.perf_counter() - t0_val
@@ -252,6 +256,40 @@ class ZhangAlgorithm:
             self._iteration += 1
 
         return self.trajectory_generator.agent
+
+
+    def _update_reward_norm(self, trajectories) -> tuple[float, float]:
+        """Compute per-step normalization stats from the rollout and inject them
+        into the reward model.
+
+        Stats are derived from raw (unnormalized) ensemble outputs so they are
+        independent of any previously set normalization. After this call,
+        reward_model.predict() returns (raw - mean) / std, which is what both
+        the RM training data and PPO rollouts will see for the rest of this
+        iteration. Stats stay frozen until the next call.
+        """
+        all_rewards: list[np.ndarray] = []
+        self.reward_model.eval()
+        with th.no_grad():
+            for traj in trajectories:
+                obs  = np.array([t.observation  for t in traj], dtype=np.float32)
+                acts = np.array([t.action       for t in traj], dtype=np.float32)
+                ns   = np.array([t.next_status  for t in traj], dtype=np.float32)
+                dn   = np.array([float(t.done)  for t in traj], dtype=np.float32)
+                all_rewards.append(self.reward_model.predict_unnormalized(obs, acts, ns, dn))
+        self.reward_model.train()
+
+        flat = np.concatenate(all_rewards)
+        mean = float(np.mean(flat))
+        std  = max(float(np.std(flat)), 1e-8)
+
+        self.reward_model.set_mean(mean)
+        self.reward_model.set_std(std)
+
+        self.logger.record("reward/norm_mean", mean, exclude="stdout")
+        self.logger.record("reward/norm_std",  std,  exclude="stdout")
+
+        return mean, std
 
 
     def train_reward_model(self, epoch_multiplier: float = 1.0) -> RewMetrics:
