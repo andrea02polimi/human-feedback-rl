@@ -19,6 +19,7 @@ from stable_baselines3.common.logger import Logger
 from scipy.stats import kendalltau, spearmanr
 import sys
 
+import os
 import torch as th
 
 
@@ -70,7 +71,7 @@ class ChristianoAlgorithm:
         train_comparison_frac: int = 0.7,
         fragment_length: int = 1,
         transition_oversampling: int = 3,
-        initial_comparison_frac: float = 0,
+        initial_comparisons: int = 0,
         initial_epoch_multiplier: int = 2,
         query_schedule: Union[str, Callable[[float], float]] = "constant",
         comparison_queue_size: int = 1_000_000,
@@ -81,7 +82,7 @@ class ChristianoAlgorithm:
         self.decay_rew = decay_rew
         self.l2_rew = l2_rew
         self.fragment_length = fragment_length
-        self.initial_comparison_frac = initial_comparison_frac
+        self.initial_comparisons = initial_comparisons
         self.initial_epoch_multiplier = initial_epoch_multiplier
         self.transition_oversampling = transition_oversampling
         self.train_comparison_frac = train_comparison_frac
@@ -131,31 +132,38 @@ class ChristianoAlgorithm:
 
 
 
+    def _save_checkpoint(self, checkpoint_dir: str, iteration: int):
+        ckpt_path = os.path.join(checkpoint_dir, f"checkpoint_{iteration:04d}")
+        os.makedirs(ckpt_path, exist_ok=True)
+        th.save(self.reward_model.state_dict(), os.path.join(ckpt_path, "reward_model.pt"))
+        self.trajectory_generator.agent.save(os.path.join(ckpt_path, "agent"))
+        print(f"- Checkpoint saved to {ckpt_path}")
+
     def train(self,
             total_timesteps: int = 1_000_000,
             timesteps_per_iteration: int = 1024,
             comparisons_per_iteration: int = 10,
             log_interval: int = 1,
+            checkpoint_dir: Optional[str] = None,
+            checkpoint_interval: int = 10,
         ) -> Any:
 
         n_iterations = int(total_timesteps / timesteps_per_iteration)
 
         total_comparisons = comparisons_per_iteration * n_iterations
-        initial_comparisons = int(total_comparisons * self.initial_comparison_frac)
-        total_comparisons = total_comparisons - initial_comparisons
 
         # Compute the number of comparisons to request at each iteration in advance.
         t_vec = np.linspace(0, 1, n_iterations)
         weights = np.array([self.query_schedule(t) for t in t_vec])
         probs = weights / weights.sum()
         shares = np.round(probs * total_comparisons).astype(int)
-        schedule = [initial_comparisons] + shares.tolist()
+        schedule = [self.initial_comparisons] + shares.tolist()
         print(f"- Query {self.query_schedule_name} schedule: {schedule}")
 
         for i, num_pairs in enumerate(schedule):
             t0 = time.perf_counter()
 
-            print(f"\nIteration {i+1}/{len(schedule)}")
+            print(f"\nIteration {i}/{len(schedule)-1}")
 
             if num_pairs == 0:
                 continue
@@ -233,6 +241,9 @@ class ChristianoAlgorithm:
             self.logger.record("time/loggings", rew_logs_metrics.time_logs_rew + time_rew_model_correlation)
             self.logger.record("time/this_iteration", time.perf_counter() - t0)
             self.logger.dump()
+
+            if checkpoint_dir is not None and (i + 1) % checkpoint_interval == 0:
+                self._save_checkpoint(checkpoint_dir, i + 1)
 
             self._iteration += 1
 
