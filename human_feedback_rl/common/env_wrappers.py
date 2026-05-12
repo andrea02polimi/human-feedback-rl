@@ -39,7 +39,8 @@ class _RunningMeanStd:
     def std(self) -> float:
         if self.count < 2:
             return 1.0
-        return float(np.sqrt(self.var / (self.count - 1))) or 1.0
+        s = float(np.sqrt(max(0.0, self.var / (self.count - 1))))
+        return s if s > 0 else 1.0
 
 
 # ---------------------------------------------------------------------------

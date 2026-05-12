@@ -258,7 +258,8 @@ class ChristianoAlgorithm:
                     weights = th.exp(self.decay_rew * t_normalized)
                     weights = weights / weights.sum()
 
-                    per_pair_loss = -(labels * bt_probs.log()).sum(dim=1)
+                    per_pair_loss = -(labels * bt_probs.clamp(min=1e-7).log()).sum(dim=1)
+                    # per_pair_loss = th.nn.functional.binary_cross_entropy_with_logits(logits, labels, reduction='none')
                     loss = (weights * per_pair_loss).sum()
 
                     optimizer.zero_grad()
@@ -305,9 +306,9 @@ class ChristianoAlgorithm:
             dtype=th.float32
         )
 
-        per_pair_loss = -(labels * bt_probs.log()).sum(dim=1)
+        per_pair_loss = -(labels * bt_probs.clamp(min=1e-7).log()).sum(dim=1)
         loss = (weights * per_pair_loss).sum().item()
-        
+
         acc  = (bt_probs.argmax(dim=1) == labels.argmax(dim=1)).float().mean().item()
 
         return loss, acc
