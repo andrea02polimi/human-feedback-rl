@@ -2,7 +2,9 @@ import time
 from dataclasses import dataclass
 from typing import List, Tuple
 
-from human_feedback_rl.common.types import FragmentPair, Preference
+import numpy as np
+
+from human_feedback_rl.common.types import FragmentPair, Fragment, Transition, Preference
 
 
 @dataclass
@@ -28,3 +30,28 @@ class PreferenceGathererFromReward:
                 preferences.append(Preference(pref1=0.5, pref2=0.5))
 
         return preferences, GathererMetrics(time_gatherer=time.perf_counter() - t0)
+
+
+class DemoGathererFromExpert:
+    """For each fragment, replaces every action with the expert's action on that observation."""
+
+    def __init__(self, expert) -> None:
+        self.expert = expert
+
+    def __call__(self, fragments: List[Fragment]) -> Tuple[List[Fragment], GathererMetrics]:
+        t0 = time.perf_counter()
+        expert_fragments = []
+        for fragment in fragments:
+            obs_batch = np.array([tr.observation for tr in fragment])
+            expert_actions = self.expert.predict(obs_batch)
+            expert_fragments.append(Fragment([
+                Transition(
+                    observation=tr.observation,
+                    action=expert_actions[j],
+                    true_reward=tr.true_reward,
+                    next_status=tr.next_status,
+                    done=tr.done,
+                )
+                for j, tr in enumerate(fragment)
+            ]))
+        return expert_fragments, GathererMetrics(time_gatherer=time.perf_counter() - t0)

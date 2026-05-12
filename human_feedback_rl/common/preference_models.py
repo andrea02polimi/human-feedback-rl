@@ -32,3 +32,4 @@ class PreferenceModelFromReward(nn.Module):
         next_status = th.tensor(np.array([t.next_status  for t in fragment]), dtype=th.float32)
         done        = th.tensor(np.array([float(t.done)  for t in fragment]), dtype=th.float32)
         return self.reward_model(obs, actions, next_status, done).sum() / len(fragment)
+    

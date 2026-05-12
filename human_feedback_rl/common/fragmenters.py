@@ -12,7 +12,6 @@ class FragmenterMetrics:
     time_fragmenter: float
 
 
-
 class RandomFragmenter:
 
     def __init__(
@@ -20,38 +19,31 @@ class RandomFragmenter:
         rng: np.random.Generator,
         logger,
     ) -> None:
-        
         self.rng = rng
         self.logger = logger
 
-    def __call__(
+    def _sample_fragments(
         self,
         trajectories: List[Trajectory],
         fragment_length: int,
-        num_pairs: int,
-    ) -> Tuple[List[FragmentPair], FragmenterMetrics]:
-        t0 = time.perf_counter()
-        fragments: List[Fragment] = []
+        num_fragments: int,
+    ) -> List[Fragment]:
+        weights = [len(traj) // fragment_length + 1 for traj in trajectories]
 
-        weights = [len(traj) for traj in trajectories]
-
-        # number of transitions that will be contained in the fragments
-        num_transitions = 2 * num_pairs * fragment_length
-        if sum(weights) < num_transitions:
+        num_transitions = num_fragments * fragment_length
+        if sum(len(traj) for traj in trajectories) < num_transitions:
             self.logger.warn(
                 "Fewer transitions available than needed for desired number "
-                "of fragment pairs. Some transitions will appear multiple times.",
+                "of fragments. Some transitions will appear multiple times.",
             )
 
-        # we need two fragments for each comparison
-        for _ in range(2 * num_pairs):
-            # NumPy's annotation here is overly-conservative, but this works at runtime
+        fragments: List[Fragment] = []
+        for _ in range(num_fragments):
             traj = self.rng.choice(
                 np.array(trajectories, dtype=object),
                 p=np.array(weights) / sum(weights),
             )
 
-            # if the traj is shorter than the fragment length, than takes the entire traj as the fragment
             n = len(traj)
             if n >= fragment_length:
                 start = self.rng.integers(0, n - fragment_length, endpoint=True)
@@ -60,20 +52,41 @@ class RandomFragmenter:
                 start = 0
                 end = n
 
-            fragment = Fragment(traj[start:end])
-            
-            fragments.append(fragment)
+            fragments.append(Fragment(traj[start:end]))
 
-        # fragments is currently a list of single fragments. We want to pair up
-        # fragments to get a list of (fragment1, fragment2) tuples. To do so,
-        # we create a single iterator of the list and zip it with itself:
-        pairs = []
-        for i in range(0, len(fragments) - 1, 2): # range(start, stop, step)
-            pairs.append(
-                FragmentPair(
-                    frag1=fragments[i],
-                    frag2=fragments[i + 1]
-                )
-            )
+        return fragments
+
+
+class RandomPairFragmenter(RandomFragmenter):
+
+    def __call__(
+        self,
+        trajectories: List[Trajectory],
+        fragment_length: int,
+        num_pairs: int,
+    ) -> Tuple[List[FragmentPair], FragmenterMetrics]:
+        t0 = time.perf_counter()
+
+        fragments = self._sample_fragments(trajectories, fragment_length, 2 * num_pairs)
+
+        pairs = [
+            FragmentPair(frag1=fragments[i], frag2=fragments[i + 1])
+            for i in range(0, len(fragments) - 1, 2)
+        ]
 
         return pairs, FragmenterMetrics(time_fragmenter=time.perf_counter() - t0)
+
+
+class RandomSingleFragmenter(RandomFragmenter):
+
+    def __call__(
+        self,
+        trajectories: List[Trajectory],
+        fragment_length: int,
+        num_fragments: int,
+    ) -> Tuple[List[Fragment], FragmenterMetrics]:
+        t0 = time.perf_counter()
+
+        fragments = self._sample_fragments(trajectories, fragment_length, num_fragments)
+
+        return fragments, FragmenterMetrics(time_fragmenter=time.perf_counter() - t0)

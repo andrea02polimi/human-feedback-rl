@@ -1,7 +1,7 @@
 import numpy as np
 from collections import deque
 from typing import Any, Deque, List, Optional
-from .types import FragmentPair, Preference
+from .types import FragmentPair, Fragment, Preference
 from dataclasses import dataclass
 
 
@@ -96,6 +96,54 @@ class PreferenceDataset(BaseDataset):
 
     def max_timestamp(self) -> Optional[int]:
         """Return the highest timestamp present in the dataset."""
+        if not self._data:
+            return None
+        return max(item[2] for item in self._data)
+
+
+@dataclass
+class DemoBatch:
+    fragments: List[Fragment]
+    expert_fragments: List[Fragment]
+    timestamps: List[int]
+
+
+class DemonstrationDataset(BaseDataset):
+    def __init__(self, queue_size: int = 1000):
+        super().__init__(queue_size=queue_size)
+
+    def push(self, fragments: List[Fragment], expert_fragments: List[Fragment], timestamp: int) -> None:
+        assert len(fragments) == len(expert_fragments)
+        items = [(frag, frag_exp, timestamp) for frag, frag_exp in zip(fragments, expert_fragments)]
+        super().push(*items)
+
+    def _to_batch(self, items: List) -> DemoBatch:
+        fragments, expert_fragments, timestamps = zip(*items)
+        return DemoBatch(list(fragments), list(expert_fragments), list(timestamps))
+
+    def get(self, batch_size: int):
+        data = list(self._data)
+        indices = np.random.permutation(len(data))
+        start_idx = 0
+        while start_idx < len(data):
+            batch_indices = indices[start_idx : start_idx + batch_size]
+            yield self._to_batch([data[i] for i in batch_indices])
+            start_idx += batch_size
+
+    def get_all(self) -> DemoBatch:
+        return self._to_batch(list(self._data))
+
+    def bootstrap(self) -> "DemonstrationDataset":
+        all_data = list(self._data)
+        n = len(all_data)
+        indices = np.random.choice(n, size=n, replace=True)
+        boot = DemonstrationDataset(queue_size=n)
+        for i in indices:
+            frag, frag_exp, ts = all_data[i]
+            boot.push([frag], [frag_exp], ts)
+        return boot
+
+    def max_timestamp(self) -> Optional[int]:
         if not self._data:
             return None
         return max(item[2] for item in self._data)
