@@ -139,6 +139,7 @@ class ChristianoAlgorithm:
         ) -> Any:
 
         n_iterations = int(total_timesteps / timesteps_per_iteration)
+
         total_comparisons = comparisons_per_iteration * n_iterations
         initial_comparisons = int(total_comparisons * self.initial_comparison_frac)
         total_comparisons = total_comparisons - initial_comparisons
