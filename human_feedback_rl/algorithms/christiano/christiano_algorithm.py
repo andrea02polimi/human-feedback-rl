@@ -8,7 +8,7 @@ import numpy as np
 from stable_baselines3.common.vec_env import VecEnv
 
 from human_feedback_rl.common.datasets import PreferenceDataset
-from human_feedback_rl.common.fragmenters import RandomPairFragmenter
+from human_feedback_rl.common.fragmenters import RandomPairFragmenter, HighVariancePairFragmenter, RandomSingleFragmenter
 from human_feedback_rl.common.reward_nets import RewardEnsemble, SumoSimpleRewardNet
 from human_feedback_rl.common.trajectory_generators import TrajectoryGeneratorFromAgent
 from human_feedback_rl.common.preference_models import PreferenceModelFromReward
@@ -48,6 +48,23 @@ def make_reward_ensemble(
 
     return RewardEnsemble(obs_space, act_space, members)
 
+def make_fragmenter(self, fragmenter_type):
+        if fragmenter_type == "active":
+            fragmenter = HighVariancePairFragmenter(
+                reward_ensemble=self.reward_model,
+                oversample=5,
+                logger=PrefixedLogger(self.logger, "fragmenter"),
+                rng=self.rng
+            )
+        elif fragmenter_type == "random":
+            fragmenter = RandomPairFragmenter(
+                logger=PrefixedLogger(self.logger, "fragmenter"),
+                rng=self.rng
+            )
+        else:
+            print("errore fragmenter")
+
+        return fragmenter
 
 QUERY_SCHEDULES: Dict[str, Callable[[float], float]] = {
     "constant": lambda t: 1.0,
@@ -74,6 +91,7 @@ class ChristianoAlgorithm:
         initial_comparisons: int = 0,
         initial_epoch_multiplier: int = 2,
         query_schedule: Union[str, Callable[[float], float]] = "constant",
+        fragmenter_type: str = "active",
         comparison_queue_size: int = 1_000_000,
         rng: Optional[np.random.Generator] = None,
     ):
@@ -88,7 +106,7 @@ class ChristianoAlgorithm:
         self.train_comparison_frac = train_comparison_frac
         self._iteration = 0
         self._gradient_steps_rew = 0
-        self.rng = rng
+        self.rng = rng if rng is not None else np.random.default_rng()
         self.venv = env
 
         self.logger = Logger(
@@ -121,10 +139,7 @@ class ChristianoAlgorithm:
             logger=PrefixedLogger(self.logger, "rollout"),
         )
 
-        self.fragmenter = RandomPairFragmenter(
-            logger=PrefixedLogger(self.logger, "fragmenter"),
-            rng=rng if rng is not None else np.random.default_rng(),
-        )
+        self.fragmenter = make_fragmenter(self, fragmenter_type)
 
         self.dataset_train = PreferenceDataset(queue_size=comparison_queue_size)
         self.dataset_val = PreferenceDataset(queue_size=comparison_queue_size)
@@ -145,6 +160,7 @@ class ChristianoAlgorithm:
             total_timesteps: int = 1_000_000,
             timesteps_per_iteration: int = 1024,
             comparisons_per_iteration: int = 10,
+            comparison_timesteps_per_iteration: int = 1024,
             log_interval: int = 1,
             checkpoint_dir: Optional[str] = None,
             checkpoint_interval: int = 10,
@@ -173,12 +189,10 @@ class ChristianoAlgorithm:
             ##########################
             # Gather new preferences #
             ##########################
-            num_steps = math.ceil(2 * self.transition_oversampling * num_pairs * self.fragment_length)
+            print(f"- Collecting {comparison_timesteps_per_iteration} transitions")
+            trajectories, rollout_logs_metrics = self.trajectory_generator.sample(comparison_timesteps_per_iteration)
 
-            print(f"- Collecting {2 * num_pairs} fragments (2x{self.transition_oversampling}x{num_pairs}x{self.fragment_length}={num_steps} transitions)")
-            trajectories, rollout_logs_metrics = self.trajectory_generator.sample(num_steps)
-
-            print(f"- Creating fragment pairs (from {len(trajectories)} trajectories and {np.sum(rollout_logs_metrics.lengths)} total transitions)")
+            print(f"- Creating {num_pairs} fragment pairs (from {len(trajectories)} trajectories and {np.sum(rollout_logs_metrics.lengths)} total transitions)")
             fragments, frag_metrics = self.fragmenter(trajectories, self.fragment_length, num_pairs)
 
             print("- Gathering preferences")
@@ -349,11 +363,15 @@ class ChristianoAlgorithm:
     def rew_model_correlation(self, trajectories):
 
         n_samples = 100
-        segment_lengths = [1, 2, 5, 10, 20]
+        segment_lengths = [1, 2, 5, 20, 100000]
+
+        random_single_fragmenter = RandomSingleFragmenter(
+            rng=self.rng if self.rng is not None else np.random.default_rng(),
+            logger=PrefixedLogger(self.logger, "fragmenter"),
+        )
 
         for seg_len in segment_lengths:
-            frag_pairs, _ = self.fragmenter(trajectories, seg_len, n_samples)
-            frag_list = [f for pair in frag_pairs for f in [pair.frag1, pair.frag2]]
+            frag_list, _ = random_single_fragmenter(trajectories, seg_len, n_samples)
 
             true_returns = np.array([sum(t.true_reward for t in frag) / len(frag) for frag in frag_list])
 
@@ -373,4 +391,24 @@ class ChristianoAlgorithm:
             self.logger.record(f"reward_correlation/spearman_rho_seg{seg_len}", rho, exclude="stdout")
             self.logger.record(f"reward_correlation/pearson_r_seg{seg_len}", r, exclude="stdout")
 
+
+        frag_list, _ = random_single_fragmenter(trajectories, self.fragment_length, n_samples)
+
+        true_returns = np.array([sum(t.true_reward for t in frag) / len(frag) for frag in frag_list])
+
+        self.reward_model.eval()
+        with th.no_grad():
+            model_returns = np.array([
+                self.preference_model._sum_rewards(frag).item()
+                for frag in frag_list
+            ])
+        self.reward_model.train()
+
+        tau, _ = kendalltau(true_returns, model_returns)
+        rho, _ = spearmanr(true_returns, model_returns)
+        r, _ = pearsonr(true_returns, model_returns)
+
+        self.logger.record(f"reward_correlation_learned_seg_len/kendall_tau_seg{self.fragment_length}", tau, exclude="stdout")
+        self.logger.record(f"reward_correlation_learned_seg_len/spearman_rho_seg{self.fragment_length}", rho, exclude="stdout")
+        self.logger.record(f"reward_correlation_learned_seg_len/pearson_r_seg{self.fragment_length}", r, exclude="stdout")
 
