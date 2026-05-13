@@ -1,7 +1,7 @@
 from stable_baselines3.common.vec_env import VecEnv, VecMonitor
 from stable_baselines3.common.base_class import BaseAlgorithm
 from .reward_nets import RewardNet
-from .loggers import PrefixedLogger
+from .loggers import PrefixedLogger, NullLogger
 from .env_wrappers import EnvRewardWrapper, EnvBufferingWrapper, PolicyExplorationWrapper
 from . import types
 import numpy as np
@@ -38,18 +38,18 @@ class TrajectoryGeneratorFromAgent:
         agent: BaseAlgorithm,
         reward_model: RewardNet,
         venv: VecEnv,
-        rng: np.random.Generator,
-        logger: PrefixedLogger,
         exploration_frac: float = 0.0,
         random_prob: float = 0.5,
+        logger: PrefixedLogger = None,
+        rng: np.random.Generator = None,
     ) -> None:
-        
-        self.logger = logger
+
+        self.logger = logger if logger is not None else NullLogger()
         self.agent = agent
         
+        self.rng = rng if rng is not None else np.random.default_rng()
         self.reward_model = reward_model
         self.exploration_frac = exploration_frac
-        self.rng = rng
 
         # The BufferingWrapper records all trajectories, so we can return
         # them after training. This should come first (before the wrapper that

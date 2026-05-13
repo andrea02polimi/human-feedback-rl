@@ -69,6 +69,17 @@ class FilteredHumanOutput(KVWriter):
         self._inner.close()
 
 
+class NullLogger:
+    """A no-op logger that silently discards all calls."""
+
+    def record(self, key, value, exclude=None): pass
+    def record_mean(self, key, value, exclude=None): pass
+    def dump(self, step=0): pass
+    def log(self, *args, **kwargs): pass
+    def warn(self, *args, **kwargs): pass
+    def info(self, *args, **kwargs): pass
+
+
 class WandbWriter(KVWriter):
     def write(self, key_values: dict, key_excluded: dict, step: int = 0):
         metrics = {}
