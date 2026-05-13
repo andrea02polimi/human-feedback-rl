@@ -309,18 +309,26 @@ class ZhangAlgorithm:
                     weights = th.exp(self.decay_rew * ts_norm)
                     weights = weights / weights.sum()
 
-                    predicted_returns = []
+                    expert_returns = []
                     for frag in batch.expert_fragments:
                         obs         = th.tensor(np.array([tr.observation  for tr in frag]), dtype=th.float32)
                         actions     = th.tensor(np.array([tr.action       for tr in frag]), dtype=th.float32)
                         next_status = th.tensor(np.array([tr.next_status  for tr in frag]), dtype=th.float32)
                         done        = th.tensor(np.array([float(tr.done)  for tr in frag]), dtype=th.float32)
-                        return_frag = rew_model_member(obs, actions, next_status, done).sum() / len(frag)
-                        predicted_returns.append(return_frag)
+                        expert_returns.append(rew_model_member(obs, actions, next_status, done).sum() / len(frag))
 
-                    returns = th.stack(predicted_returns)                    # (B,)
-                    # Loss: -log(sigmoid(R)) — reward model should assign high return to expert fragments.
-                    per_frag_loss = -th.log(th.sigmoid(returns).clamp(min=1e-7))
+                    agent_returns = []
+                    for frag in batch.fragments:
+                        obs         = th.tensor(np.array([tr.observation  for tr in frag]), dtype=th.float32)
+                        actions     = th.tensor(np.array([tr.action       for tr in frag]), dtype=th.float32)
+                        next_status = th.tensor(np.array([tr.next_status  for tr in frag]), dtype=th.float32)
+                        done        = th.tensor(np.array([float(tr.done)  for tr in frag]), dtype=th.float32)
+                        agent_returns.append(rew_model_member(obs, actions, next_status, done).sum() / len(frag))
+
+                    r_expert = th.stack(expert_returns)   # (B,)
+                    r_agent  = th.stack(agent_returns)    # (B,)
+                    # BTL loss: expert always preferred over agent on the same state.
+                    per_frag_loss = -th.log(th.sigmoid(r_expert - r_agent).clamp(min=1e-7))
                     loss = (weights * per_frag_loss).sum()
 
                     optimizer.zero_grad()
@@ -353,22 +361,29 @@ class ZhangAlgorithm:
         weights = weights / weights.sum()
 
         self.reward_model.eval()
-        predicted_returns = []
+        expert_returns = []
+        agent_returns = []
         with th.no_grad():
             for frag in data.expert_fragments:
                 obs         = th.tensor(np.array([tr.observation  for tr in frag]), dtype=th.float32)
                 actions     = th.tensor(np.array([tr.action       for tr in frag]), dtype=th.float32)
                 next_status = th.tensor(np.array([tr.next_status  for tr in frag]), dtype=th.float32)
                 done        = th.tensor(np.array([float(tr.done)  for tr in frag]), dtype=th.float32)
-                R = self.reward_model(obs, actions, next_status, done).sum() / len(frag)
-                predicted_returns.append(R)
+                expert_returns.append(self.reward_model(obs, actions, next_status, done).sum() / len(frag))
+            for frag in data.fragments:
+                obs         = th.tensor(np.array([tr.observation  for tr in frag]), dtype=th.float32)
+                actions     = th.tensor(np.array([tr.action       for tr in frag]), dtype=th.float32)
+                next_status = th.tensor(np.array([tr.next_status  for tr in frag]), dtype=th.float32)
+                done        = th.tensor(np.array([float(tr.done)  for tr in frag]), dtype=th.float32)
+                agent_returns.append(self.reward_model(obs, actions, next_status, done).sum() / len(frag))
         self.reward_model.train()
 
-        returns = th.stack(predicted_returns)
-        per_frag_loss = -th.log(th.sigmoid(returns).clamp(min=1e-7))
+        r_expert = th.stack(expert_returns)
+        r_agent  = th.stack(agent_returns)
+        per_frag_loss = -th.log(th.sigmoid(r_expert - r_agent).clamp(min=1e-7))
         loss = (weights * per_frag_loss).sum().item()
-        # Accuracy: fraction of expert fragments the model assigns positive return to.
-        acc = (returns > 0).float().mean().item()
+        # Accuracy: fraction of pairs where expert return > agent return.
+        acc = (r_expert > r_agent).float().mean().item()
 
         return loss, acc
 
