@@ -1,14 +1,36 @@
 import numpy as np
 from collections import deque
-from typing import Any, Deque, List, Optional
+from typing import Any, Deque, List, Literal, Optional, Union
 from .types import FragmentPair, Fragment, Preference
 from dataclasses import dataclass
 
 
+class ReservoirBuffer:
+    def __init__(self, maxlen: int):
+        self.maxlen = maxlen
+        self._data: List[Any] = []
+
+    def append(self, item: Any) -> None:
+        if len(self._data) < self.maxlen:
+            self._data.append(item)
+        else:
+            idx = np.random.randint(0, self.maxlen)
+            self._data[idx] = item
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __iter__(self):
+        return iter(self._data)
+
+
 class BaseDataset:
-    def __init__(self, queue_size: int = 1000):
+    def __init__(self, queue_size: int = 1000, eviction: Literal["fifo", "reservoir"] = "fifo"):
         self.queue_size = queue_size
-        self._data: Deque[Any] = deque(maxlen=queue_size)
+        if eviction == "reservoir":
+            self._data: Union[deque, ReservoirBuffer] = ReservoirBuffer(maxlen=queue_size)
+        else:
+            self._data = deque(maxlen=queue_size)
 
     def push(self, *items: Any) -> None:
         for item in items:
