@@ -5,7 +5,7 @@ import numpy as np
 import torch as th
 
 from human_feedback_rl.common.base_reward_learning_algorithm import BaseRewardLearningAlgorithm
-from human_feedback_rl.common.reward_nets import make_reward_ensemble
+from human_feedback_rl.common.reward_nets import make_reward_ensemble, NormalizedRewardNet
 from human_feedback_rl.common.datasets import PreferenceDataset
 from human_feedback_rl.common.fragmenters import HighVariancePairFragmenter, RandomPairFragmenter
 from human_feedback_rl.common.gatherers import PreferenceGathererFromReward
@@ -44,7 +44,7 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
         output_formats: Optional[List] = None,
         debug_datasets: Optional[dict] = None,
     ):
-        reward_model = make_reward_ensemble(env, **(reward_model_kwargs or {}))
+        reward_model = NormalizedRewardNet(make_reward_ensemble(env, **(reward_model_kwargs or {})))
 
         super().__init__(
             env=env,
@@ -164,6 +164,20 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
         loss = -(labels * bt_probs.clamp(min=1e-7).log()).sum(dim=1).mean().item()
         acc  = (bt_probs.argmax(dim=1) == labels.argmax(dim=1)).float().mean().item()
         return loss, acc
+
+
+    def before_agent_training(self):
+        all_transitions = [t for traj in self.trajectories for t in traj]
+        if not all_transitions:
+            return
+        obs    = np.array([t.observation for t in all_transitions])
+        acts   = np.array([t.action      for t in all_transitions])
+        status = np.array([t.next_status for t in all_transitions])
+        done   = np.array([float(t.done) for t in all_transitions])
+        raw = self.reward_model.predict_unnormalized(obs, acts, status, done)
+        self.reward_model.set_mean(float(raw.mean()))
+        self.reward_model.set_std(float(raw.std()))
+
 
     # ------------------------------------------------------------------
     # Private helpers

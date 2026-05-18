@@ -205,6 +205,10 @@ class NormalizedRewardNet(RewardNet):
         """Raw prediction, bypassing normalization."""
         return super().predict(state, action, next_status, done)
 
+    @property
+    def members(self):
+        return self.net.members
+
 
 
 def make_reward_ensemble(
