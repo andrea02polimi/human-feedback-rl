@@ -1,4 +1,5 @@
 from .base_algorithm import BaseAlgorithm
+from .base_reward_learning_algorithm import BaseRewardLearningAlgorithm, QUERY_SCHEDULES
 from .base_policy import BCPolicy
 from .reward_nets import RewardNet, RewardEnsemble
 from .env_wrappers import EnvRewardWrapper
@@ -17,6 +18,8 @@ from .types import (
 
 __all__ = [
     "BaseAlgorithm",
+    "BaseRewardLearningAlgorithm",
+    "QUERY_SCHEDULES",
     "RewardEnsemble",
     "RewardNet",
     "EnvRewardWrapper",

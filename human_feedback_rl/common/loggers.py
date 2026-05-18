@@ -1,42 +1,103 @@
-from stable_baselines3.common.logger import HumanOutputFormat
-from stable_baselines3.common.logger import KVWriter
 import sys
-import wandb
 
+import wandb
+from stable_baselines3.common.logger import HumanOutputFormat, KVWriter
+from stable_baselines3.common.logger import Logger as SB3Logger
+
+
+class Logger(SB3Logger):
+    """SB3 Logger extended with record_sum (accumulates values before dump)."""
+
+    def warn(self, msg: str) -> None:
+        super().warn(f"\033[33m{msg}\033[0m")
+
+    def record_sum(self, key, value, exclude=None):
+        if key in self.name_to_value:
+            self.name_to_value[key] += value
+            self.name_to_count[key] += 1
+        else:
+            self.name_to_value[key] = value
+            self.name_to_count[key] = 1
+        self.name_to_excluded[key] = exclude
+
+    def dump_keys(self, keys, step=0):
+        """Write and clear only the given keys, leaving all other buffered data intact."""
+        key_values   = {k: self.name_to_value[k]   for k in keys if k in self.name_to_value}
+        key_excluded = {k: self.name_to_excluded[k] for k in keys if k in self.name_to_excluded}
+        for fmt in self.output_formats:
+            fmt.write(key_values, key_excluded, step)
+        for k in keys:
+            self.name_to_value.pop(k, None)
+            self.name_to_excluded.pop(k, None)
+            self.name_to_count.pop(k, None)
+
+
+# ── WandB writer ──────────────────────────────────────────────────────────────
+
+class WandbWriter(KVWriter):
+    def write(self, key_values: dict, key_excluded: dict, step: int = 0) -> None:
+        metrics = {k: v for k, v in key_values.items()
+                   if key_excluded.get(k) is None or "wandb" not in key_excluded[k]}
+        if metrics:
+            wandb.log(metrics)
+
+    def close(self) -> None:
+        wandb.finish()
+
+
+# ── prefix wrapper ────────────────────────────────────────────────────────────
 
 class PrefixedLogger:
-    """Wraps an SB3 logger and prepends a prefix to every recorded key."""
+    """Wraps any SB3-compatible logger and prepends a prefix to every key.
+
+    Records are buffered locally. dump() pushes the buffer into the parent
+    logger and then flushes only those keys to all output formats, leaving
+    any data accumulated by other components in the parent untouched.
+    """
 
     def __init__(self, logger, prefix: str):
         self._logger = logger
-        self.prefix = prefix
+        self.prefix  = prefix.rstrip("/")
+        self._data: list = []  # (method_name, key, value, exclude)
+
+    def _pk(self, key: str) -> str:
+        return f"{self.prefix}/{key}"
 
     def record(self, key, value, exclude=None):
-        self._logger.record(f"{self.prefix}/{key}", value, exclude)
+        self._data.append(("record", self._pk(key), value, exclude))
 
     def record_mean(self, key, value, exclude=None):
-        self._logger.record_mean(f"{self.prefix}/{key}", value, exclude)
+        self._data.append(("record_mean", self._pk(key), value, exclude))
+
+    def record_sum(self, key, value, exclude=None):
+        self._data.append(("record_sum", self._pk(key), value, exclude))
 
     def dump(self, step=0):
-        self._logger.dump(step)
+        keys = [key for _, key, _, _ in self._data]
+        for method, key, value, exclude in self._data:
+            getattr(self._logger, method)(key, value, exclude)
+        self._data.clear()
+        self._logger.dump_keys(keys, step)
 
     def __getattr__(self, name):
         return getattr(self._logger, name)
 
 
-class ExcludedLogger:
-    """Wraps an SB3 logger and injects a fixed exclude tag into every record call."""
+# ── exclude-format wrapper ────────────────────────────────────────────────────
 
-    def __init__(self, logger, exclude):
-        self._logger = logger
+class ExcludeFormatLogger:
+    """Wraps a logger and always excludes a given format from every record call."""
+
+    def __init__(self, logger, exclude: str):
+        self._logger  = logger
         self._exclude = exclude
 
     def _merge(self, exclude):
         if exclude is None:
             return self._exclude
-        a = (self._exclude,) if isinstance(self._exclude, str) else tuple(self._exclude)
-        b = (exclude,) if isinstance(exclude, str) else tuple(exclude)
-        return tuple(set(a) | set(b))
+        if isinstance(exclude, str):
+            return (exclude, self._exclude)
+        return tuple(set(exclude) | {self._exclude})
 
     def record(self, key, value, exclude=None):
         self._logger.record(key, value, self._merge(exclude))
@@ -44,6 +105,9 @@ class ExcludedLogger:
     def record_mean(self, key, value, exclude=None):
         self._logger.record_mean(key, value, self._merge(exclude))
 
+    def record_sum(self, key, value, exclude=None):
+        self._logger.record_sum(key, value, self._merge(exclude))
+
     def dump(self, step=0):
         self._logger.dump(step)
 
@@ -51,46 +115,14 @@ class ExcludedLogger:
         return getattr(self._logger, name)
 
 
-class FilteredHumanOutput(KVWriter):
-    """HumanOutputFormat that respects SB3 exclude flags (keys excluded from 'stdout' are hidden)."""
-
-    def __init__(self):
-        self._inner = HumanOutputFormat(sys.stdout)
-
-    def write(self, key_values: dict, key_excluded: dict, step: int = 0) -> None:
-        visible = {
-            k for k in key_values
-            if key_excluded.get(k) is None or "stdout" not in key_excluded[k]
-        }
-        if visible:
-            self._inner.write(key_values, key_excluded, step)
-
-    def close(self) -> None:
-        self._inner.close()
-
+# ── null logger ───────────────────────────────────────────────────────────────
 
 class NullLogger:
-    """A no-op logger that silently discards all calls."""
-
+    """Discards all calls. Used as a fallback when no logger is injected."""
     def record(self, key, value, exclude=None): pass
     def record_mean(self, key, value, exclude=None): pass
+    def record_sum(self, key, value, exclude=None): pass
     def dump(self, step=0): pass
     def log(self, *args, **kwargs): pass
     def warn(self, *args, **kwargs): pass
-    def info(self, *args, **kwargs): pass
 
-
-class WandbWriter(KVWriter):
-    def write(self, key_values: dict, key_excluded: dict, step: int = 0):
-        metrics = {}
-        for k, v in key_values.items():
-            excluded = key_excluded.get(k)
-            if excluded is not None:
-                formats = (excluded,) if isinstance(excluded, str) else excluded
-                if "wandb" in formats:
-                    continue
-            metrics[k] = v
-        wandb.log(metrics)
-
-    def close(self):
-        wandb.finish()

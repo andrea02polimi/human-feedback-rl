@@ -1,48 +1,57 @@
 import time
-from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List
 
 import numpy as np
+import torch as th
 
+from human_feedback_rl.common.loggers import NullLogger
 from human_feedback_rl.common.types import FragmentPair, Fragment, Transition, Preference
-
-
-@dataclass
-class GathererMetrics:
-    time_gatherer: float
+from human_feedback_rl.common.bradley_terry import BradleyTerry
 
 
 class PreferenceGathererFromReward:
     """Uses ground-truth rewards to generate preferences (for testing)."""
 
-    def __call__(self, fragment_pairs: List[FragmentPair]) -> Tuple[List[Preference], GathererMetrics]:
-        t0 = time.perf_counter()
+    def __init__(self, logger=None, hard_labels=True) -> None:
+        self.hard_labels = hard_labels
+        self.logger = logger if logger is not None else NullLogger()
+
+    def __call__(self, fragment_pairs: List[FragmentPair]) -> List[Preference]:
+
         preferences = []
-        for pair in fragment_pairs:
-            reward1 = pair.frag1.total_reward() / pair.frag1.length()
-            reward2 = pair.frag2.total_reward() / pair.frag2.length()
 
-            if reward1 > reward2:
-                preferences.append(Preference(pref1=1.0, pref2=0.0))
-            elif reward2 > reward1:
-                preferences.append(Preference(pref1=0.0, pref2=1.0))
+        for p in fragment_pairs:
+            r1 = p.frag1.total_reward() / p.frag1.length()
+            r2 = p.frag2.total_reward() / p.frag2.length()
+
+            if self.hard_labels:
+                if r1 > r2:
+                    pref = Preference(1.0, 0.0)
+                elif r1 < r2:
+                    pref = Preference(0.0, 1.0)
+                else:
+                    pref = Preference(0.5, 0.5)
             else:
-                preferences.append(Preference(pref1=0.5, pref2=0.5))
+                p1, p2 = BradleyTerry(th.tensor([r1]), th.tensor([r2]))[0].tolist()
+                pref = Preference(p1, p2)
 
-        return preferences, GathererMetrics(time_gatherer=time.perf_counter() - t0)
+            preferences.append(pref)
+
+        return preferences
 
 
 class DemoGathererFromExpert:
     """For each fragment, replaces every action with the expert's action on that observation."""
 
-    def __init__(self, expert) -> None:
+    def __init__(self, expert, logger=None) -> None:
         self.expert = expert
+        self.logger = logger if logger is not None else NullLogger()
 
-    def __call__(self, fragments: List[Fragment]) -> Tuple[List[Fragment], GathererMetrics]:
-        t0 = time.perf_counter()
+    def __call__(self, fragments: List[Fragment]) -> List[Fragment]:
+        
         expert_fragments = []
         for fragment in fragments:
-            obs_batch = np.array([tr.observation for tr in fragment])
+            obs_batch      = np.array([tr.observation for tr in fragment])
             expert_actions = self.expert.predict(obs_batch)
             expert_fragments.append(Fragment([
                 Transition(
@@ -54,4 +63,5 @@ class DemoGathererFromExpert:
                 )
                 for j, tr in enumerate(fragment)
             ]))
-        return expert_fragments, GathererMetrics(time_gatherer=time.perf_counter() - t0)
+
+        return expert_fragments

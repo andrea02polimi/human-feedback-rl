@@ -209,8 +209,8 @@ class PolicyExplorationWrapper:
     Dopo ogni chiamata, con probabilità `switch_prob`,
     decide se cambiare policy corrente.
     Quando cambia, sceglie:
-    - policy casuale con probabilità `random_prob`
-    - policy vera con probabilità `1 - random_prob`
+    - policy casuale con probabilità `exploration_eps`
+    - policy vera con probabilità `1 - exploration_eps`
 
     Limitazione:
     supporta solo policy stateless, cioè senza stato ricorrente.
@@ -218,9 +218,9 @@ class PolicyExplorationWrapper:
 
     def __init__(
         self,
-        policy: Callable,
         venv: VecEnv,
-        random_prob: float,
+        policy: Callable,
+        exploration_eps: float,
         rng: np.random.Generator,
     ):
         """
@@ -230,14 +230,14 @@ class PolicyExplorationWrapper:
                 (actions, state), dove state deve essere None.
             venv:
                 Ambiente vettorizzato, usato per campionare azioni casuali.
-            random_prob:
+            exploration_eps:
                 Probabilità di scegliere la policy casuale quando avviene uno switch.
             rng:
                 Generatore random usato per tutte le scelte casuali.
         """
         self.wrapped_policy = policy
         self.venv = venv
-        self.random_prob = random_prob
+        self.exploration_eps = exploration_eps
         self.rng = rng
 
         # Seed dell'action space, così anche il sampling casuale dipende da rng
@@ -245,7 +245,7 @@ class PolicyExplorationWrapper:
         self.venv.action_space.seed(seed)
 
     def predict(self, observation: np.ndarray, **kwargs) -> tuple:
-        if self.rng.random() < self.random_prob:
+        if self.rng.random() < self.exploration_eps:
             num_envs = len(observation)
             actions = np.stack([self.venv.action_space.sample() for _ in range(num_envs)])
             return actions, None
