@@ -88,6 +88,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         rng: Optional[np.random.Generator] = None,
         log_folder: Optional[str] = None,
         output_formats: Optional[List] = None,
+        debug_datasets: Optional[Dict] = None,
     ):
         super().__init__(env, agent, rng, log_folder=log_folder, output_formats=output_formats)
 
@@ -97,6 +98,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         self.exploration_frac         = exploration_frac
         self.iteration                = 0
         self.trajectories             = []
+        self.debug_datasets           = debug_datasets or {}
 
         if fragment_length not in self._CORRELATION_SEGMENT_LENGTHS:
             self._CORRELATION_SEGMENT_LENGTHS = self._CORRELATION_SEGMENT_LENGTHS + (fragment_length,)
@@ -188,36 +190,44 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         print(f"  checkpoint saved in {ckpt_path}")
 
     def log_reward_model_correlations(self, trajectories) -> None:
-        """Log Kendall-τ, Spearman-ρ, and Pearson-r between model and true returns.
+        """Log Spearman-ρ and Pearson-r between model and true returns.
 
-        Evaluated at every length in ``_CORRELATION_SEGMENT_LENGTHS`` and again
-        at the learned fragment length (logged under a separate key prefix).
+        Uses pre-computed debug datasets when available; otherwise samples
+        fragments on-the-fly from the provided trajectories.
         """
+        if self.debug_datasets:
+            for key, data in self.debug_datasets.items():
+                frag_list = [frag for bucket in data.values() for frag in bucket]
+                if not frag_list:
+                    continue
+                self._log_correlations(frag_list, tag=key)
+        else:
+            for seg_len in self._CORRELATION_SEGMENT_LENGTHS:
+                frag_list = self._single_fragmenter(trajectories, seg_len, self._CORRELATION_N_SAMPLES)
+                self._log_correlations(frag_list, tag=f"seg{seg_len}")
 
-        for seg_len in self._CORRELATION_SEGMENT_LENGTHS:
-            frag_list = self._single_fragmenter(trajectories, seg_len, self._CORRELATION_N_SAMPLES)
+    def _log_correlations(self, frag_list, tag: str) -> None:
+        true_returns = np.array(
+            [sum(t.true_reward for t in frag) / len(frag) for frag in frag_list]
+        )
 
-            true_returns = np.array(
-                [sum(t.true_reward for t in frag) / len(frag) for frag in frag_list]
-            )
+        self.reward_model.eval()
+        with th.no_grad():
+            model_returns = []
+            for frag in frag_list:
+                obs    = th.tensor(np.array([t.observation  for t in frag]), dtype=th.float32)
+                acts   = th.tensor(np.array([t.action       for t in frag]), dtype=th.float32)
+                next_s = th.tensor(np.array([t.next_status  for t in frag]), dtype=th.float32)
+                done   = th.tensor(np.array([float(t.done)  for t in frag]), dtype=th.float32)
+                model_returns.append(self.reward_model(obs, acts, next_s, done).sum().item() / len(frag))
+            model_returns = np.array(model_returns)
+        self.reward_model.train()
 
-            self.reward_model.eval()
-            with th.no_grad():
-                model_returns = []
-                for frag in frag_list:
-                    obs     = th.tensor(np.array([t.observation       for t in frag]), dtype=th.float32)
-                    acts    = th.tensor(np.array([t.action            for t in frag]), dtype=th.float32)
-                    next_s  = th.tensor(np.array([t.next_status       for t in frag]), dtype=th.float32)
-                    done    = th.tensor(np.array([float(t.done)       for t in frag]), dtype=th.float32)
-                    model_returns.append(self.reward_model(obs, acts, next_s, done).sum().item() / len(frag))
-                model_returns = np.array(model_returns)
-            self.reward_model.train()
+        rho, _ = spearmanr(true_returns, model_returns)
+        r,   _ = pearsonr(true_returns, model_returns)
 
-            rho, _ = spearmanr(true_returns, model_returns)
-            r,   _ = pearsonr(true_returns, model_returns)
-
-            self.logger.record(f"reward_correlation/spearman_seg{seg_len}",   rho, exclude="stdout")
-            self.logger.record(f"reward_correlation/pearson_seg{seg_len}",    r,   exclude="stdout")
+        self.logger.record(f"reward_correlation/spearman_{tag}", rho, exclude="stdout")
+        self.logger.record(f"reward_correlation/pearson_{tag}",  r,   exclude="stdout")
 
     def log_iteration(self, t0: float) -> None:
         """Log iteration-level scalars and flush the logger.

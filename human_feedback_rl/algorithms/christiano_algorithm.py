@@ -26,8 +26,8 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
         env,
         agent,
         lr_rew: float = 0.001,
-        n_minibatches_rew: int = 5,
-        n_epochs_rew: int = 5,
+        gradient_steps_rew: int = 10,
+        batch_size_rew: int = 32,
         l2_rew: float = 0.01,
         fragmenter_type: str = "random",
         comparison_queue_size: int = 1_000_000,
@@ -42,6 +42,7 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
         rng: Optional[np.random.Generator] = None,
         log_folder: Optional[str] = None,
         output_formats: Optional[List] = None,
+        debug_datasets: Optional[dict] = None,
     ):
         reward_model = make_reward_ensemble(env, **(reward_model_kwargs or {}))
 
@@ -58,10 +59,11 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
             rng=rng,
             log_folder=log_folder,
             output_formats=output_formats,
+            debug_datasets=debug_datasets,
         )
 
-        self.n_epochs_rew        = n_epochs_rew
-        self.n_minibatches_rew   = n_minibatches_rew
+        self.gradient_steps_rew  = gradient_steps_rew
+        self.batch_size_rew      = batch_size_rew
 
         self.fragmenter          = self._make_fragmenter(fragmenter_type)
         self.preference_gatherer = PreferenceGathererFromReward(logger=self.logger, hard_labels=hard_labels)
@@ -119,25 +121,21 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
     def train_reward_model(self) -> None:
         t0 = time.perf_counter()
 
-        boot_datasets = [self.dataset_train.bootstrap() for _ in self.reward_model.members]
-
-        for _ in range(self.n_epochs_rew):
-            for member, optimizer, boot_dataset in zip(
-                self.reward_model.members, self.optimizers, boot_datasets
-            ):
-                member.train()
-                batch_size = max(1, len(boot_dataset) // self.n_minibatches_rew)
-                for batch in boot_dataset.get(batch_size):
-                    r1 = th.stack([member.fragment_avg_reward(p.frag1) for p in batch.fragment_pairs])
-                    r2 = th.stack([member.fragment_avg_reward(p.frag2) for p in batch.fragment_pairs])
-                    bt_probs = BradleyTerry(r1, r2)
-                    labels   = th.tensor(
-                        [[p.pref1, p.pref2] for p in batch.preferences], dtype=th.float32
-                    )
-                    loss = -(labels * bt_probs.clamp(min=1e-7).log()).sum(dim=1).mean()
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
+        for member, optimizer in zip(self.reward_model.members, self.optimizers):
+            member.train()
+            boot_dataset = self.dataset_train.bootstrap()
+            for _ in range(self.gradient_steps_rew):
+                batch = boot_dataset.sample(self.batch_size_rew)
+                r1 = th.stack([member.fragment_avg_reward(p.frag1) for p in batch.fragment_pairs])
+                r2 = th.stack([member.fragment_avg_reward(p.frag2) for p in batch.fragment_pairs])
+                bt_probs = BradleyTerry(r1, r2)
+                labels   = th.tensor(
+                    [[p.pref1, p.pref2] for p in batch.preferences], dtype=th.float32
+                )
+                loss = -(labels * bt_probs.clamp(min=1e-7).log()).sum(dim=1).mean()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
 
         t_train = time.perf_counter() - t0
 
