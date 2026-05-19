@@ -1,19 +1,17 @@
+import math
 import time
 from typing import List
 
 import numpy as np
-import torch as th
 
 from human_feedback_rl.common.loggers import NullLogger
 from human_feedback_rl.common.types import FragmentPair, Fragment, Transition, Preference
-from human_feedback_rl.common.bradley_terry import BradleyTerry
 
 
-class PreferenceGathererFromReward:
+class BinaryPreferenceGathererFromReward:
     """Uses ground-truth rewards to generate preferences (for testing)."""
 
-    def __init__(self, logger=None, hard_labels=True) -> None:
-        self.hard_labels = hard_labels
+    def __init__(self, logger=None) -> None:
         self.logger = logger if logger is not None else NullLogger()
 
     def __call__(self, fragment_pairs: List[FragmentPair]) -> List[Preference]:
@@ -24,16 +22,34 @@ class PreferenceGathererFromReward:
             r1 = p.frag1.total_reward() / p.frag1.length()
             r2 = p.frag2.total_reward() / p.frag2.length()
 
-            if self.hard_labels:
-                if r1 > r2:
-                    pref = Preference(1.0, 0.0)
-                elif r1 < r2:
-                    pref = Preference(0.0, 1.0)
-                else:
-                    pref = Preference(0.5, 0.5)
+            if r1 > r2:
+                pref = Preference(1.0, 0.0)
+            elif r1 < r2:
+                pref = Preference(0.0, 1.0)
             else:
-                p1, p2 = BradleyTerry(th.tensor([r1]), th.tensor([r2]))[0].tolist()
-                pref = Preference(p1, p2)
+                pref = Preference(0.5, 0.5)
+
+            preferences.append(pref)
+
+        return preferences
+    
+
+class SoftPreferenceGathererFromReward:
+    """Uses ground-truth rewards to generate preferences (for testing)."""
+
+    def __init__(self, logger=None) -> None:
+        self.logger = logger if logger is not None else NullLogger()
+
+    def __call__(self, fragment_pairs: List[FragmentPair]) -> List[Preference]:
+
+        preferences = []
+
+        for p in fragment_pairs:
+            r1 = p.frag1.total_reward() / p.frag1.length()
+            r2 = p.frag2.total_reward() / p.frag2.length()
+
+            p1 = 1.0 / (1.0 + math.exp(r2 - r1))
+            pref = Preference(p1, 1.0 - p1)
 
             preferences.append(pref)
 
