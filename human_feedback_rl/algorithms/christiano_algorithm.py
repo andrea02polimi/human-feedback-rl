@@ -10,6 +10,7 @@ from human_feedback_rl.common.datasets import PreferenceDataset
 from human_feedback_rl.common.fragmenters import HighVariancePairFragmenter, RandomPairFragmenter
 from human_feedback_rl.common.gatherers import PreferenceGathererFromReward
 from human_feedback_rl.common.bradley_terry import BradleyTerry
+from human_feedback_rl.common.env_wrappers import _RunningMeanStd
 
 
 class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
@@ -29,6 +30,7 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
         gradient_steps_rew: int = 10,
         batch_size_rew: int = 32,
         l2_rew: float = 0.01,
+        bt_temperature: float = 1.0,
         fragmenter_type: str = "random",
         comparison_queue_size: int = 1_000_000,
         hard_labels: bool = True,
@@ -43,6 +45,7 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
         log_folder: Optional[str] = None,
         output_formats: Optional[List] = None,
         debug_datasets: Optional[dict] = None,
+        pessimism: float = 0.0,
     ):
         reward_model = NormalizedRewardNet(make_reward_ensemble(env, **(reward_model_kwargs or {})))
 
@@ -60,13 +63,14 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
             log_folder=log_folder,
             output_formats=output_formats,
             debug_datasets=debug_datasets,
+            pessimism=pessimism,
         )
 
         self.gradient_steps_rew  = gradient_steps_rew
         self.batch_size_rew      = batch_size_rew
 
         self.fragmenter          = self._make_fragmenter(fragmenter_type)
-        self.preference_gatherer = PreferenceGathererFromReward(logger=self.logger, hard_labels=hard_labels)
+        self.preference_gatherer = PreferenceGathererFromReward(logger=self.logger, hard_labels=hard_labels, bt_temperature=bt_temperature)
         self.dataset_train       = PreferenceDataset(queue_size=comparison_queue_size, rng=self.rng)
         self.dataset_val         = PreferenceDataset(queue_size=comparison_queue_size, rng=self.rng)
 
@@ -74,6 +78,8 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
             th.optim.Adam(m.parameters(), lr=lr_rew, weight_decay=l2_rew)
             for m in self.reward_model.members
         ]
+
+        self._rms = _RunningMeanStd()
 
 
     # ------------------------------------------------------------------
@@ -90,7 +96,6 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
         t0 = time.perf_counter()
         self.logger.record("time/collect_feedback", t_collect_feedback)
         self.logger.record_sum("time/loggings", time.perf_counter() - t0)
-
 
         return fragment_pairs, preferences
 
@@ -175,8 +180,10 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
         status = np.array([t.next_status for t in all_transitions])
         done   = np.array([float(t.done) for t in all_transitions])
         raw = self.reward_model.predict_unnormalized(obs, acts, status, done)
-        self.reward_model.set_mean(float(raw.mean()))
-        self.reward_model.set_std(float(raw.std()))
+
+        self._rms.update(raw)
+        self.reward_model.set_mean(self._rms.mean)
+        self.reward_model.set_std(self._rms.std)
 
 
     # ------------------------------------------------------------------
@@ -204,7 +211,7 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
     def _make_fragmenter(self, fragmenter_type: str):
         if fragmenter_type == "active":
             return HighVariancePairFragmenter(
-                reward_ensemble=self.reward_model,
+                reward_ensemble=self.reward_model.net,
                 oversample=5,
                 logger=self.logger,
                 rng=self.rng,

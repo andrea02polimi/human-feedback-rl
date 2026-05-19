@@ -89,6 +89,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         log_folder: Optional[str] = None,
         output_formats: Optional[List] = None,
         debug_datasets: Optional[Dict] = None,
+        pessimism: float = 0.0,
     ):
         super().__init__(env, agent, rng, log_folder=log_folder, output_formats=output_formats)
 
@@ -116,6 +117,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
             exploration_eps=exploration_eps,
             rng=self.rng,
             logger=self.logger,
+            pessimism=pessimism,
         )
 
         # Used exclusively for reward-correlation logging (always single fragments).

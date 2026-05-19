@@ -205,6 +205,24 @@ class NormalizedRewardNet(RewardNet):
         """Raw prediction, bypassing normalization."""
         return super().predict(state, action, next_status, done)
 
+    @th.no_grad()
+    def predict_pessimistic(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        next_status: Optional[np.ndarray] = None,
+        done: Optional[np.ndarray] = None,
+        k: float = 0.5,
+    ) -> np.ndarray:
+        """Pessimistic normalized prediction: (mean - k*std - norm_mean) / norm_std.
+
+        With k>0, uncertain (OOD) states are penalized proportionally to ensemble
+        disagreement, discouraging reward hacking into unexplored regions.
+        Reduces to predict() when n_ensembles=1 (std=0).
+        """
+        mean_raw, std_raw = self.net.predict_mean_std(state, action, next_status, done)
+        return (mean_raw - k * std_raw - self._mean) / (self._std + 1e-8)
+
     @property
     def members(self):
         return self.net.members

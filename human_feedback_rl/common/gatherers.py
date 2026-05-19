@@ -12,8 +12,9 @@ from human_feedback_rl.common.bradley_terry import BradleyTerry
 class PreferenceGathererFromReward:
     """Uses ground-truth rewards to generate preferences (for testing)."""
 
-    def __init__(self, logger=None, hard_labels=True) -> None:
+    def __init__(self, logger=None, hard_labels=True, bt_temperature=1.0) -> None:
         self.hard_labels = hard_labels
+        self.bt_temperature = bt_temperature
         self.logger = logger if logger is not None else NullLogger()
 
     def __call__(self, fragment_pairs: List[FragmentPair]) -> List[Preference]:
@@ -32,7 +33,7 @@ class PreferenceGathererFromReward:
                 else:
                     pref = Preference(0.5, 0.5)
             else:
-                p1, p2 = BradleyTerry(th.tensor([r1]), th.tensor([r2]))[0].tolist()
+                p1, p2 = BradleyTerry(th.tensor([r1]), th.tensor([r2]), temperature=self.bt_temperature)[0].tolist()
                 pref = Preference(p1, p2)
 
             preferences.append(pref)

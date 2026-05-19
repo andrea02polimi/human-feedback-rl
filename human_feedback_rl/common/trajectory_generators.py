@@ -24,6 +24,7 @@ class TrajectoryGeneratorFromAgent:
         exploration_eps: float = 0.5,
         logger=None,
         rng: np.random.Generator = None,
+        pessimism: float = 0.0,
     ) -> None:
 
         self.logger = logger if logger is not None else NullLogger()
@@ -48,6 +49,7 @@ class TrajectoryGeneratorFromAgent:
         self.venv = VecMonitor(EnvRewardWrapper(
             self.buffering_wrapper,
             reward_model=self.reward_model,
+            pessimism=pessimism,
         ))
 
         self.agent.set_env(self.venv)

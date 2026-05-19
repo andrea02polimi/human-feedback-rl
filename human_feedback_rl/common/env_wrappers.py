@@ -57,9 +57,10 @@ class EnvRewardWrapper(VecEnvWrapper):
     being passed to the agent (Christiano et al. 2017, Section 2.2).
     """
 
-    def __init__(self, venv: VecEnv, reward_model: RewardEnsemble):
+    def __init__(self, venv: VecEnv, reward_model: RewardEnsemble, pessimism: float = 0.0):
         super().__init__(venv)
         self.reward_model = reward_model
+        self.pessimism = pessimism
         self._obs: np.ndarray | None = None
         self._actions: np.ndarray | None = None
 
@@ -77,7 +78,12 @@ class EnvRewardWrapper(VecEnvWrapper):
 
         if self._obs is not None and self._actions is not None:
             next_status = np.array([ego_status_to_onehot(i.get("ego_status", "running")) for i in infos])
-            predicted_rew = self.reward_model.predict(self._obs, self._actions, next_status, dones.astype(np.float32))
+            if self.pessimism > 0.0:
+                predicted_rew = self.reward_model.predict_pessimistic(
+                    self._obs, self._actions, next_status, dones.astype(np.float32), k=self.pessimism
+                )
+            else:
+                predicted_rew = self.reward_model.predict(self._obs, self._actions, next_status, dones.astype(np.float32))
         else:
             predicted_rew = np.zeros(len(obs), dtype=np.float32)
 
