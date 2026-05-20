@@ -79,8 +79,6 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
             for m in self.reward_model.members
         ]
 
-        self._rms = _RunningMeanStd()
-
 
     # ------------------------------------------------------------------
     # Abstract hook implementations
@@ -140,6 +138,8 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
                 loss = -(labels * bt_probs.clamp(min=1e-7).log()).sum(dim=1).mean()
                 optimizer.zero_grad()
                 loss.backward()
+                grad_norm = th.nn.utils.clip_grad_norm_(member.parameters(), max_norm=1.0)
+                print(grad_norm)
                 optimizer.step()
 
         t_train = time.perf_counter() - t0
@@ -180,10 +180,6 @@ class ChristianoAlgorithm(BaseRewardLearningAlgorithm):
         status = np.array([t.next_status for t in all_transitions])
         done   = np.array([float(t.done) for t in all_transitions])
         raw = self.reward_model.predict_unnormalized(obs, acts, status, done)
-
-        self._rms.update(raw)
-        self.reward_model.set_mean(self._rms.mean)
-        self.reward_model.set_std(self._rms.std)
 
 
     # ------------------------------------------------------------------
