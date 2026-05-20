@@ -1,4 +1,5 @@
 import math
+import random
 import time
 from typing import List
 
@@ -8,11 +9,14 @@ from human_feedback_rl.common.loggers import NullLogger
 from human_feedback_rl.common.types import FragmentPair, Fragment, Transition, Preference
 
 
-class BinaryPreferenceGathererFromReward:
+class PreferenceGathererFromReward:
     """Uses ground-truth rewards to generate preferences (for testing)."""
 
-    def __init__(self, logger=None) -> None:
+    def __init__(self, logger = None, labels_type: str = "soft", temperature: float = 1) -> None:
+
         self.logger = logger if logger is not None else NullLogger()
+        self.labels_type = labels_type
+        self.temperature = temperature
 
     def __call__(self, fragment_pairs: List[FragmentPair]) -> List[Preference]:
 
@@ -22,12 +26,24 @@ class BinaryPreferenceGathererFromReward:
             r1 = p.frag1.total_reward() / p.frag1.length()
             r2 = p.frag2.total_reward() / p.frag2.length()
 
-            if r1 > r2:
-                pref = Preference(1.0, 0.0)
-            elif r1 < r2:
-                pref = Preference(0.0, 1.0)
+            if self.labels_type == "binary":
+                if r1 > r2:
+                    pref = Preference(1.0, 0.0)
+                elif r1 < r2:
+                    pref = Preference(0.0, 1.0)
+                else:
+                    pref = Preference(0.5, 0.5)
+
+            elif self.labels_type == "soft":
+                prob1 = 1.0 / (1.0 + math.exp((r2 - r1)/self.temperature))
+                pref = Preference(prob1, 1.0 - prob1)
+
+            elif self.labels_type == "binary_bernulli":
+                prob1 = 1.0 / (1.0 + math.exp((r2 - r1)/self.temperature))
+                pref1 = 1 if random.random() < prob1 else 0
+                pref = Preference(pref1, 1.0 - pref1)
             else:
-                pref = Preference(0.5, 0.5)
+                print("errore inserimento labels_type: soft or binary or binary_bernulli")
 
             preferences.append(pref)
 

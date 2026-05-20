@@ -161,17 +161,18 @@ class NormalizedRewardNet(RewardNet):
     Stats are injected via set_mean() / set_std().
     """
 
-    def __init__(self, net: RewardNet):
+    def __init__(self, net: RewardNet, alfa: float = 1):
         super().__init__(net.observation_space, net.action_space)
         self.net = net
+        self.alfa = alfa
         self._mean: float = 0.0
         self._std: float = 1.0
 
     def set_mean(self, mean: float) -> None:
-        self._mean = float(mean)
+        self._mean = (1 - self.alfa)*self._mean + self.alfa*float(mean)
 
     def set_std(self, std: float) -> None:
-        self._std = float(std)
+        self._std = (1 - self.alfa)*self._std + self.alfa*float(std)
 
     def forward(
         self,
@@ -180,7 +181,7 @@ class NormalizedRewardNet(RewardNet):
         next_status: Optional[th.Tensor] = None,
         done: Optional[th.Tensor] = None,
     ) -> th.Tensor:
-        return self.net(state, action, next_status, done)
+        return self.net(state, action, next_status, done) - self._mean
 
     @th.no_grad()
     def predict(
@@ -191,7 +192,7 @@ class NormalizedRewardNet(RewardNet):
         done: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Normalized prediction: (raw - mean) / std."""
-        raw = super().predict(state, action, next_status, done)
+        raw = self.net.predict(state, action, next_status, done)
         return (raw - self._mean) / (self._std + 1e-8)
 
     @th.no_grad()
@@ -203,7 +204,7 @@ class NormalizedRewardNet(RewardNet):
         done: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Raw prediction, bypassing normalization."""
-        return super().predict(state, action, next_status, done)
+        return self.net.predict(state, action, next_status, done)
 
     @property
     def members(self):
@@ -216,11 +217,20 @@ def make_reward_ensemble(
     n_ensembles: int = 1,
     net_arch: Optional[List[int]] = None,
     activation_fn: str = None,
+    alfa: float = 1,
 ) -> RewardEnsemble:
+    
     obs_space = venv.observation_space
     act_space = venv.action_space
+
     members = [
-        SumoRewardNet(obs_space, act_space, net_arch=net_arch, activation_fn=activation_fn)
+        NormalizedRewardNet(
+            SumoRewardNet(
+                obs_space, 
+                act_space, 
+                net_arch=net_arch, 
+                activation_fn=activation_fn
+            ), alfa)
         for _ in range(n_ensembles)
     ]
-    return RewardEnsemble(obs_space, act_space, members)
+    return NormalizedRewardNet(RewardEnsemble(obs_space, act_space, members), alfa)

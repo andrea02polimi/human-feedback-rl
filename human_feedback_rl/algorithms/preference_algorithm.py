@@ -8,10 +8,10 @@ from human_feedback_rl.common.base_reward_learning_algorithm import BaseRewardLe
 from human_feedback_rl.common.reward_nets import make_reward_ensemble, NormalizedRewardNet
 from human_feedback_rl.common.datasets import PreferenceDataset
 from human_feedback_rl.common.fragmenters import HighVariancePairFragmenter, RandomPairFragmenter
-from human_feedback_rl.common.gatherers import SoftPreferenceGathererFromReward
+from human_feedback_rl.common.gatherers import PreferenceGathererFromReward
 
 
-class SoftPreferenceAlgorithm(BaseRewardLearningAlgorithm):
+class BinaryPreferenceAlgorithm(BaseRewardLearningAlgorithm):
     """
     Preference-based reward learning following Christiano et al. (2017).
 
@@ -30,7 +30,7 @@ class SoftPreferenceAlgorithm(BaseRewardLearningAlgorithm):
         l2_rew: float = 0.01,
         fragmenter_type: str = "random",
         comparison_queue_size: int = 1_000_000,
-        hard_labels: bool = True,
+        labels_type: str = "binary",
         train_comparison_frac: float = 0.7,
         fragment_length: int = 1,
         initial_queries: int = 0,
@@ -65,7 +65,7 @@ class SoftPreferenceAlgorithm(BaseRewardLearningAlgorithm):
         self.batch_size_rew      = batch_size_rew
 
         self.fragmenter          = self._make_fragmenter(fragmenter_type)
-        self.preference_gatherer = SoftPreferenceGathererFromReward(logger=self.logger)
+        self.preference_gatherer = PreferenceGathererFromReward(logger=self.logger, labels_type=labels_type)
         self.dataset_train       = PreferenceDataset(queue_size=comparison_queue_size, rng=self.rng)
         self.dataset_val         = PreferenceDataset(queue_size=comparison_queue_size, rng=self.rng)
 
@@ -129,17 +129,16 @@ class SoftPreferenceAlgorithm(BaseRewardLearningAlgorithm):
                 r1 = th.stack([member.fragment_avg_reward(p.frag1) for p in batch.fragment_pairs])
                 r2 = th.stack([member.fragment_avg_reward(p.frag2) for p in batch.fragment_pairs])
                 
-                soft_label1 = th.tensor(
-                    [p.pref1 for p in batch.preferences], dtype=th.float32
+                # Bradley Terry preference model: bt_probs=(p1, p2)
+                prob1 = th.sigmoid(r1 - r2)
+                bt_probs = th.stack([prob1, 1 - prob1], dim=1)
+
+                labels   = th.tensor(
+                    [[p.pref1, p.pref2] for p in batch.preferences], dtype=th.float32
                 )
 
-                dr_true = th.logit(soft_label1, eps=1e-6)
-
-                prob1 = th.sigmoid(r1 - r2 - dr_true)
-                probs = th.stack([prob1, 1 - prob1], dim=1)
-
-                loss = -(probs.clamp(min=1e-7).log()).sum(dim=1).mean()
-
+                loss = -(labels * bt_probs.clamp(min=1e-7).log()).sum(dim=1).mean()
+                
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -159,29 +158,38 @@ class SoftPreferenceAlgorithm(BaseRewardLearningAlgorithm):
         self.logger.record("time/train_reward_model",   t_train)
         self.logger.record_sum("time/loggings",         time.perf_counter() - t0)
 
-
     def _evaluate_reward_model(self, data) -> tuple:
         self.reward_model.eval()
 
         with th.no_grad():
             r1 = th.stack([self.reward_model.fragment_avg_reward(p.frag1) for p in data.fragment_pairs])
             r2 = th.stack([self.reward_model.fragment_avg_reward(p.frag2) for p in data.fragment_pairs])
-            
-            soft_label1 = th.tensor(
-                [p.pref1 for p in data.preferences], dtype=th.float32
-            )
 
-            dr_true = th.logit(soft_label1, eps=1e-6)
-
-            prob1 = th.sigmoid(r1 - r2 - dr_true)
-            probs = th.stack([prob1, 1 - prob1], dim=1)
+            prob1 = th.sigmoid(r1 - r2)
+            bt_probs = th.stack([prob1, 1 - prob1], dim=1)
 
         self.reward_model.train()
 
-        loss = -(probs.clamp(min=1e-7).log()).sum(dim=1).mean().item()
-        acc  = ((r1 > r2) == (soft_label1 > 0.5)).float().mean().item()
+        labels = th.tensor([[p.pref1, p.pref2] for p in data.preferences], dtype=th.float32)
+        loss = -(labels * bt_probs.clamp(min=1e-7).log()).sum(dim=1).mean().item()
+        acc  = (bt_probs.argmax(dim=1) == labels.argmax(dim=1)).float().mean().item()
         return loss, acc
 
+    def before_agent_training(self):
+        all_transitions = [t for traj in self.trajectories for t in traj]
+        if not all_transitions:
+            return
+        obs    = np.array([t.observation for t in all_transitions])
+        acts   = np.array([t.action      for t in all_transitions])
+        status = np.array([t.next_status for t in all_transitions])
+        done   = np.array([float(t.done) for t in all_transitions])
+
+        for member in self.reward_model.members:
+            raw = member.predict_unnormalized(obs, acts, status, done)
+            member.set_mean(raw.mean())
+        
+        raw = self.reward_model.predict_unnormalized(obs, acts, status, done)
+        self.reward_model.set_mean(raw.mean())
 
     # ------------------------------------------------------------------
     # Private helpers
