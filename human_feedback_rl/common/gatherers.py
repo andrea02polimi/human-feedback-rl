@@ -50,27 +50,6 @@ class PreferenceGathererFromReward:
         return preferences
     
 
-class SoftPreferenceGathererFromReward:
-    """Uses ground-truth rewards to generate preferences (for testing)."""
-
-    def __init__(self, logger=None) -> None:
-        self.logger = logger if logger is not None else NullLogger()
-
-    def __call__(self, fragment_pairs: List[FragmentPair]) -> List[Preference]:
-
-        preferences = []
-
-        for p in fragment_pairs:
-            r1 = p.frag1.total_reward() / p.frag1.length()
-            r2 = p.frag2.total_reward() / p.frag2.length()
-
-            p1 = 1.0 / (1.0 + math.exp(r2 - r1))
-            pref = Preference(p1, 1.0 - p1)
-
-            preferences.append(pref)
-
-        return preferences
-
 
 class DemoGathererFromExpert:
     """For each fragment, replaces every action with the expert's action on that observation."""

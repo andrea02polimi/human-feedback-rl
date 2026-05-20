@@ -220,7 +220,16 @@ class NormalizedRewardNet(RewardNet):
     @property
     def members(self):
         return self.net.members
-
+    
+    @th.no_grad()
+    def predict_all(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        next_status: Optional[np.ndarray] = None,
+        done: Optional[np.ndarray] = None,
+        ):
+        return self.net.predict_all(state, action, next_status, done)
 
 
 def make_reward_ensemble(

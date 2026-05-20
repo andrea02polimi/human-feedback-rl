@@ -11,7 +11,7 @@ from human_feedback_rl.common.fragmenters import HighVariancePairFragmenter, Ran
 from human_feedback_rl.common.gatherers import PreferenceGathererFromReward
 
 
-class BinaryPreferenceAlgorithm(BaseRewardLearningAlgorithm):
+class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
     """
     Preference-based reward learning following Christiano et al. (2017).
 
@@ -33,6 +33,7 @@ class BinaryPreferenceAlgorithm(BaseRewardLearningAlgorithm):
         labels_type: str = "binary",
         train_comparison_frac: float = 0.7,
         fragment_length: int = 1,
+        temperature: float = 1,
         initial_queries: int = 0,
         exploration_frac: float = 0.0,
         exploration_eps: float = 0.5,
@@ -65,7 +66,7 @@ class BinaryPreferenceAlgorithm(BaseRewardLearningAlgorithm):
         self.batch_size_rew      = batch_size_rew
 
         self.fragmenter          = self._make_fragmenter(fragmenter_type)
-        self.preference_gatherer = PreferenceGathererFromReward(logger=self.logger, labels_type=labels_type)
+        self.preference_gatherer = PreferenceGathererFromReward(logger=self.logger, labels_type=labels_type, temperature=temperature)
         self.dataset_train       = PreferenceDataset(queue_size=comparison_queue_size, rng=self.rng)
         self.dataset_val         = PreferenceDataset(queue_size=comparison_queue_size, rng=self.rng)
 
