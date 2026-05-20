@@ -1,8 +1,8 @@
-from .preference_algorithm import BinaryPreferenceAlgorithm
+from .preference_algorithm import PreferenceAlgorithm
 from .dagger_algorithm import DaggerAlgorithm
 
 __all__ = [
-    "BinaryPreferenceAlgorithm",
+    "PreferenceAlgorithm",
     "DaggerAlgorithm",
     ]
 
