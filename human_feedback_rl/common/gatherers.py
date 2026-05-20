@@ -12,7 +12,7 @@ from human_feedback_rl.common.types import FragmentPair, Fragment, Transition, P
 class PreferenceGathererFromReward:
     """Uses ground-truth rewards to generate preferences (for testing)."""
 
-    def __init__(self, logger = None, labels_type: str = "soft", temperature: float = 1) -> None:
+    def __init__(self, logger = None, labels_type: str = "soft", temperature: float = 20.0) -> None:
 
         self.logger = logger if logger is not None else NullLogger()
         self.labels_type = labels_type

@@ -206,6 +206,17 @@ class NormalizedRewardNet(RewardNet):
         """Raw prediction, bypassing normalization."""
         return self.net.predict(state, action, next_status, done)
 
+    @th.no_grad()
+    def predict_all(
+        self,
+        state: np.ndarray,
+        action: np.ndarray,
+        next_status: Optional[np.ndarray] = None,
+        done: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Delegate to the inner ensemble's predict_all."""
+        return self.net.predict_all(state, action, next_status, done)
+
     @property
     def members(self):
         return self.net.members

@@ -1,9 +1,9 @@
 from .base_algorithm import BaseAlgorithm
 from .base_reward_learning_algorithm import BaseRewardLearningAlgorithm, QUERY_SCHEDULES
 from .base_policy import BCPolicy
+from .datasets import PreferenceDataset
 from .reward_nets import RewardNet, RewardEnsemble
 from .env_wrappers import EnvRewardWrapper
-from .preference_models import PreferenceModelFromReward
 from .schedules import InverseSchedule
 from .loggers import PrefixedLogger, WandbWriter
 from .custom_logging_callback import CustomLoggingCallback
@@ -23,7 +23,6 @@ __all__ = [
     "RewardEnsemble",
     "RewardNet",
     "EnvRewardWrapper",
-    "PreferenceModelFromReward",
     "Fragment",
     "FragmentPair",
     "Preference",
