@@ -42,7 +42,7 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
         rng: Optional[np.random.Generator] = None,
         log_folder: Optional[str] = None,
         output_formats: Optional[List] = None,
-        debug_datasets: Optional[dict] = None,
+        debug_dataset: Optional[dict] = None,
     ):
         reward_model = make_reward_ensemble(env, **(reward_model_kwargs or {}))
 
@@ -59,7 +59,7 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
             rng=rng,
             log_folder=log_folder,
             output_formats=output_formats,
-            debug_datasets=debug_datasets,
+            debug_dataset=debug_dataset,
         )
 
         self.gradient_steps_rew  = gradient_steps_rew

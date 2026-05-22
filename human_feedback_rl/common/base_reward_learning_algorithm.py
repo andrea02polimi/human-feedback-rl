@@ -71,9 +71,12 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         _CORRELATION_SEGMENT_LENGTHS – segment lengths used in rew_model_correlation.
     """
 
-    _CORRELATION_SEGMENT_LENGTHS: tuple = (1, 5, 20, None)
-    _CORRELATION_N_SAMPLES: int = 100
-
+    STATUS_ARRIVED  = 0
+    STATUS_COLLIDED = 1
+    STATUS_OFFROAD  = 2
+    STATUS_TIMEOUT  = 3
+    STATUS_RUNNING  = 4
+    
     def __init__(
         self,
         env,
@@ -88,7 +91,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         rng: Optional[np.random.Generator] = None,
         log_folder: Optional[str] = None,
         output_formats: Optional[List] = None,
-        debug_datasets: Optional[Dict] = None,
+        debug_dataset: Optional[Dict] = None,
     ):
         super().__init__(env, agent, rng, log_folder=log_folder, output_formats=output_formats)
 
@@ -98,7 +101,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         self.exploration_frac         = exploration_frac
         self.iteration                = 0
         self.trajectories             = []
-        self.debug_datasets           = debug_datasets or {}
+        self.debug_dataset            = debug_dataset or {}
 
         if fragment_length not in self._CORRELATION_SEGMENT_LENGTHS:
             self._CORRELATION_SEGMENT_LENGTHS = self._CORRELATION_SEGMENT_LENGTHS + (fragment_length,)
@@ -160,7 +163,12 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         Default: logs reward-model correlation against ground-truth returns.
         Override and call super() to add extra steps (e.g. reward normalization).
         """
-        self.log_reward_model_validation(self.trajectories)
+        
+        all_transitions = [t for traj in self.trajectories for t in traj]
+        self.log_reward_model_validation(all_transitions, "reward_val/current_rollout")
+        
+        if self.debug_dataset:
+            self.log_reward_model_validation(self.debug_dataset, "reward_val/debug_dataset")
 
 
     def before_agent_training(self) -> None:
@@ -189,53 +197,54 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         self.trajectory_generator.agent.save(os.path.join(ckpt_path, "agent"))
         print(f"  checkpoint saved in {ckpt_path}")
 
-    def log_reward_model_validation(self, trajectories) -> None:
-        """
-        
-        """
-        norm_on_running = True
-        matching_mean = True
-        matching_std = False
-        STATUS_ARRIVED  = 0
-        STATUS_COLLIDED = 1
-        STATUS_OFFROAD  = 2
-        STATUS_TIMEOUT  = 3
-        STATUS_RUNNING  = 4
-
-        all_transitions = [t for traj in trajectories for t in traj]
-
+    def _run_reward_inference(self, transitions):
+        """Run the reward model in eval mode; return arrays of true/pred rewards, status, done."""
         self.reward_model.eval()
         with th.no_grad():
-            true_rewards = np.array([t.true_reward  for t in all_transitions], dtype=np.float32)
-            obs    = np.array([t.observation for t in all_transitions], dtype=np.float32)
-            acts   = np.array([t.action      for t in all_transitions], dtype=np.float32)
-            status = np.array([t.next_status for t in all_transitions], dtype=np.float32)
-            done   = np.array([float(t.done) for t in all_transitions], dtype=np.float32)
+            true_rewards = np.array([t.true_reward  for t in transitions], dtype=np.float32)
+            obs          = np.array([t.observation  for t in transitions], dtype=np.float32)
+            acts         = np.array([t.action       for t in transitions], dtype=np.float32)
+            status       = np.array([t.next_status  for t in transitions], dtype=np.float32)
+            done         = np.array([float(t.done)  for t in transitions], dtype=np.float32)
             pred_rewards = self.reward_model.predict(obs, acts, status, done)
         self.reward_model.train()
+        return true_rewards, pred_rewards, status
 
-        # ── normalisation mask ────────────────────────────────────────────────────
-        norm_mask = np.ones(len(all_transitions), dtype=bool)
+    def _normalize_predictions(
+        self,
+        pred_rewards: np.ndarray,
+        true_rewards: np.ndarray,
+        status: np.ndarray,
+        norm_on_running: bool = True,
+        match_mean: bool = True,
+        match_std: bool = False,
+    ) -> np.ndarray:
+        """Shift/scale pred_rewards to align with true_rewards statistics on running steps."""
+        
+        norm_mask = np.ones(len(pred_rewards), dtype=bool)
         if norm_on_running:
-            norm_mask = status[:, STATUS_RUNNING] == 1
-
+            norm_mask = status[:, self.STATUS_RUNNING] == 1
+            
         true_mean = np.mean(true_rewards[norm_mask])
-        true_std  = np.std(true_rewards[norm_mask])
         pred_mean = np.mean(pred_rewards[norm_mask])
-        pred_std  = np.std(pred_rewards[norm_mask])
 
-        if matching_mean and matching_std:
-            pred_rewards_norm = (pred_rewards - pred_mean) / pred_std * true_std + true_mean
-        elif matching_mean:
-            pred_rewards_norm = pred_rewards - pred_mean + true_mean
-        else:
-            pred_rewards_norm = pred_rewards
+        if match_mean and match_std:
+            true_std = np.std(true_rewards[norm_mask])
+            pred_std = np.std(pred_rewards[norm_mask])
+            return (pred_rewards - pred_mean) / pred_std * true_std + true_mean
+        elif match_mean:
+            return pred_rewards - pred_mean + true_mean
+        return pred_rewards
 
-        arrived_mask  = status[:, STATUS_ARRIVED] == 1
-        collided_mask = status[:, STATUS_COLLIDED] == 1
-        offroad_mask  = status[:, STATUS_OFFROAD] == 1
-        timeout_mask  = status[:, STATUS_TIMEOUT] == 1
-        running_mask  = status[:, STATUS_RUNNING] == 1
+    def log_reward_model_validation(self, transitions, log_class: str) -> None:
+        true_rewards, pred_rewards, status = self._run_reward_inference(transitions)
+        pred_rewards_norm = self._normalize_predictions(pred_rewards, true_rewards, status)
+        
+        arrived_mask  = status[:, self.STATUS_ARRIVED] == 1
+        collided_mask = status[:, self.STATUS_COLLIDED] == 1
+        offroad_mask  = status[:, self.STATUS_OFFROAD] == 1
+        timeout_mask  = status[:, self.STATUS_TIMEOUT] == 1
+        running_mask  = status[:, self.STATUS_RUNNING] == 1
 
         mae_arrived   = np.mean(np.abs(pred_rewards_norm[arrived_mask] - true_rewards[arrived_mask]))
         mae_collided  = np.mean(np.abs(pred_rewards_norm[collided_mask] - true_rewards[collided_mask]))
@@ -244,13 +253,12 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         mae_running   = np.mean(np.abs(pred_rewards_norm[running_mask] - true_rewards[running_mask]))
         kt_running, _ = kendalltau(true_rewards[running_mask], pred_rewards_norm[running_mask])
 
-        self.logger.record(f"reward_model_val/mae_arrived", mae_arrived)
-        self.logger.record(f"reward_model_val/mae_collided", mae_collided)
-        self.logger.record(f"reward_model_val/mae_offroad", mae_offroad)
-        self.logger.record(f"reward_model_val/mae_timeout", mae_timeout)
-        self.logger.record(f"reward_model_val/mae_running", mae_running)
-        self.logger.record(f"reward_model_val/kt_running", kt_running)
-
+        self.logger.record(f"{log_class}/mae_arrived", mae_arrived)
+        self.logger.record(f"{log_class}/mae_collided", mae_collided)
+        self.logger.record(f"{log_class}/mae_offroad", mae_offroad)
+        self.logger.record(f"{log_class}/mae_timeout", mae_timeout)
+        self.logger.record(f"{log_class}/mae_running", mae_running)
+        self.logger.record(f"{log_class}/kendall_running", kt_running)
 
     def log_iteration(self, t0: float) -> None:
         """Log iteration-level scalars and flush the logger.
