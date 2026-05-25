@@ -18,7 +18,34 @@ def make_net(in_dim: int, net_arch: list[int], activation_fn: str) -> nn.Sequent
     layers.append(nn.Linear(in_dim, 1))
     return nn.Sequential(*layers)
 
+class ResidualBlock(nn.Module):
+    """Simple residual block with optional skip connection."""
+    def __init__(self, dim: int, activation_fn: str):
+        super().__init__()
+        act = {"relu": nn.ReLU, "tanh": nn.Tanh}[activation_fn]
+        self.fc = nn.Linear(dim, dim)
+        self.activation = act()
+    
+    def forward(self, x):
+        return x + self.activation(self.fc(x))
 
+
+def make_residual_net(in_dim: int, net_arch: list[int], activation_fn: str) -> nn.Sequential:
+    """Build an MLP with residual connections."""
+    act = {"relu": nn.ReLU, "tanh": nn.Tanh}[activation_fn]
+    layers = []
+    
+    # Project input to first hidden dimension
+    layers.append(nn.Linear(in_dim, net_arch[0]))
+    layers.append(act())
+    
+    # Residual blocks for hidden layers
+    for dim in net_arch:
+        layers.append(ResidualBlock(dim, activation_fn))
+    
+    # Output layer
+    layers.append(nn.Linear(net_arch[-1], 1))
+    return nn.Sequential(*layers)
 
 class RewardNet(nn.Module, abc.ABC):
     """Abstract reward network: maps (state, action, next_status, done) → scalar reward."""
@@ -94,7 +121,9 @@ class SumoRewardNet(RewardNet):
         obs_dim = observation_space.shape[0]
         act_dim = action_space.shape[0]
         in_dim = obs_dim + act_dim + self.STATUS_DIM + 1  # +1 for done
+        
         self.net = make_net(in_dim, net_arch, activation_fn)
+        # self.net = make_residual_net(in_dim, net_arch, activation_fn)
 
     def forward(self, state, action, next_status=None, done=None):
         x = th.cat([state, action, next_status, done.unsqueeze(-1)], dim=1)

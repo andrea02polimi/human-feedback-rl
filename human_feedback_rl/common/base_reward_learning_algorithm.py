@@ -85,9 +85,11 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         train_comparison_frac: float = 0.7,
         fragment_length: int = 1,
         initial_queries: int = 0,
+        initial_agent_timesteps: int = 0,
         exploration_frac: float = 0.0,
         exploration_eps: float = 0.5,
         query_schedule: Union[str, Callable[[float], float]] = "constant",
+        temperature: float = 1,
         rng: Optional[np.random.Generator] = None,
         log_folder: Optional[str] = None,
         output_formats: Optional[List] = None,
@@ -99,12 +101,10 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         self.initial_queries          = initial_queries
         self.train_comparison_frac    = train_comparison_frac
         self.exploration_frac         = exploration_frac
+        self.temperature              = temperature
         self.iteration                = 0
         self.trajectories             = []
         self.debug_dataset            = debug_dataset or {}
-
-        if fragment_length not in self._CORRELATION_SEGMENT_LENGTHS:
-            self._CORRELATION_SEGMENT_LENGTHS = self._CORRELATION_SEGMENT_LENGTHS + (fragment_length,)
 
         self.query_schedule      = QUERY_SCHEDULES[query_schedule]
         self.query_schedule_name = query_schedule
@@ -171,6 +171,13 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
             self.log_reward_model_validation(self.debug_dataset, "reward_val/debug_dataset")
 
 
+    def before_train(self, timesteps_per_iteration: int, log_interval: int) -> None:
+        """Called once before the main training loop starts.
+
+        Default: no-op. Override to add a pre-warmup phase (e.g. initial agent
+        training or reward model pre-training) before the first iteration.
+        """
+
     def before_agent_training(self) -> None:
         """Called after reward-model training, before agent training each iteration.
 
@@ -220,6 +227,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         match_std: bool = False,
     ) -> np.ndarray:
         """Shift/scale pred_rewards to align with true_rewards statistics on running steps."""
+        pred_rewards = pred_rewards * self.temperature
         
         norm_mask = np.ones(len(pred_rewards), dtype=bool)
         if norm_on_running:
@@ -340,6 +348,8 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         print("="*100)
         print("")
         print(f"Query {self.query_schedule_name} schedule: {schedule}")
+
+        self.before_train(timesteps_per_iteration, log_interval)
 
         for num_queries in schedule:
             t_iter = time.perf_counter()

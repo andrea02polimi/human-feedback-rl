@@ -10,6 +10,9 @@ from human_feedback_rl.common.datasets import PreferenceDataset
 from human_feedback_rl.common.fragmenters import HighVariancePairFragmenter, RandomPairFragmenter
 from human_feedback_rl.common.gatherers import PreferenceGathererFromReward
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import torch as th
+
 
 class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
     """
@@ -56,6 +59,7 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
             exploration_frac=exploration_frac,
             exploration_eps=exploration_eps,
             query_schedule=query_schedule,
+            temperature=temperature,
             rng=rng,
             log_folder=log_folder,
             output_formats=output_formats,
@@ -117,11 +121,10 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
         self.logger.record("time/push_data",               t_push_data)
         self.logger.record_sum("time/loggings",            time.perf_counter() - t0)
 
-
     def train_reward_model(self) -> None:
         t0 = time.perf_counter()
 
-        for member, optimizer in zip(self.reward_model.members, self.optimizers):
+        def train_member(member, optimizer):
             member.train()
             boot_dataset = self.dataset_train.bootstrap()
             for _ in range(self.gradient_steps_rew):
@@ -130,11 +133,10 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
                 r1 = th.stack([member.fragment_avg_reward(p.frag1) for p in batch.fragment_pairs])
                 r2 = th.stack([member.fragment_avg_reward(p.frag2) for p in batch.fragment_pairs])
                 
-                # Bradley Terry preference model: bt_probs=(p1, p2)
                 prob1 = th.sigmoid(r1 - r2)
                 bt_probs = th.stack([prob1, 1 - prob1], dim=1)
 
-                labels   = th.tensor(
+                labels = th.tensor(
                     [[p.pref1, p.pref2] for p in batch.preferences], dtype=th.float32
                 )
 
@@ -144,7 +146,18 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
                 loss.backward()
                 optimizer.step()
 
+        # Train all members in parallel
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            futures = [
+                executor.submit(train_member, member, optimizer)
+                for member, optimizer in zip(self.reward_model.members, self.optimizers)
+            ]
+            # Wait for all to complete
+            for future in as_completed(futures):
+                future.result()
+
         t_train = time.perf_counter() - t0
+
 
         t0 = time.perf_counter()
         loss_train, acc_train = self._evaluate_reward_model(self.dataset_train.get_all())
