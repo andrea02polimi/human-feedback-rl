@@ -9,8 +9,17 @@ reward model is updated by minimising the MaxEnt IRL loss:
 
 Because τ^M are always fresh samples from the current policy, no importance
 sampling correction is needed.
+
+Model batch sampling uses two buffers to keep log Z calibrated even when the
+agent converges to the expert distribution:
+  - anchor_buffer: trajectories from the first n_anchor_iterations (permanent)
+  - model_buffer:  rolling window of recent trajectories (FIFO, size model_buffer_size)
+A fixed fraction (anchor_frac) of the model mini-batch is drawn from the anchor
+buffer, guaranteeing that low-quality trajectories never disappear from the
+partition function estimate.
 """
 
+import collections
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, List, Optional, Union
@@ -55,6 +64,9 @@ class DemoAlgorithm(BaseRewardLearningAlgorithm):
         exploration_eps: float = 0.5,
         query_schedule: Union[str, Callable[[float], float]] = "constant",
         reward_model_kwargs: Optional[dict] = None,
+        model_buffer_size: int = 500,
+        n_anchor_iterations: int = 3,
+        anchor_frac: float = 0.4,
         rng: Optional[np.random.Generator] = None,
         log_folder: Optional[str] = None,
         output_formats: Optional[List] = None,
@@ -88,6 +100,11 @@ class DemoAlgorithm(BaseRewardLearningAlgorithm):
         self.batch_size_model         = batch_size_model
         self.initial_agent_timesteps  = initial_agent_timesteps
 
+        self.model_buffer: collections.deque = collections.deque(maxlen=model_buffer_size)
+        self.anchor_buffer: List[Trajectory] = []
+        self.n_anchor_iterations              = n_anchor_iterations
+        self.anchor_frac                      = anchor_frac
+
         self.optimizers = [
             th.optim.Adam(m.parameters(), lr=lr_rew, weight_decay=l2_rew)
             for m in self.reward_model.members
@@ -120,13 +137,19 @@ class DemoAlgorithm(BaseRewardLearningAlgorithm):
 
     def push_data(self, _fragments, _feedback) -> None:
         """No dataset to update; model trajectories come from self.trajectories."""
-        self.logger.record("dataset/expert_size", len(self.expert_trajectories))
-        self.logger.record("dataset/model_size",  len(self.trajectories))
+        self.logger.record("dataset/expert_size",       len(self.expert_trajectories))
+        self.logger.record("dataset/model_size",         len(self.trajectories))
+        self.logger.record("dataset/model_buffer_size",  len(self.model_buffer))
+        self.logger.record("dataset/anchor_buffer_size", len(self.anchor_buffer))
 
     def train_reward_model(self) -> None:
         """MaxEnt IRL reward model update using the current rollout as model trajectories."""
         if not self.trajectories:
             return
+
+        self.model_buffer.extend(self.trajectories)
+        if self.iteration < self.n_anchor_iterations:
+            self.anchor_buffer.extend(self.trajectories)
 
         t0 = time.perf_counter()
 
@@ -209,16 +232,32 @@ class DemoAlgorithm(BaseRewardLearningAlgorithm):
             for i in exp_idx
         ])
 
-        # Model mini-batch (fresh from current rollout — no IS needed)
-        n_m       = min(self.batch_size_model, len(self.trajectories))
-        model_idx = self.rng.choice(len(self.trajectories), size=n_m, replace=False)
-        model_returns = th.stack([
-            self._traj_sum_reward(member, self.trajectories[i])
-            for i in model_idx
-        ])
+        # Model mini-batch: anchor (permanent early trajectories) + rolling buffer.
+        # The anchor guarantees low-quality trajectories stay in log Z even when
+        # the current policy has fully converged to the expert distribution.
+        model_pool = list(self.model_buffer)
+
+        if self.anchor_buffer and model_pool:
+            n_anchor = max(1, int(self.anchor_frac * self.batch_size_model))
+            n_recent = self.batch_size_model - n_anchor
+
+            anc_idx = self.rng.choice(len(self.anchor_buffer), size=min(n_anchor, len(self.anchor_buffer)), replace=False)
+            rec_idx = self.rng.choice(len(model_pool),         size=min(n_recent,  len(model_pool)),         replace=False)
+
+            model_returns = th.stack(
+                [self._traj_sum_reward(member, self.anchor_buffer[i]) for i in anc_idx] +
+                [self._traj_sum_reward(member, model_pool[i])          for i in rec_idx]
+            )
+        else:
+            n_m       = min(self.batch_size_model, len(self.trajectories))
+            model_idx = self.rng.choice(len(self.trajectories), size=n_m, replace=False)
+            model_returns = th.stack([
+                self._traj_sum_reward(member, self.trajectories[i])
+                for i in model_idx
+            ])
 
         # Numerically stable log partition function approximation
-        log_z = th.logsumexp(model_returns, dim=0) - np.log(n_m)
+        log_z = th.logsumexp(model_returns, dim=0) - np.log(len(model_returns))
 
         return -expert_returns.mean() + log_z
 
