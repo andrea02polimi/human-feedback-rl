@@ -114,15 +114,25 @@ class DemoAlgorithm(BaseRewardLearningAlgorithm):
     # Optional hook implementations
     # ------------------------------------------------------------------
 
-    def before_train(self, _timesteps_per_iteration: int, log_interval: int) -> None:
+    def before_train(self, timesteps_per_iteration: int, log_interval: int) -> None:
         """Warm up the agent before the first reward model update.
 
         Runs only when initial_agent_timesteps > 0. Training the agent first
         ensures that the trajectories used in logsumexp(R_θ(τ^M)) at iteration 0
         come from a non-random policy, improving the partition function estimate.
+
+        Pre-warmup anchor collection: one rollout is sampled from the initial
+        (pre-warmup) policy and permanently added to the anchor buffer BEFORE
+        warmup training begins. This guarantees genuinely low-quality trajectories
+        are always present in log Z, regardless of how long the warmup runs.
         """
         if self.initial_agent_timesteps <= 0:
             return
+
+        print(f"- Collecting pre-warmup anchor trajectories from initial policy ({timesteps_per_iteration} steps)")
+        pre_warmup_trajs = self.sample_rollout(timesteps_per_iteration)
+        self.anchor_buffer.extend(pre_warmup_trajs)
+        print(f"  → {len(pre_warmup_trajs)} pre-warmup trajectories added to anchor buffer")
 
         print(f"- Pre-warming agent for {self.initial_agent_timesteps} timesteps before first reward model update")
         self.train_agent(self.initial_agent_timesteps, log_interval)
@@ -222,7 +232,11 @@ class DemoAlgorithm(BaseRewardLearningAlgorithm):
         L = -mean(R_θ(τ^E)) + logsumexp(R_θ(τ^M)) - log(M)
 
         τ^E: mini-batch from self.expert_trajectories
-        τ^M: mini-batch from self.trajectories (current rollout, fresh from policy)
+        τ^M: mini-batch from anchor_buffer (permanent early/low-quality trajectories)
+             + model_buffer (rolling window of recent agent trajectories).
+             Together they form a diverse off-policy sample that approximates log Z(θ).
+             Expert trajectories are deliberately excluded: the gradient of log Z requires
+             samples from p(τ|θ) ∝ exp(R_θ(τ)), not from the expert distribution.
         """
         # Expert mini-batch
         n_e     = min(self.batch_size_expert, len(self.expert_trajectories))
