@@ -20,6 +20,7 @@ partition function estimate.
 """
 
 import collections
+import copy
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, List, Optional, Union
@@ -67,6 +68,9 @@ class DemoAlgorithm(BaseRewardLearningAlgorithm):
         model_buffer_size: int = 500,
         n_anchor_iterations: int = 3,
         anchor_frac: float = 0.4,
+        freeze_threshold_low: float = 0.0,
+        freeze_threshold_high: float = 0.0,
+        freeze_patience: int = 0,
         rng: Optional[np.random.Generator] = None,
         log_folder: Optional[str] = None,
         output_formats: Optional[List] = None,
@@ -104,6 +108,17 @@ class DemoAlgorithm(BaseRewardLearningAlgorithm):
         self.anchor_buffer: List[Trajectory] = []
         self.n_anchor_iterations              = n_anchor_iterations
         self.anchor_frac                      = anchor_frac
+
+        # Freeze logic: when freeze_patience > 0, the reward model is frozen
+        # (restored to its best weights) once Kendall τ drops below
+        # freeze_threshold_low for freeze_patience consecutive iterations.
+        # Set freeze_patience = 0 to disable (default, backward-compatible).
+        self.freeze_threshold_low  = freeze_threshold_low
+        self.freeze_threshold_high = freeze_threshold_high
+        self.freeze_patience       = freeze_patience
+        self._freeze_counter: int                   = 0
+        self._reward_model_frozen: bool             = False
+        self._best_state_dict: Optional[dict]       = None
 
         self.optimizers = [
             th.optim.Adam(m.parameters(), lr=lr_rew, weight_decay=l2_rew)
@@ -157,9 +172,41 @@ class DemoAlgorithm(BaseRewardLearningAlgorithm):
         if not self.trajectories:
             return
 
+        # Always update buffers, even when the reward model is frozen.
         self.model_buffer.extend(self.trajectories)
         if self.iteration < self.n_anchor_iterations:
             self.anchor_buffer.extend(self.trajectories)
+
+        # ── Freeze logic ────────────────────────────────────────────────────
+        if self.freeze_patience > 0:
+            kendall = self._last_kendall_running
+
+            if not self._reward_model_frozen:
+                # Persist the best weights seen so far.
+                if kendall > self.freeze_threshold_high:
+                    self._best_state_dict = copy.deepcopy(self.reward_model.state_dict())
+
+                # Increment patience counter when quality is below the low threshold.
+                if kendall < self.freeze_threshold_low:
+                    self._freeze_counter += 1
+                else:
+                    self._freeze_counter = 0
+
+                # Only freeze if we have a known-good state to restore to.
+                if self._freeze_counter >= self.freeze_patience and self._best_state_dict is not None:
+                    self._reward_model_frozen = True
+                    self.reward_model.load_state_dict(self._best_state_dict)
+            else:
+                # Unfreeze only if quality has recovered above the high threshold.
+                if kendall > self.freeze_threshold_high:
+                    self._reward_model_frozen = False
+                    self._freeze_counter = 0
+
+            self.logger.record("reward/model_frozen", int(self._reward_model_frozen))
+
+            if self._reward_model_frozen:
+                return
+        # ────────────────────────────────────────────────────────────────────
 
         t0 = time.perf_counter()
 

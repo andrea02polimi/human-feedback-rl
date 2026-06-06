@@ -105,6 +105,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         self.iteration                = 0
         self.trajectories             = []
         self.debug_dataset            = debug_dataset or {}
+        self._last_kendall_running: float = 0.0
 
         self.query_schedule      = QUERY_SCHEDULES[query_schedule]
         self.query_schedule_name = query_schedule
@@ -260,6 +261,8 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         mae_timeout   = np.mean(np.abs(pred_rewards_norm[timeout_mask] - true_rewards[timeout_mask]))
         mae_running   = np.mean(np.abs(pred_rewards_norm[running_mask] - true_rewards[running_mask]))
         kt_running, _ = kendalltau(true_rewards[running_mask], pred_rewards_norm[running_mask])
+        if log_class == "reward_val/current_rollout":
+            self._last_kendall_running = float(kt_running) if not np.isnan(kt_running) else 0.0
 
         self.logger.record(f"{log_class}/mae_arrived", mae_arrived)
         self.logger.record(f"{log_class}/mae_collided", mae_collided)
