@@ -38,12 +38,12 @@ class PreferenceGathererFromReward:
                 prob1 = 1.0 / (1.0 + math.exp((r2 - r1)/self.temperature))
                 pref = Preference(prob1, 1.0 - prob1)
 
-            elif self.labels_type == "binary_bernulli":
+            elif self.labels_type in {"binary_bernoulli", "binary_bernulli"}:
                 prob1 = 1.0 / (1.0 + math.exp((r2 - r1)/self.temperature))
                 pref1 = 1 if random.random() < prob1 else 0
                 pref = Preference(pref1, 1.0 - pref1)
             else:
-                print("errore inserimento labels_type: soft or binary or binary_bernulli")
+                print("errore inserimento labels_type: soft or binary or binary_bernoulli")
 
             preferences.append(pref)
 
