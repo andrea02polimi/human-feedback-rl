@@ -7,6 +7,7 @@ class Transition:
     observation: Any        # o_t
     action: Any             # a_t
     true_reward: float      # r_t (true reward)
+    next_observation: Any = None # o_{t+1}
     next_status: Any = None # 7-dim one-hot: [arrived, collided, off_road, timeout, running, teleported, removed_unknown]
     done: bool = False
 
@@ -14,8 +15,9 @@ class Transition:
 @dataclass
 class Trajectory(List[Transition]):
 
-    def __init__(self, transitions=None):
+    def __init__(self, transitions=None, log_importance_weight: float = 0.0):
         super().__init__(list(transitions) if transitions is not None else [])
+        self.log_importance_weight = log_importance_weight
         
     def total_reward(self) -> float:
         return sum(t.true_reward for t in self)

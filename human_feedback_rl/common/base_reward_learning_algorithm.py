@@ -11,7 +11,7 @@ import os
 import random
 import time
 from abc import abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
@@ -85,7 +85,6 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         train_comparison_frac: float = 0.7,
         fragment_length: int = 1,
         initial_queries: int = 0,
-        initial_agent_timesteps: int = 0,
         exploration_frac: float = 0.0,
         exploration_eps: float = 0.5,
         query_schedule: Union[str, Callable[[float], float]] = "constant",
@@ -169,14 +168,14 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         self.log_reward_model_validation(all_transitions, "reward_val/current_rollout")
         
         if self.debug_dataset:
-            self.log_reward_model_validation(self.debug_dataset, "reward_val/debug_dataset")
+            self.log_reward_model_validation(self.debug_dataset, "reward_val/balanced_eval_dataset")
 
 
     def before_train(self, timesteps_per_iteration: int, log_interval: int) -> None:
         """Called once before the main training loop starts.
 
-        Default: no-op. Override to add a pre-warmup phase (e.g. initial agent
-        training or reward model pre-training) before the first iteration.
+        Default: no-op. Override to add algorithm-specific setup before the
+        first iteration.
         """
 
     def before_agent_training(self) -> None:
@@ -191,8 +190,20 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
     # ------------------------------------------------------------------
 
     def build_query_schedule(self, n_iterations: int, total_queries: int) -> List[int]:
-        """Return a per-iteration list of query counts following the configured schedule."""
-        t_vec = np.linspace(0, 1, n_iterations)
+        """Return a per-iteration list of query counts following the configured schedule.
+
+        The list has exactly ``n_iterations`` entries, one per agent-training block,
+        so the agent is trained for exactly ``total_timesteps``. The first iteration
+        collects ``initial_queries`` to bootstrap the reward model; the remaining
+        ``total_queries - initial_queries`` queries are distributed over the other
+        iterations according to the configured schedule.
+        """
+        if n_iterations <= 0:
+            return []
+        if n_iterations == 1:
+            return [total_queries]
+
+        t_vec = np.linspace(0, 1, n_iterations - 1)
         weights = np.array([self.query_schedule(t) for t in t_vec])
         probs = weights / weights.sum()
         shares = np.round(probs * (total_queries - self.initial_queries)).astype(int)
@@ -207,6 +218,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
 
     def _run_reward_inference(self, transitions):
         """Run the reward model in eval mode; return arrays of true/pred rewards, status, done."""
+        transitions = self._validation_transitions(transitions)
         self.reward_model.eval()
         with th.no_grad():
             true_rewards = np.array([t.true_reward  for t in transitions], dtype=np.float32)
@@ -214,9 +226,54 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
             acts         = np.array([t.action       for t in transitions], dtype=np.float32)
             status       = np.array([t.next_status  for t in transitions], dtype=np.float32)
             done         = np.array([float(t.done)  for t in transitions], dtype=np.float32)
-            pred_rewards = self.reward_model.predict(obs, acts, status, done)
+            next_input = self._reward_model_next_input(transitions, obs, status)
+            pred_rewards = self.reward_model.predict(obs, acts, next_input, done)
         self.reward_model.train()
         return true_rewards, pred_rewards, status
+
+    def _validation_transitions(self, data):
+        if isinstance(data, dict) and "segments_by_length" in data:
+            return self._transitions_from_segments(data["segments_by_length"])
+        return data
+
+    def _transitions_from_segments(self, segments_by_length) -> List:
+        transitions = []
+        needs_next_state = getattr(self.reward_model, "uses_next_state", False)
+
+        for segments in segments_by_length.values():
+            for segment in segments:
+                for i, transition in enumerate(segment):
+                    if not needs_next_state:
+                        transitions.append(transition)
+                        continue
+
+                    next_obs = getattr(transition, "next_observation", None)
+                    if next_obs is None:
+                        if i + 1 < len(segment):
+                            next_obs = segment[i + 1].observation
+                        else:
+                            continue
+                        transition = replace(transition, next_observation=next_obs)
+                    transitions.append(transition)
+
+        if not transitions:
+            raise ValueError("No compatible transitions found in validation dataset.")
+        return transitions
+
+    def _reward_model_next_input(self, transitions, obs: np.ndarray, status: np.ndarray) -> np.ndarray:
+        if not getattr(self.reward_model, "uses_next_state", False):
+            return status
+
+        next_observations = [getattr(t, "next_observation", None) for t in transitions]
+        if any(next_obs is None for next_obs in next_observations):
+            raise ValueError("next_observation is required by this reward model.")
+
+        next_input = np.asarray(next_observations, dtype=np.float32)
+        if next_input.shape != obs.shape:
+            raise ValueError(
+                f"next_observation shape {next_input.shape} does not match observation shape {obs.shape}."
+            )
+        return next_input
 
     def _normalize_predictions(
         self,
@@ -233,6 +290,9 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         norm_mask = np.ones(len(pred_rewards), dtype=bool)
         if norm_on_running:
             norm_mask = status[:, self.STATUS_RUNNING] == 1
+
+        if not np.any(norm_mask):
+            return pred_rewards
             
         true_mean = np.mean(true_rewards[norm_mask])
         pred_mean = np.mean(pred_rewards[norm_mask])
@@ -245,8 +305,18 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
             return pred_rewards - pred_mean + true_mean
         return pred_rewards
 
+    @staticmethod
+    def _masked_mae(pred_rewards: np.ndarray, true_rewards: np.ndarray, mask: np.ndarray) -> float:
+        if not np.any(mask):
+            return float("nan")
+        return float(np.mean(np.abs(pred_rewards[mask] - true_rewards[mask])))
+
     def log_reward_model_validation(self, transitions, log_class: str) -> None:
-        true_rewards, pred_rewards, status = self._run_reward_inference(transitions)
+        try:
+            true_rewards, pred_rewards, status = self._run_reward_inference(transitions)
+        except ValueError as exc:
+            self.logger.log(f"Skipping {log_class}: {exc}")
+            return
         pred_rewards_norm = self._normalize_predictions(pred_rewards, true_rewards, status)
         
         arrived_mask  = status[:, self.STATUS_ARRIVED] == 1
@@ -255,12 +325,14 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         timeout_mask  = status[:, self.STATUS_TIMEOUT] == 1
         running_mask  = status[:, self.STATUS_RUNNING] == 1
 
-        mae_arrived   = np.mean(np.abs(pred_rewards_norm[arrived_mask] - true_rewards[arrived_mask]))
-        mae_collided  = np.mean(np.abs(pred_rewards_norm[collided_mask] - true_rewards[collided_mask]))
-        mae_offroad   = np.mean(np.abs(pred_rewards_norm[offroad_mask] - true_rewards[offroad_mask]))
-        mae_timeout   = np.mean(np.abs(pred_rewards_norm[timeout_mask] - true_rewards[timeout_mask]))
-        mae_running   = np.mean(np.abs(pred_rewards_norm[running_mask] - true_rewards[running_mask]))
-        kt_running, _ = kendalltau(true_rewards[running_mask], pred_rewards_norm[running_mask])
+        mae_arrived   = self._masked_mae(pred_rewards_norm, true_rewards, arrived_mask)
+        mae_collided  = self._masked_mae(pred_rewards_norm, true_rewards, collided_mask)
+        mae_offroad   = self._masked_mae(pred_rewards_norm, true_rewards, offroad_mask)
+        mae_timeout   = self._masked_mae(pred_rewards_norm, true_rewards, timeout_mask)
+        mae_running   = self._masked_mae(pred_rewards_norm, true_rewards, running_mask)
+        kt_running = float("nan")
+        if np.sum(running_mask) >= 2:
+            kt_running, _ = kendalltau(true_rewards[running_mask], pred_rewards_norm[running_mask])
         if log_class == "reward_val/current_rollout":
             self._last_kendall_running = float(kt_running) if not np.isnan(kt_running) else 0.0
 
@@ -311,11 +383,12 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         return trajectories
     
     def _score_trajectory(self, traj: Trajectory) -> float:
-        obs         = np.array([t.observation for t in traj])
-        acts        = np.array([t.action for t in traj])
-        next_status = np.array([t.next_status for t in traj])
-        done        = np.array([float(t.done) for t in traj])
-        return self.reward_model.predict(obs, acts, next_status, done).sum()
+        obs    = np.array([t.observation for t in traj])
+        acts   = np.array([t.action for t in traj])
+        status = np.array([t.next_status for t in traj])
+        done   = np.array([float(t.done) for t in traj])
+        next_input = self._reward_model_next_input(traj, obs, status)
+        return self.reward_model.predict(obs, acts, next_input, done).sum()
 
 
     def train_agent(self, steps: int, log_interval: int) -> None:
@@ -358,8 +431,9 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
             t_iter = time.perf_counter()
             print(f"\nIteration {self.iteration}/{len(schedule)-1}")
 
-            if num_queries == 0:
-                continue
+            # Reward-model and agent training run every iteration; ``num_queries``
+            # only governs how much feedback is gathered (it may legitimately be 0,
+            # e.g. for demonstration-based algorithms or late schedule iterations).
 
             # ---- Data collection ----------------------------------------
             exploration_steps = int(self.exploration_frac * timesteps_per_iteration)

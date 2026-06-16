@@ -48,6 +48,7 @@ class TrajectoryGeneratorFromAgent:
         self.venv = VecMonitor(EnvRewardWrapper(
             self.buffering_wrapper,
             reward_model=self.reward_model,
+            policy=self.agent.policy,
         ))
 
         self.agent.set_env(self.venv)

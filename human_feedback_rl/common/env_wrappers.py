@@ -57,11 +57,16 @@ class EnvRewardWrapper(VecEnvWrapper):
     being passed to the agent (Christiano et al. 2017, Section 2.2).
     """
 
-    def __init__(self, venv: VecEnv, reward_model: RewardEnsemble):
+    def __init__(self, venv: VecEnv, reward_model: RewardEnsemble, policy=None):
         super().__init__(venv)
         self.reward_model = reward_model
+        self.policy = policy
         self._obs: np.ndarray | None = None
         self._actions: np.ndarray | None = None
+        self._reward_stats = _RunningMeanStd()
+
+        if hasattr(self.reward_model, "set_policy"):
+            self.reward_model.set_policy(policy)
 
     def reset(self):
         obs = self.venv.reset()
@@ -77,7 +82,19 @@ class EnvRewardWrapper(VecEnvWrapper):
 
         if self._obs is not None and self._actions is not None:
             next_status = np.array([ego_status_to_onehot(i.get("ego_status", "running")) for i in infos])
-            predicted_rew = self.reward_model.predict(self._obs, self._actions, next_status, dones.astype(np.float32))
+            if getattr(self.reward_model, "uses_next_state", False):
+                # AIRL: bootstrap V(next state). Pass the *true-terminal* mask so the
+                # shaping zeroes/absorbs only on real terminals, not on timeouts
+                # (status index 3), which should keep bootstrapping the next state.
+                reward_next_input = obs
+                is_timeout = next_status[:, 3] == 1.0
+                done_signal = np.logical_and(dones, ~is_timeout).astype(np.float32)
+            else:
+                reward_next_input = next_status
+                done_signal = dones.astype(np.float32)
+            predicted_rew = self.reward_model.predict(self._obs, self._actions, reward_next_input, done_signal)
+            self._reward_stats.update(predicted_rew)
+            predicted_rew = (predicted_rew - self._reward_stats.mean) / (self._reward_stats.std + 1e-8)
         else:
             predicted_rew = np.zeros(len(obs), dtype=np.float32)
 
@@ -145,6 +162,7 @@ class EnvBufferingWrapper(VecEnvWrapper):
                 observation=self._last_obs[i],
                 action=actions[i],
                 true_reward=float(true_rew[i]),
+                next_observation=obs[i],
                 next_status=ego_status_to_onehot(infos[i].get("ego_status", "running")),
                 done=bool(dones[i]),
             )
