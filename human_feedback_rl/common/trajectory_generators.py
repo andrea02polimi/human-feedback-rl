@@ -73,6 +73,7 @@ class TrajectoryGeneratorFromAgent:
             total_timesteps=steps,
             reset_num_timesteps=False,
             callback=CustomLoggingCallback(),
+            log_interval=log_interval,
             **kwargs,
         )
 

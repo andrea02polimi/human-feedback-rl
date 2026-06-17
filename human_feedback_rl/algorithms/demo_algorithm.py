@@ -172,7 +172,7 @@ class DemoAlgorithm(BaseAlgorithm):
         def train_member(member, optimizer):
             member.train()
             for _ in range(self.gradient_steps_rew):
-                loss = self._demo_loss(member)
+                loss = self._maxent_loss(member) # TODO scambiare con maxent_loss
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -199,7 +199,7 @@ class DemoAlgorithm(BaseAlgorithm):
             return float("nan")
         self.reward_model.eval()
         with th.no_grad():
-            loss = self._demo_loss(self.reward_model).item()
+            loss = self._maxent_loss(self.reward_model).item() # TODO scambiare con maxent_loss
         self.reward_model.train()
         return loss
 
@@ -220,6 +220,28 @@ class DemoAlgorithm(BaseAlgorithm):
         # logsumexp(returns) - log(n_m) is a numerically stable estimate of
         # log Z_θ, the log partition function over the current policy distribution.
         log_z = th.logsumexp(model_returns, dim=0) - np.log(n_m)
+
+        return -expert_returns.mean() + log_z
+    
+    def _maxent_loss_2(self, member) -> th.Tensor:
+        """L = -mean(R_θ(τ^E)) + logsumexp(R_θ(τ^M)) - log(M)"""
+        n_e     = min(self.batch_size_expert, len(self.expert_trajectories))
+        exp_idx = self.rng.choice(len(self.expert_trajectories), size=n_e, replace=False)
+        expert_returns = th.stack([
+            self._traj_sum_reward(member, self.expert_trajectories[i]) for i in exp_idx
+        ])
+
+        n_m       = min(self.batch_size_model, len(self.trajectories))
+        model_idx = self.rng.choice(len(self.trajectories), size=n_m, replace=False)
+        model_returns = th.stack([
+            self._traj_sum_reward(member, self.trajectories[i]) for i in model_idx
+        ])
+
+        # logsumexp(returns) - log(n_m) is a numerically stable estimate of
+        # log Z_θ, the log partition function over the current policy distribution.
+        all_returns = th.cat([model_returns, expert_returns], dim=0)
+
+        log_z = th.logsumexp(all_returns, dim=0) - np.log(len(all_returns))
 
         return -expert_returns.mean() + log_z
 
