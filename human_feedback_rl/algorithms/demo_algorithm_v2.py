@@ -11,8 +11,10 @@ from omegaconf import DictConfig, OmegaConf
 
 import sumo_rl_ego as sre
 import wandb
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.logger import HumanOutputFormat
+
+AGENT_CLASSES = {"PPO": PPO, "SAC": SAC}
 
 from human_feedback_rl.common.trajectory_generators import TrajectoryGeneratorFromAgent
 from human_feedback_rl.common.reward_nets import SumoRewardNet
@@ -203,8 +205,14 @@ def main(cfg: DictConfig) -> None:
     print("Creating environment...")
     env = sre.make_vec_env(cfg.env.id, n_envs=cfg.env.n_envs, base_seed=seed, **OmegaConf.to_container(cfg.env.kwargs, resolve=True))
 
-    print("Initializing agent...")
-    agent = PPO(env=env, seed=seed, **OmegaConf.to_container(cfg.agent.kwargs, resolve=True))
+    print(f"Initializing agent ({cfg.agent.type})...")
+    try:
+        agent_cls = AGENT_CLASSES[cfg.agent.type]
+    except KeyError:
+        raise ValueError(
+            f"Unknown agent type '{cfg.agent.type}'. Available: {list(AGENT_CLASSES)}"
+        )
+    agent = agent_cls(env=env, seed=seed, **OmegaConf.to_container(cfg.agent.kwargs, resolve=True))
 
     print("Initializing reward model...")
     algo_kwargs = OmegaConf.to_container(cfg.algo.kwargs, resolve=True)

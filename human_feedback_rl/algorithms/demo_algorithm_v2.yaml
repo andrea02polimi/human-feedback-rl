@@ -1,3 +1,7 @@
+defaults:
+  - agent: ppo   # override on the CLI: agent=sac
+  - _self_
+
 run:
   seed: 0
   output_dir: outputs/demo_algorithm_v2
@@ -13,20 +17,6 @@ env:
   kwargs:
     ego: "continuous"
     reward: "fast"
-
-agent:
-  kwargs:
-    policy: "MlpPolicy"
-    n_steps: 1000
-    n_epochs: 10
-    learning_rate: 0.0003
-    batch_size: 64
-    ent_coef: 0
-    gae_lambda: 0.95
-    gamma: 0.997
-    policy_kwargs:
-      net_arch: [64, 64]
-    device: "cpu"
 
 algo:
   kwargs:
