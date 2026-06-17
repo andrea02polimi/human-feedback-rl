@@ -163,6 +163,13 @@ class DemoAlgorithm(BaseAlgorithm):
     # Reward model training (MaxEnt IRL)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _grad_norm(module) -> float:
+        """Norma L2 totale dei gradienti correnti dei parametri del modulo."""
+        return float(th.sqrt(sum(
+            p.grad.pow(2).sum() for p in module.parameters() if p.grad is not None
+        )))
+
     def _train_reward_model(self) -> None:
         if not self.trajectories:
             return
@@ -171,25 +178,30 @@ class DemoAlgorithm(BaseAlgorithm):
 
         def train_member(member, optimizer):
             member.train()
+            norms = []
             for _ in range(self.gradient_steps_rew):
                 loss = self._maxent_loss(member) # TODO scambiare con maxent_loss
                 optimizer.zero_grad()
                 loss.backward()
+                norms.append(self._grad_norm(member))
                 optimizer.step()
+            return norms
 
+        all_norms = []
         with ThreadPoolExecutor(max_workers=1) as executor:
             futures = [
                 executor.submit(train_member, member, optimizer)
                 for member, optimizer in zip(self.reward_model.members, self.optimizers)
             ]
             for future in as_completed(futures):
-                future.result()
+                all_norms.extend(future.result())
 
         t_train = time.perf_counter() - t0
 
         t0 = time.perf_counter()
         loss_val = self._evaluate_reward_model()
         self.logger.record("reward/loss_val",         loss_val, exclude="stdout")
+        self.logger.record("reward/grad_norm",        float(np.mean(all_norms)), exclude="stdout")
         self.logger.record("time/train_reward_model", t_train)
         self.logger.record_sum("time/loggings",       time.perf_counter() - t0)
 
