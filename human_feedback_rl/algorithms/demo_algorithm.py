@@ -18,7 +18,7 @@ from typing import Any, List, Optional
 
 import numpy as np
 import torch as th
-from scipy.stats import kendalltau
+from scipy.stats import kendalltau, spearmanr
 
 from human_feedback_rl.common.base_algorithm import BaseAlgorithm
 from human_feedback_rl.common.loggers import ExcludeFormatLogger, PrefixedLogger
@@ -81,6 +81,10 @@ class DemoAlgorithm(BaseAlgorithm):
         self.temperature             = temperature
         self.trajectories            = []
         self.debug_dataset           = debug_dataset or {}
+        # The debug dataset is a flat, sequentially-ordered list of transitions.
+        # Split it into trajectories on the `done` flag so we can compute
+        # return-level ranking metrics on it (see _log_return_ranking).
+        self._debug_trajectories     = self._split_into_trajectories(self.debug_dataset)
 
         self.reward_model = make_reward_ensemble(env, **(reward_model_kwargs or {}))
 
@@ -136,8 +140,10 @@ class DemoAlgorithm(BaseAlgorithm):
             # ---- Phase 2: Validate reward model against ground truth ----
             all_transitions = [t for traj in self.trajectories for t in traj]
             self._log_reward_validation(all_transitions, "reward_val/current_rollout")
+            self._log_return_ranking(self.trajectories, "reward_val/current_rollout")
             if self.debug_dataset:
                 self._log_reward_validation(self.debug_dataset, "reward_val/debug_dataset")
+                self._log_return_ranking(self._debug_trajectories, "reward_val/debug_dataset")
 
             # ---- Phase 3: Update reward model (MaxEnt IRL) --------------
             print("- Training reward model")
@@ -351,8 +357,8 @@ class DemoAlgorithm(BaseAlgorithm):
     # ------------------------------------------------------------------
 
     def _log_reward_validation(self, transitions, log_class: str) -> None:
-        """Log MAE per terminal-state type and Kendall τ on running steps."""
-        true_rewards, pred_rewards, status = self._run_reward_inference(transitions)
+        """Log MAE per terminal-state type, Kendall τ on running steps and ensemble disagreement."""
+        true_rewards, pred_rewards, pred_std, status = self._run_reward_inference(transitions)
         pred_norm = self._align_predictions(pred_rewards, true_rewards, status)
 
         arrived_mask  = status[:, self.STATUS_ARRIVED]  == 1
@@ -369,8 +375,12 @@ class DemoAlgorithm(BaseAlgorithm):
         kt_running, _ = kendalltau(true_rewards[running_mask], pred_norm[running_mask])
         self.logger.record(f"{log_class}/kendall_running", kt_running)
 
+        # Ensemble disagreement: rising std signals out-of-distribution inputs.
+        self.logger.record(f"{log_class}/ensemble_std",         float(np.mean(pred_std)))
+        self.logger.record(f"{log_class}/ensemble_std_running", float(np.mean(pred_std[running_mask])))
+
     def _run_reward_inference(self, transitions):
-        """Run reward model in eval+no_grad mode; return (true, pred, status) arrays."""
+        """Run reward model in eval+no_grad mode; return (true, pred_mean, pred_std, status) arrays."""
         self.reward_model.eval()
         with th.no_grad():
             true_rewards = np.array([t.true_reward for t in transitions], dtype=np.float32)
@@ -379,8 +389,10 @@ class DemoAlgorithm(BaseAlgorithm):
             status       = np.array([t.next_status  for t in transitions], dtype=np.float32)
             done         = np.array([float(t.done)  for t in transitions], dtype=np.float32)
             pred_rewards = self.reward_model.predict(obs, acts, status, done)
+            # Per-member predictions (N, n_members); std across members = ensemble disagreement.
+            pred_std     = self.reward_model.predict_all(obs, acts, status, done).std(axis=1)
         self.reward_model.train()
-        return true_rewards, pred_rewards, status
+        return true_rewards, pred_rewards, pred_std, status
 
     def _align_predictions(
         self,
@@ -396,6 +408,31 @@ class DemoAlgorithm(BaseAlgorithm):
         running_mask = status[:, self.STATUS_RUNNING] == 1
         shift = np.mean(true_rewards[running_mask]) - np.mean(pred_rewards[running_mask])
         return pred_rewards + shift
+
+    @staticmethod
+    def _split_into_trajectories(transitions) -> List[Trajectory]:
+        """Split a flat, sequentially-ordered list of transitions into trajectories on `done`."""
+        trajectories, current = [], Trajectory()
+        for t in transitions:
+            current.add_transition(t)
+            if t.done:
+                trajectories.append(current)
+                current = Trajectory()
+        if len(current) > 0:
+            trajectories.append(current)
+        return trajectories
+
+    def _log_return_ranking(self, trajectories, log_class: str) -> None:
+        """Spearman ρ between predicted and true trajectory returns (ranking quality)."""
+        if len(trajectories) < 2:
+            return
+        true_returns, pred_returns = [], []
+        for traj in trajectories:
+            _, pred_rewards, _, _ = self._run_reward_inference(traj)
+            true_returns.append(float(sum(t.true_reward for t in traj)))
+            pred_returns.append(float(pred_rewards.sum()))
+        rho, _ = spearmanr(true_returns, pred_returns)
+        self.logger.record(f"{log_class}/spearman_returns", rho)
 
     # ------------------------------------------------------------------
     # Logging and checkpointing
