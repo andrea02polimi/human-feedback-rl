@@ -104,9 +104,17 @@ class DemoAlgorithmV2():
             loss = -th.mean(expert_returns) + th.mean(agent_returns)
             self.optimizer.zero_grad()
             loss.backward()
+
+            # Total L2 norm of the gradient over all reward-model parameters,
+            # computed after backward() and before the optimizer step.
+            grad_norm = th.nn.utils.clip_grad_norm_(
+                self.reward_model.parameters(), max_norm=float("inf")
+            )
+
             self.optimizer.step()
 
             self.logger.record_mean("reward_model/loss", loss.item())
+            self.logger.record_mean("reward_model/grad_norm", grad_norm.item())
 
     def _update_policy(self, timesteps_per_iteration):
         self.agent.train(steps=timesteps_per_iteration, log_interval=1)

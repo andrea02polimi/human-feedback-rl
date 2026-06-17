@@ -4,7 +4,7 @@ run:
 
 wandb:
   entity: andrea02polimi-politecnico-di-milano
-  project: demo_v2
+  project: PPO_demo
   tags: Null
 
 env:
@@ -30,7 +30,7 @@ agent:
 
 algo:
   kwargs:
-    lr_rew: 0.0001
+    lr_rew: 0.001
     gradient_steps_rew: 100
     batch_size_expert: 32
     batch_size_model: 64
