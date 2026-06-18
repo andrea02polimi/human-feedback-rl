@@ -45,11 +45,12 @@ class TrajectoryGeneratorFromAgent:
 
         self.buffering_wrapper = EnvBufferingWrapper(venv)
 
-        self.venv = VecMonitor(EnvRewardWrapper(
+        self.reward_wrapper = EnvRewardWrapper(
             self.buffering_wrapper,
             reward_model=self.reward_model,
             policy=self.agent.policy,
-        ))
+        )
+        self.venv = VecMonitor(self.reward_wrapper)
 
         self.agent.set_env(self.venv)
 
@@ -74,8 +75,19 @@ class TrajectoryGeneratorFromAgent:
             total_timesteps=steps,
             reset_num_timesteps=False,
             callback=CustomLoggingCallback(),
+            log_interval=log_interval,
             **kwargs,
         )
+
+    def relabel_replay_buffer(self) -> None:
+        """Recompute the rewards stored in an off-policy replay buffer with the
+        current reward model. No-op for on-policy agents (no replay buffer) or for
+        buffers that do not support relabelling."""
+        buffer = getattr(self.agent, "replay_buffer", None)
+        if buffer is None or not hasattr(buffer, "relabel"):
+            return
+        stats = self.reward_wrapper._reward_stats
+        buffer.relabel(self.reward_model, reward_mean=stats.mean, reward_std=stats.std)
 
 
     def sample(self, agent_steps, exploration_steps = 0) -> Sequence[types.Trajectory]:

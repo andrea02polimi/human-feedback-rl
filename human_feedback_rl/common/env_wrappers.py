@@ -82,17 +82,8 @@ class EnvRewardWrapper(VecEnvWrapper):
 
         if self._obs is not None and self._actions is not None:
             next_status = np.array([ego_status_to_onehot(i.get("ego_status", "running")) for i in infos])
-            if getattr(self.reward_model, "uses_next_state", False):
-                # AIRL: bootstrap V(next state). Pass the *true-terminal* mask so the
-                # shaping zeroes/absorbs only on real terminals, not on timeouts
-                # (status index 3), which should keep bootstrapping the next state.
-                reward_next_input = obs
-                is_timeout = next_status[:, 3] == 1.0
-                done_signal = np.logical_and(dones, ~is_timeout).astype(np.float32)
-            else:
-                reward_next_input = next_status
-                done_signal = dones.astype(np.float32)
-            predicted_rew = self.reward_model.predict(self._obs, self._actions, reward_next_input, done_signal)
+            done_signal = dones.astype(np.float32)
+            predicted_rew = self.reward_model.predict(self._obs, self._actions, next_status, done_signal)
             self._reward_stats.update(predicted_rew)
             predicted_rew = (predicted_rew - self._reward_stats.mean) / (self._reward_stats.std + 1e-8)
         else:

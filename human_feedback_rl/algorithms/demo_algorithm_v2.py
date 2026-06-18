@@ -13,11 +13,13 @@ import sumo_rl_ego as sre
 import wandb
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.logger import HumanOutputFormat
+from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 
 AGENT_CLASSES = {"PPO": PPO, "SAC": SAC}
 
 from human_feedback_rl.common.trajectory_generators import TrajectoryGeneratorFromAgent
 from human_feedback_rl.common.reward_nets import SumoRewardNet
+from human_feedback_rl.common.replay_buffers import RelabelReplayBuffer
 from human_feedback_rl.common.loggers import (
     Logger,
     WandbWriter,
@@ -38,6 +40,7 @@ class DemoAlgorithmV2():
         gradient_steps_rew,
         batch_size_expert,
         batch_size_model,
+        log_interval=25,
         logger=None,
         rng=None,
     ):
@@ -65,6 +68,7 @@ class DemoAlgorithmV2():
         self.gradient_steps_rew = gradient_steps_rew
         self.batch_size_expert = batch_size_expert
         self.batch_size_model = batch_size_model
+        self.log_interval = log_interval
         self.expert_trajectories = list(expert_trajectories)
 
     def train(self,
@@ -77,6 +81,9 @@ class DemoAlgorithmV2():
             print(f"=== Iteration {iteration+1}/{num_iterations} ===")
             trajectories = self._collect_trajectories(timesteps_per_iteration)
             self._update_reward_model(trajectories)
+            # Reward model just changed: recompute the rewards already stored in an
+            # off-policy replay buffer (no-op for on-policy agents like PPO).
+            self.agent.relabel_replay_buffer()
             self._update_policy(timesteps_per_iteration)
 
             self.logger.record("iterations", iteration)
@@ -102,8 +109,11 @@ class DemoAlgorithmV2():
             agent_idx = self.rng.choice(len(trajectories), size=self.batch_size_model, replace=True)
             agent_returns = self._sum_rewards(trajectories, agent_idx)
 
+            total_returns = th.cat([expert_returns, agent_returns])
+            log_z = th.logsumexp(total_returns, dim=0) - th.log(th.tensor(len(exp_idx) + len(agent_idx), dtype=th.float32))
+
             # minimize -agent_returns.mean() + expert_returns.mean()
-            loss = -th.mean(expert_returns) + th.mean(agent_returns)
+            loss = -th.mean(expert_returns) + th.mean(agent_returns) + log_z
             self.optimizer.zero_grad()
             loss.backward()
 
@@ -119,7 +129,7 @@ class DemoAlgorithmV2():
             self.logger.record_mean("reward_model/grad_norm", grad_norm.item())
 
     def _update_policy(self, timesteps_per_iteration):
-        self.agent.train(steps=timesteps_per_iteration, log_interval=1)
+        self.agent.train(steps=timesteps_per_iteration, log_interval=self.log_interval)
 
     def _sum_rewards(self, trajectories, idx) -> th.Tensor:
         """Return a (len(idx),) tensor of per-trajectory reward-model returns (with grad)."""
@@ -212,7 +222,12 @@ def main(cfg: DictConfig) -> None:
         raise ValueError(
             f"Unknown agent type '{cfg.agent.type}'. Available: {list(AGENT_CLASSES)}"
         )
-    agent = agent_cls(env=env, seed=seed, **OmegaConf.to_container(cfg.agent.kwargs, resolve=True))
+    agent_kwargs = OmegaConf.to_container(cfg.agent.kwargs, resolve=True)
+    if issubclass(agent_cls, OffPolicyAlgorithm):
+        # Relabellable buffer so SAC's stored rewards can be recomputed each time the
+        # reward model is updated (see DemoAlgorithmV2.train).
+        agent_kwargs.setdefault("replay_buffer_class", RelabelReplayBuffer)
+    agent = agent_cls(env=env, seed=seed, **agent_kwargs)
 
     print("Initializing reward model...")
     algo_kwargs = OmegaConf.to_container(cfg.algo.kwargs, resolve=True)

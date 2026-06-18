@@ -11,7 +11,7 @@ import os
 import random
 import time
 from abc import abstractmethod
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
@@ -226,8 +226,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
             acts         = np.array([t.action       for t in transitions], dtype=np.float32)
             status       = np.array([t.next_status  for t in transitions], dtype=np.float32)
             done         = np.array([float(t.done)  for t in transitions], dtype=np.float32)
-            next_input = self._reward_model_next_input(transitions, obs, status)
-            pred_rewards = self.reward_model.predict(obs, acts, next_input, done)
+            pred_rewards = self.reward_model.predict(obs, acts, status, done)
         self.reward_model.train()
         return true_rewards, pred_rewards, status
 
@@ -238,42 +237,13 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
 
     def _transitions_from_segments(self, segments_by_length) -> List:
         transitions = []
-        needs_next_state = getattr(self.reward_model, "uses_next_state", False)
-
         for segments in segments_by_length.values():
             for segment in segments:
-                for i, transition in enumerate(segment):
-                    if not needs_next_state:
-                        transitions.append(transition)
-                        continue
-
-                    next_obs = getattr(transition, "next_observation", None)
-                    if next_obs is None:
-                        if i + 1 < len(segment):
-                            next_obs = segment[i + 1].observation
-                        else:
-                            continue
-                        transition = replace(transition, next_observation=next_obs)
-                    transitions.append(transition)
+                transitions.extend(segment)
 
         if not transitions:
             raise ValueError("No compatible transitions found in validation dataset.")
         return transitions
-
-    def _reward_model_next_input(self, transitions, obs: np.ndarray, status: np.ndarray) -> np.ndarray:
-        if not getattr(self.reward_model, "uses_next_state", False):
-            return status
-
-        next_observations = [getattr(t, "next_observation", None) for t in transitions]
-        if any(next_obs is None for next_obs in next_observations):
-            raise ValueError("next_observation is required by this reward model.")
-
-        next_input = np.asarray(next_observations, dtype=np.float32)
-        if next_input.shape != obs.shape:
-            raise ValueError(
-                f"next_observation shape {next_input.shape} does not match observation shape {obs.shape}."
-            )
-        return next_input
 
     def _normalize_predictions(
         self,
@@ -387,8 +357,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         acts   = np.array([t.action for t in traj])
         status = np.array([t.next_status for t in traj])
         done   = np.array([float(t.done) for t in traj])
-        next_input = self._reward_model_next_input(traj, obs, status)
-        return self.reward_model.predict(obs, acts, next_input, done).sum()
+        return self.reward_model.predict(obs, acts, status, done).sum()
 
 
     def train_agent(self, steps: int, log_interval: int) -> None:
