@@ -1,5 +1,4 @@
 import numpy as np
-from collections import deque
 from typing import List, Tuple, Any, Dict, Callable, Union, Optional
 
 from stable_baselines3.common.vec_env import VecEnvWrapper, VecEnv
@@ -54,16 +53,15 @@ class EnvRewardWrapper(VecEnvWrapper):
     predictions. Uses the pre-step observation for reward prediction to align
     with how the reward predictor was trained on (obs_t, a_t) pairs.
 
-    Rewards are normalized to mean 0 / std 1 via a running estimate before
-    being passed to the agent (Christiano et al. 2017, Section 2.2).
+    Agent-only reward transformations are owned by ``reward_model.predict``;
+    reward-model training uses ``forward`` and remains unaffected.
     """
 
-    def __init__(self, venv: VecEnv, reward_model: RewardEnsemble, relabel_debug_size: int = 100_000):
+    def __init__(self, venv: VecEnv, reward_model: RewardEnsemble):
         super().__init__(venv)
         self.reward_model = reward_model
         self._obs: np.ndarray | None = None
         self._actions: np.ndarray | None = None
-        self._relabel_debug_buffer = deque(maxlen=relabel_debug_size)
 
     def reset(self):
         obs = self.venv.reset()
@@ -80,42 +78,11 @@ class EnvRewardWrapper(VecEnvWrapper):
         if self._obs is not None and self._actions is not None:
             next_status = np.array([ego_status_to_onehot(i.get("ego_status", "running")) for i in infos])
             predicted_rew = self.reward_model.predict(self._obs, self._actions, next_status, dones.astype(np.float32))
-            self._store_relabel_debug_batch(self._obs, self._actions, next_status, dones, predicted_rew)
         else:
             predicted_rew = np.zeros(len(obs), dtype=np.float32)
 
         self._obs = np.asarray(obs, dtype=np.float32)
         return obs, predicted_rew, dones, infos
-
-    def _store_relabel_debug_batch(self, obs, actions, next_status, dones, rewards) -> None:
-        for i in range(len(rewards)):
-            self._relabel_debug_buffer.append((
-                np.asarray(obs[i], dtype=np.float32).copy(),
-                np.asarray(actions[i], dtype=np.float32).copy(),
-                np.asarray(next_status[i], dtype=np.float32).copy(),
-                float(dones[i]),
-                float(rewards[i]),
-            ))
-
-    def sample_relabel_debug_batch(self, batch_size: int, rng: np.random.Generator):
-        """Sample rewards as originally passed to the agent for stale-reward diagnostics."""
-        n_items = len(self._relabel_debug_buffer)
-        if n_items == 0:
-            return None
-
-        n_samples = min(batch_size, n_items)
-        indices = rng.choice(n_items, size=n_samples, replace=False)
-        samples = [self._relabel_debug_buffer[int(i)] for i in indices]
-        obs, actions, next_status, dones, rewards = zip(*samples)
-        return (
-            np.asarray(obs, dtype=np.float32),
-            np.asarray(actions, dtype=np.float32),
-            np.asarray(next_status, dtype=np.float32),
-            np.asarray(dones, dtype=np.float32),
-            np.asarray(rewards, dtype=np.float32),
-        )
-
-
 
 class EnvBufferingWrapper(VecEnvWrapper):
     """VecEnvWrapper that records rollout transitions and groups them into Trajectory objects."""
@@ -126,6 +93,8 @@ class EnvBufferingWrapper(VecEnvWrapper):
 
         self._initialized = False
         self._saved_actions = None
+        self._saved_log_probs = None
+        self._recording_mask = np.ones(self.num_envs, dtype=bool)
 
         # Completed (terminated) trajectories.
         self._finished_trajectories: List[Trajectory] = []
@@ -148,6 +117,20 @@ class EnvBufferingWrapper(VecEnvWrapper):
         self._saved_actions = actions
         self.venv.step_async(actions)
 
+    def set_log_probs(self, log_probs: np.ndarray) -> None:
+        """Attach action log-probabilities to the next buffered transitions."""
+        log_probs = np.asarray(log_probs, dtype=np.float32).reshape(-1)
+        if len(log_probs) != self.num_envs:
+            raise ValueError(f"Expected {self.num_envs} log-probs, got {len(log_probs)}.")
+        self._saved_log_probs = log_probs
+
+    def set_recording_mask(self, mask: np.ndarray) -> None:
+        """Select which parallel environments are recorded on the next step."""
+        mask = np.asarray(mask, dtype=bool).reshape(-1)
+        if len(mask) != self.num_envs:
+            raise ValueError(f"Expected a mask of length {self.num_envs}, got {len(mask)}.")
+        self._recording_mask = mask
+
     def step_wait(self):
         """Step the env and record one Transition per parallel env."""
         assert self._initialized, "Call reset() before stepping."
@@ -155,18 +138,23 @@ class EnvBufferingWrapper(VecEnvWrapper):
 
         actions = self._saved_actions
         self._saved_actions = None
+        log_probs = self._saved_log_probs
+        self._saved_log_probs = None
 
         obs, true_rew, dones, infos = self.venv.step_wait()
 
-        self._timesteps += 1
+        self._timesteps += self._recording_mask.astype(int)
 
         for i in range(self.num_envs):
+            if not self._recording_mask[i]:
+                continue
             transition = Transition(
                 observation=self._last_obs[i],
                 action=actions[i],
                 true_reward=float(true_rew[i]),
                 next_status=ego_status_to_onehot(infos[i].get("ego_status", "running")),
                 done=bool(dones[i]),
+                log_policy_prob=None if log_probs is None else float(log_probs[i]),
             )
 
             self._partial_trajectories[i].add_transition(transition)
@@ -196,6 +184,8 @@ class EnvBufferingWrapper(VecEnvWrapper):
 
         self._initialized = True
         self._saved_actions = None
+        self._saved_log_probs = None
+        self._recording_mask = np.ones(self.num_envs, dtype=bool)
 
         obs = self.venv.reset(**kwargs)
         self._last_obs = obs
@@ -245,3 +235,26 @@ class PolicyExplorationWrapper:
             actions = np.stack([self.venv.action_space.sample() for _ in range(num_envs)])
             return actions, None
         return self.wrapped_policy.predict(observation, **kwargs)
+
+    def action_log_prob(self, observation: np.ndarray, actions: np.ndarray) -> np.ndarray:
+        """Log-density under the epsilon mixture, independent of sampled branch."""
+        from .trajectory_generators import policy_action_log_probs
+
+        policy_log_prob = policy_action_log_probs(self.wrapped_policy, observation, actions)
+        action_space = self.venv.action_space
+        if hasattr(action_space, "low") and hasattr(action_space, "high"):
+            uniform_log_prob = -float(np.log(action_space.high - action_space.low).sum())
+        elif hasattr(action_space, "n"):
+            uniform_log_prob = -float(np.log(action_space.n))
+        else:
+            raise TypeError(f"Unsupported exploration action space: {type(action_space).__name__}")
+
+        eps = self.exploration_eps
+        if eps <= 0:
+            return policy_log_prob
+        if eps >= 1:
+            return np.full_like(policy_log_prob, uniform_log_prob)
+        return np.logaddexp(
+            np.log1p(-eps) + policy_log_prob,
+            np.log(eps) + uniform_log_prob,
+        )

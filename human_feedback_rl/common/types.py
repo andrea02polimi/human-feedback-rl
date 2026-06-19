@@ -9,6 +9,7 @@ class Transition:
     true_reward: float      # r_t (true reward)
     next_status: Any = None # 7-dim one-hot: [arrived, collided, off_road, timeout, running, teleported, removed_unknown]
     done: bool = False
+    log_policy_prob: float | None = None
 
 
 @dataclass

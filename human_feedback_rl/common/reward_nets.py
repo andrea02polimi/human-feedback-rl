@@ -184,24 +184,42 @@ class RewardEnsemble(RewardNet):
 
 
 class NormalizedRewardNet(RewardNet):
-    """Wraps any RewardNet and applies (raw - mean) / std normalization in predict().
+    """Apply an agent-only affine transformation in ``predict``.
 
-    forward() stays raw so loss computation is unaffected.
-    Stats are injected via set_mean() / set_std().
+    ``forward`` is deliberately raw so inference statistics cannot alter the
+    reward-learning objective. Statistics are buffers and survive checkpoints.
     """
 
     def __init__(self, net: RewardNet, alpha: float = 1):
         super().__init__(net.observation_space, net.action_space)
         self.net = net
         self.alpha = alpha
-        self._mean: float = 0.0
-        self._std: float = 1.0
+        self.register_buffer("_mean", th.tensor(0.0, dtype=th.float32))
+        self.register_buffer("_std", th.tensor(1.0, dtype=th.float32))
 
     def set_mean(self, mean: float) -> None:
-        self._mean = (1 - self.alpha)*self._mean + self.alpha*float(mean)
+        updated = (1 - self.alpha) * float(self._mean) + self.alpha * float(mean)
+        self._mean.fill_(updated)
 
     def set_std(self, std: float) -> None:
-        self._std = (1 - self.alpha)*self._std + self.alpha*float(std)
+        updated = (1 - self.alpha) * float(self._std) + self.alpha * float(std)
+        self._std.fill_(max(updated, 1e-8))
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ) -> None:
+        # Older checkpoints predate persistent normalization statistics.
+        state_dict.setdefault(prefix + "_mean", self._mean)
+        state_dict.setdefault(prefix + "_std", self._std)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward(
         self,
@@ -210,7 +228,7 @@ class NormalizedRewardNet(RewardNet):
         next_status: Optional[th.Tensor] = None,
         done: Optional[th.Tensor] = None,
     ) -> th.Tensor:
-        return self.net(state, action, next_status, done) - self._mean
+        return self.net(state, action, next_status, done)
 
     @th.no_grad()
     def predict(
@@ -222,7 +240,7 @@ class NormalizedRewardNet(RewardNet):
     ) -> np.ndarray:
         """Normalized prediction: (raw - mean) / std."""
         raw = self.net.predict(state, action, next_status, done)
-        return (raw - self._mean) / (self._std + 1e-8)
+        return (raw - float(self._mean)) / (float(self._std) + 1e-8)
 
     @th.no_grad()
     def predict_unnormalized(
@@ -262,14 +280,18 @@ def make_reward_ensemble(
     obs_space = venv.observation_space
     act_space = venv.action_space
 
+    net_arch = net_arch or [128, 128]
+    activation_fn = activation_fn or "tanh"
     members = [
         NormalizedRewardNet(
             SumoRewardNet(
-                obs_space, 
-                act_space, 
-                net_arch=net_arch, 
-                activation_fn=activation_fn
-            ), alpha)
+                obs_space,
+                act_space,
+                net_arch=net_arch,
+                activation_fn=activation_fn,
+            ),
+            alpha,
+        )
         for _ in range(n_ensembles)
     ]
     return NormalizedRewardNet(RewardEnsemble(obs_space, act_space, members), alpha)
