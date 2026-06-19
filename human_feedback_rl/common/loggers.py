@@ -5,6 +5,78 @@ from stable_baselines3.common.logger import HumanOutputFormat, KVWriter
 from stable_baselines3.common.logger import Logger as SB3Logger
 
 
+ITERATION_METRIC_PREFIXES = (
+    "reward/",
+    "reward_val/",
+    "replay_relabel_debug/",
+    "rollout/",
+    "time/",
+)
+
+# These values remain in W&B history and can still be added to custom panels.
+# Hiding them only keeps the automatically generated workspace focused.
+HIDDEN_METRIC_PREFIXES = (
+    "agent/action_rate/",
+    "agent/time/",
+)
+
+HIDDEN_METRICS = (
+    "reward/grad_norm_max",
+    "reward/return_abs_mean",
+    "reward/return_min",
+    "reward/return_max",
+    "replay_relabel_debug/sample_size",
+    "replay_relabel_debug/stored_reward_mean",
+    "replay_relabel_debug/current_reward_mean",
+    "replay_relabel_debug/stored_reward_std",
+    "replay_relabel_debug/current_reward_std",
+    "replay_relabel_debug/delta_mean",
+    "replay_relabel_debug/delta_std",
+    "replay_relabel_debug/relabel_enabled",
+    "replay_relabel_debug/critic_uses_current_reward",
+    "time/loggings",
+)
+
+VALIDATION_DATASETS = ("current_rollout", "debug_dataset")
+VALIDATION_STAGES = ("pre_update", "post_update")
+HIDDEN_VALIDATION_SUFFIXES = (
+    "reward_min",
+    "reward_max",
+    "reward_running",
+    "reward_arrived",
+    "reward_collided",
+    "reward_offroad",
+    "reward_timeout",
+    "ensemble_std_running",
+    "spearman_returns_defined",
+)
+
+
+def configure_wandb_metrics(run) -> None:
+    """Assign semantic X axes and trim W&B's automatically generated panels."""
+    run.define_metric("iterations", hidden=True, summary="max")
+    run.define_metric(
+        "agent/time/total_timesteps", hidden=True, summary="max"
+    )
+    run.define_metric(
+        "agent/*", step_metric="agent/time/total_timesteps", step_sync=True
+    )
+    for prefix in ITERATION_METRIC_PREFIXES:
+        run.define_metric(
+            f"{prefix}*", step_metric="iterations", step_sync=True
+        )
+
+    for prefix in HIDDEN_METRIC_PREFIXES:
+        run.define_metric(f"{prefix}*", hidden=True)
+    for metric in HIDDEN_METRICS:
+        run.define_metric(metric, hidden=True)
+    for dataset in VALIDATION_DATASETS:
+        for stage in VALIDATION_STAGES:
+            prefix = f"reward_val/{dataset}/{stage}"
+            for suffix in HIDDEN_VALIDATION_SUFFIXES:
+                run.define_metric(f"{prefix}/{suffix}", hidden=True)
+
+
 class Logger(SB3Logger):
     """SB3 Logger extended with record_sum (accumulates values before dump)."""
 
@@ -125,4 +197,3 @@ class NullLogger:
     def dump(self, step=0): pass
     def log(self, *args, **kwargs): pass
     def warn(self, *args, **kwargs): pass
-

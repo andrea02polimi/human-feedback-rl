@@ -578,19 +578,39 @@ class DemoAlgorithm(BaseAlgorithm):
         self.logger.record(f"{log_class}/reward_min",  float(np.min(pred_rewards)))
         self.logger.record(f"{log_class}/reward_max",  float(np.max(pred_rewards)))
 
-        self._record_masked_mean(f"{log_class}/reward_running",  pred_rewards, running_mask)
-        self._record_masked_mean(f"{log_class}/reward_arrived",  pred_rewards, arrived_mask)
-        self._record_masked_mean(f"{log_class}/reward_collided", pred_rewards, collided_mask)
+        running_mean = self._record_masked_mean(
+            f"{log_class}/reward_running", pred_rewards, running_mask
+        )
+        arrived_mean = self._record_masked_mean(
+            f"{log_class}/reward_arrived", pred_rewards, arrived_mask
+        )
+        collided_mean = self._record_masked_mean(
+            f"{log_class}/reward_collided", pred_rewards, collided_mask
+        )
         self._record_masked_mean(f"{log_class}/reward_offroad",  pred_rewards, offroad_mask)
         self._record_masked_mean(f"{log_class}/reward_timeout",  pred_rewards, timeout_mask)
+
+        if arrived_mean is not None and collided_mean is not None:
+            self.logger.record(
+                f"{log_class}/gap_arrived_collided", arrived_mean - collided_mean
+            )
+        if arrived_mean is not None and running_mean is not None:
+            self.logger.record(
+                f"{log_class}/gap_arrived_running", arrived_mean - running_mean
+            )
 
         # Rising ensemble disagreement signals inputs that are becoming OOD for the reward model.
         self.logger.record(f"{log_class}/ensemble_std", float(np.mean(pred_std)))
         self._record_masked_mean(f"{log_class}/ensemble_std_running", pred_std, running_mask)
 
-    def _record_masked_mean(self, key: str, values: np.ndarray, mask: np.ndarray) -> None:
+    def _record_masked_mean(
+        self, key: str, values: np.ndarray, mask: np.ndarray
+    ) -> Optional[float]:
         if np.any(mask):
-            self.logger.record(key, float(np.mean(values[mask])))
+            mean = float(np.mean(values[mask]))
+            self.logger.record(key, mean)
+            return mean
+        return None
 
     def _run_reward_inference(self, transitions):
         """Run the reward model in eval+no_grad mode; return (true, pred_mean, pred_std, status)."""

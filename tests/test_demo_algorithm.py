@@ -10,6 +10,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 
 from human_feedback_rl.algorithms import DemoAlgorithm
 from human_feedback_rl.common.env_wrappers import EnvBufferingWrapper
+from human_feedback_rl.common.loggers import configure_wandb_metrics
 from human_feedback_rl.common.replay_buffers import RewardRelabelReplayBuffer
 from human_feedback_rl.common.reward_nets import make_reward_ensemble
 from human_feedback_rl.common.trajectory_generators import (
@@ -63,6 +64,30 @@ REWARD_KWARGS = {"n_ensembles": 1, "net_arch": [8], "activation_fn": "tanh"}
 
 
 class DemoAlgorithmTest(unittest.TestCase):
+    def test_wandb_metrics_use_semantic_axes_and_hide_secondary_panels(self):
+        class FakeRun:
+            def __init__(self):
+                self.calls = []
+
+            def define_metric(self, name, **kwargs):
+                self.calls.append((name, kwargs))
+
+        run = FakeRun()
+        configure_wandb_metrics(run)
+        definitions = dict(run.calls)
+
+        self.assertEqual(
+            definitions["agent/*"]["step_metric"],
+            "agent/time/total_timesteps",
+        )
+        self.assertEqual(definitions["reward/*"]["step_metric"], "iterations")
+        self.assertTrue(definitions["agent/action_rate/*"]["hidden"])
+        self.assertTrue(
+            definitions[
+                "reward_val/debug_dataset/post_update/reward_arrived"
+            ]["hidden"]
+        )
+
     def test_ppo_log_prob_uses_tail_mass_for_clipped_actions(self):
         env = make_vec_env()
         agent = PPO(
@@ -209,6 +234,10 @@ class DemoAlgorithmTest(unittest.TestCase):
         )
         self.assertIn(
             "reward_val/current_rollout/post_update/reward_mean",
+            algorithm.logger.name_to_value,
+        )
+        self.assertIn(
+            "reward_val/current_rollout/post_update/gap_arrived_running",
             algorithm.logger.name_to_value,
         )
         self.assertIn(
