@@ -11,7 +11,6 @@ from human_feedback_rl.common.fragmenters import HighVariancePairFragmenter, Ran
 from human_feedback_rl.common.gatherers import PreferenceGathererFromReward
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import torch as th
 
 
 class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
@@ -146,13 +145,11 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
                 loss.backward()
                 optimizer.step()
 
-        # Train all members in parallel
         with ThreadPoolExecutor(max_workers=1) as executor:
             futures = [
                 executor.submit(train_member, member, optimizer)
                 for member, optimizer in zip(self.reward_model.members, self.optimizers)
             ]
-            # Wait for all to complete
             for future in as_completed(futures):
                 future.result()
 

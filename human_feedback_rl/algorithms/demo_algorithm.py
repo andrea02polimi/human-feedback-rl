@@ -1,13 +1,17 @@
-"""
-DemoAlgorithm: demonstration-based reward learning using MaxEnt IRL.
+"""Demonstration-based reward learning via MaxEnt IRL.
 
-A fixed set of expert trajectories is passed at initialisation. At each
-iteration the agent's current rollout serves as the model trajectories. The
-reward model is updated by minimising the MaxEnt IRL loss:
+A fixed set of expert trajectories is supplied at construction. Each iteration the
+agent's fresh rollout serves as the model trajectories, the reward model is updated
+against the expert set, and the agent is trained on the updated reward.
 
-    L = -mean(R_θ(τ^E)) + logsumexp(R_θ(τ^M)) - log(M)
+Three reward losses are available (see ``loss_type``), all of the form
+``-mean(R(tau^E)) + partition_term``:
 
-Because τ^M are always fresh samples from the current policy, no importance
+    maxent    L = -mean(R(tau^E)) + logsumexp(R(tau^M)) - log|M|
+    maxent_2  L = -mean(R(tau^E)) + logsumexp(R(tau^E u tau^M)) - log|E u M|
+    demo      L = -mean(R(tau^E)) + mean(R(tau^M))
+
+Because tau^M are always fresh samples from the current policy, no importance
 sampling correction is needed.
 """
 
@@ -18,7 +22,7 @@ from typing import Any, List, Optional
 
 import numpy as np
 import torch as th
-from scipy.stats import kendalltau, spearmanr
+from scipy.stats import spearmanr
 
 from human_feedback_rl.common.base_algorithm import BaseAlgorithm
 from human_feedback_rl.common.loggers import ExcludeFormatLogger, PrefixedLogger
@@ -28,18 +32,7 @@ from human_feedback_rl.common.types import Trajectory
 
 
 class DemoAlgorithm(BaseAlgorithm):
-    """
-    Demonstration-based reward learning via MaxEnt IRL.
-
-    Expert trajectories are passed once at initialisation and stay fixed for
-    the entire training run.  At each iteration the algorithm:
-
-      1. Collects agent trajectories via rollout.
-      2. Updates the reward model with:
-            L = -mean(R_θ(τ^E)) + logsumexp(R_θ(τ^M)) - log(M)
-         sampling mini-batches from the fixed expert set and the current rollout.
-      3. Normalises the reward model mean and trains the agent with PPO.
-    """
+    """Alternating reward-learning (MaxEnt IRL) and agent-training loop."""
 
     STATUS_ARRIVED  = 0
     STATUS_COLLIDED = 1
@@ -47,11 +40,14 @@ class DemoAlgorithm(BaseAlgorithm):
     STATUS_TIMEOUT  = 3
     STATUS_RUNNING  = 4
 
+    VALID_LOSSES = ("maxent", "maxent_2", "demo")
+
     def __init__(
         self,
         env,
         agent,
         expert_trajectories: List[Trajectory],
+        loss_type: str = "maxent",
         lr_rew: float = 0.001,
         gradient_steps_rew: int = 10,
         batch_size_expert: int = 32,
@@ -69,10 +65,13 @@ class DemoAlgorithm(BaseAlgorithm):
     ):
         if not expert_trajectories:
             raise ValueError("expert_trajectories must be a non-empty list of Trajectory objects.")
+        if loss_type not in self.VALID_LOSSES:
+            raise ValueError(f"loss_type must be one of {self.VALID_LOSSES}, got {loss_type!r}.")
 
         super().__init__(env, agent, rng, log_folder=log_folder, output_formats=output_formats)
 
         self.expert_trajectories     = list(expert_trajectories)
+        self.loss_type               = loss_type
         self.gradient_steps_rew      = gradient_steps_rew
         self.batch_size_expert       = batch_size_expert
         self.batch_size_model        = batch_size_model
@@ -81,9 +80,9 @@ class DemoAlgorithm(BaseAlgorithm):
         self.temperature             = temperature
         self.trajectories            = []
         self.debug_dataset           = debug_dataset or {}
-        # The debug dataset is a flat, sequentially-ordered list of transitions.
-        # Split it into trajectories on the `done` flag so we can compute
-        # return-level ranking metrics on it (see _log_return_ranking).
+
+        # The debug dataset is a flat, sequentially-ordered list of transitions;
+        # split it on `done` so we can compute return-level ranking metrics on it.
         self._debug_trajectories     = self._split_into_trajectories(self.debug_dataset)
 
         self.reward_model = make_reward_ensemble(env, **(reward_model_kwargs or {}))
@@ -118,9 +117,8 @@ class DemoAlgorithm(BaseAlgorithm):
         """Run the full alternating reward-learning + agent-training loop."""
         n_iterations = int(total_timesteps / timesteps_per_iteration)
 
-        # Train the agent before the first reward model update so that model
-        # trajectories at iteration 0 come from a non-random policy, improving
-        # the logsumexp partition function estimate.
+        # Warm up the agent first so iteration-0 model trajectories come from a
+        # non-random policy, improving the logsumexp partition estimate.
         if self.initial_agent_timesteps > 0:
             print(f"- Pre-warming agent for {self.initial_agent_timesteps} timesteps")
             self._train_agent(self.initial_agent_timesteps, log_interval)
@@ -129,15 +127,11 @@ class DemoAlgorithm(BaseAlgorithm):
             t_iter = time.perf_counter()
             print(f"\nIteration {iteration}/{n_iterations - 1}")
 
-            # ---- Phase 1: Collect agent rollout -------------------------
             exploration_steps = int(self.exploration_frac * timesteps_per_iteration)
             print(f"- Collecting {timesteps_per_iteration} agent + {exploration_steps} exploration transitions")
             self.trajectories = self._sample_rollout(timesteps_per_iteration, exploration_steps)
 
-            self.logger.record("dataset/expert_size", len(self.expert_trajectories))
-            self.logger.record("dataset/model_size",  len(self.trajectories))
-
-            # ---- Phase 2: Validate reward model against ground truth ----
+            # Validate the reward model against ground truth before updating it.
             all_transitions = [t for traj in self.trajectories for t in traj]
             self._log_reward_validation(all_transitions, "reward_val/current_rollout")
             self._log_return_ranking(self.trajectories, "reward_val/current_rollout")
@@ -145,20 +139,18 @@ class DemoAlgorithm(BaseAlgorithm):
                 self._log_reward_validation(self.debug_dataset, "reward_val/debug_dataset")
                 self._log_return_ranking(self._debug_trajectories, "reward_val/debug_dataset")
 
-            # ---- Phase 3: Update reward model (MaxEnt IRL) --------------
             print("- Training reward model")
             self._train_reward_model()
 
-            # ---- Phase 4: Normalize reward model mean -------------------
-            # Centers the reward model output to zero-mean on the current rollout
-            # before PPO training so the value function baseline stays well-scaled.
+            # Center rewards before agent training. For off-policy agents such as
+            # SAC, older replay-buffer rewards still keep their old values; the
+            # relabel debug below measures that stale-reward mismatch.
             self._normalize_reward_mean()
+            self._log_replay_reward_staleness()
 
-            # ---- Phase 5: Train agent with updated reward model ---------
             print(f"- Training agent for {timesteps_per_iteration} timesteps")
             self._train_agent(timesteps_per_iteration, log_interval)
 
-            # ---- Logging and checkpointing ------------------------------
             self._log_iteration(t_iter, iteration)
             if checkpoint_dir is not None and (iteration + 1) % checkpoint_interval == 0:
                 self._save_checkpoint(checkpoint_dir, iteration + 1)
@@ -171,7 +163,7 @@ class DemoAlgorithm(BaseAlgorithm):
 
     @staticmethod
     def _grad_norm(module) -> float:
-        """Norma L2 totale dei gradienti correnti dei parametri del modulo."""
+        """Total L2 norm of the module's current parameter gradients."""
         return float(th.sqrt(sum(
             p.grad.pow(2).sum() for p in module.parameters() if p.grad is not None
         )))
@@ -186,7 +178,7 @@ class DemoAlgorithm(BaseAlgorithm):
             member.train()
             norms = []
             for _ in range(self.gradient_steps_rew):
-                loss = self._maxent_loss(member) # TODO scambiare con maxent_loss
+                loss = self._reward_loss(member)
                 optimizer.zero_grad()
                 loss.backward()
                 norms.append(self._grad_norm(member))
@@ -205,24 +197,101 @@ class DemoAlgorithm(BaseAlgorithm):
         t_train = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        loss_val = self._evaluate_reward_model()
-        self.logger.record("reward/loss_val",         loss_val, exclude="stdout")
+        self._log_reward_loss_diagnostics()
         self.logger.record("reward/grad_norm",        float(np.mean(all_norms)), exclude="stdout")
+        self.logger.record("reward/weight_norm",      self._param_norm(self.reward_model), exclude="stdout")
         self.logger.record("time/train_reward_model", t_train)
         self.logger.record_sum("time/loggings",       time.perf_counter() - t0)
 
-    def _evaluate_reward_model(self) -> float:
-        """MaxEnt IRL loss on the current expert and model batches (no grad, eval mode)."""
+    @staticmethod
+    def _param_norm(module) -> float:
+        """Total L2 norm of model parameters."""
+        return float(th.sqrt(sum(p.detach().pow(2).sum() for p in module.parameters())))
+
+    def _diagnostic_returns(self, member):
+        """Deterministic expert/model trajectory returns for reward debugging."""
+        expert_trajs = self._even_subset(self.expert_trajectories, self.batch_size_expert)
+        model_trajs = self._even_subset(self.trajectories, self.batch_size_model)
+        expert_returns = th.stack([self._traj_sum_reward(member, traj) for traj in expert_trajs])
+        model_returns = th.stack([self._traj_sum_reward(member, traj) for traj in model_trajs])
+        return expert_returns, model_returns
+
+    @staticmethod
+    def _even_subset(items, max_items: int):
+        """Return a deterministic, evenly-spaced subset without advancing RNG state."""
+        n_items = len(items)
+        if max_items <= 0:
+            max_items = 1
+        if n_items <= max_items:
+            return list(items)
+        indices = np.linspace(0, n_items - 1, max_items, dtype=int)
+        return [items[i] for i in indices]
+
+    def _log_reward_loss_diagnostics(self) -> None:
+        """Log loss-specific reward diagnostics that are meaningful for IRL."""
         if not self.trajectories:
-            return float("nan")
+            return
+
         self.reward_model.eval()
         with th.no_grad():
-            loss = self._maxent_loss(self.reward_model).item() # TODO scambiare con maxent_loss
+            expert_returns, model_returns = self._diagnostic_returns(self.reward_model)
+            expert_term = -expert_returns.mean()
+            model_mean = model_returns.mean()
+
+            all_returns = th.cat([expert_returns, model_returns], dim=0)
+            margin = expert_returns.mean() - model_mean
+            abs_mean = all_returns.abs().mean()
+
+            self.logger.record("reward/expert_return_mean", float(expert_returns.mean()), exclude="stdout")
+            self.logger.record("reward/model_return_mean",  float(model_mean), exclude="stdout")
+            self.logger.record("reward/expert_model_margin", float(margin), exclude="stdout")
+            self.logger.record("reward/return_std",         float(all_returns.std(unbiased=False)), exclude="stdout")
+            self.logger.record("reward/return_abs_mean",    float(abs_mean), exclude="stdout")
+            self.logger.record("reward/return_min",         float(all_returns.min()), exclude="stdout")
+            self.logger.record("reward/return_max",         float(all_returns.max()), exclude="stdout")
+
+            if self.loss_type == "demo":
+                loss = expert_term + model_mean
+                self.logger.record("reward/loss",            float(loss), exclude="stdout")
+                self.logger.record("reward/demo_margin",     float(margin), exclude="stdout")
+                self.logger.record("reward/demo_scale_std",  float(all_returns.std(unbiased=False)), exclude="stdout")
+                self.logger.record("reward/demo_scale_abs",  float(abs_mean), exclude="stdout")
+                self.reward_model.train()
+                return
+
+            if self.loss_type == "maxent_2":
+                partition = th.logsumexp(all_returns, dim=0) - np.log(len(all_returns))
+                weights = th.softmax(all_returns, dim=0)
+                expert_mass = weights[:len(expert_returns)].sum()
+                model_mass = weights[len(expert_returns):].sum()
+                top1_weight, top1_idx = weights.max(dim=0)
+                ess = 1.0 / weights.pow(2).sum()
+
+                self.logger.record("reward/loss",                         float(expert_term + partition), exclude="stdout")
+                self.logger.record("reward/maxent2_partition_all",        float(partition), exclude="stdout")
+                self.logger.record("reward/maxent2_expert_softmax_mass",  float(expert_mass), exclude="stdout")
+                self.logger.record("reward/maxent2_model_softmax_mass",   float(model_mass), exclude="stdout")
+                self.logger.record("reward/maxent2_top1_softmax_weight",  float(top1_weight), exclude="stdout")
+                self.logger.record("reward/maxent2_top1_is_expert",       float((top1_idx < len(expert_returns)).item()), exclude="stdout")
+                self.logger.record("reward/maxent2_effective_sample_size", float(ess), exclude="stdout")
+                self.reward_model.train()
+                return
+
+            partition = th.logsumexp(model_returns, dim=0) - np.log(len(model_returns))
+            weights = th.softmax(model_returns, dim=0)
+            top_values = th.topk(weights, k=min(5, len(weights))).values
+            ess = 1.0 / weights.pow(2).sum()
+
+            self.logger.record("reward/loss",                          float(expert_term + partition), exclude="stdout")
+            self.logger.record("reward/maxent_partition_model",        float(partition), exclude="stdout")
+            self.logger.record("reward/maxent_top1_softmax_weight",    float(weights.max()), exclude="stdout")
+            self.logger.record("reward/maxent_top5_softmax_mass",      float(top_values.sum()), exclude="stdout")
+            self.logger.record("reward/maxent_effective_sample_size",  float(ess), exclude="stdout")
         self.reward_model.train()
-        return loss
 
-    def _maxent_loss(self, member) -> th.Tensor:
-        """L = -mean(R_θ(τ^E)) + logsumexp(R_θ(τ^M)) - log(M)"""
+    def _sample_returns(self, member):
+        """Return (expert_returns, model_returns): per-trajectory return tensors
+        for a random mini-batch of expert and current-model trajectories."""
         n_e     = min(self.batch_size_expert, len(self.expert_trajectories))
         exp_idx = self.rng.choice(len(self.expert_trajectories), size=n_e, replace=False)
         expert_returns = th.stack([
@@ -234,50 +303,27 @@ class DemoAlgorithm(BaseAlgorithm):
         model_returns = th.stack([
             self._traj_sum_reward(member, self.trajectories[i]) for i in model_idx
         ])
+        return expert_returns, model_returns
 
-        # logsumexp(returns) - log(n_m) is a numerically stable estimate of
-        # log Z_θ, the log partition function over the current policy distribution.
-        log_z = th.logsumexp(model_returns, dim=0) - np.log(n_m)
+    def _reward_loss(self, member) -> th.Tensor:
+        """IRL loss selected by ``self.loss_type``.
 
-        return -expert_returns.mean() + log_z
-    
-    def _maxent_loss_2(self, member) -> th.Tensor:
-        """L = -mean(R_θ(τ^E)) + logsumexp(R_θ(τ^M)) - log(M)"""
-        n_e     = min(self.batch_size_expert, len(self.expert_trajectories))
-        exp_idx = self.rng.choice(len(self.expert_trajectories), size=n_e, replace=False)
-        expert_returns = th.stack([
-            self._traj_sum_reward(member, self.expert_trajectories[i]) for i in exp_idx
-        ])
+        All variants share the ``-mean(R(tau^E))`` term and differ only in the
+        partition term. ``logsumexp(returns) - log(n)`` is a numerically stable
+        estimate of the log partition function over the sampled distribution.
+        """
+        expert_returns, model_returns = self._sample_returns(member)
+        expert_term = -expert_returns.mean()
 
-        n_m       = min(self.batch_size_model, len(self.trajectories))
-        model_idx = self.rng.choice(len(self.trajectories), size=n_m, replace=False)
-        model_returns = th.stack([
-            self._traj_sum_reward(member, self.trajectories[i]) for i in model_idx
-        ])
+        if self.loss_type == "demo":
+            return expert_term + model_returns.mean()
 
-        # logsumexp(returns) - log(n_m) is a numerically stable estimate of
-        # log Z_θ, the log partition function over the current policy distribution.
-        all_returns = th.cat([model_returns, expert_returns], dim=0)
+        if self.loss_type == "maxent_2":
+            all_returns = th.cat([model_returns, expert_returns], dim=0)
+            return expert_term + th.logsumexp(all_returns, dim=0) - np.log(len(all_returns))
 
-        log_z = th.logsumexp(all_returns, dim=0) - np.log(len(all_returns))
-
-        return -expert_returns.mean() + log_z
-
-    def _demo_loss(self, member) -> th.Tensor:
-        """L = -mean(R_θ(τ^E)) + mean(R_θ(τ^A))"""
-        n_e     = min(self.batch_size_expert, len(self.expert_trajectories))
-        exp_idx = self.rng.choice(len(self.expert_trajectories), size=n_e, replace=False)
-        expert_returns = th.stack([
-            self._traj_sum_reward(member, self.expert_trajectories[i]) for i in exp_idx
-        ])
-
-        n_m       = min(self.batch_size_model, len(self.trajectories))
-        model_idx = self.rng.choice(len(self.trajectories), size=n_m, replace=False)
-        model_returns = th.stack([
-            self._traj_sum_reward(member, self.trajectories[i]) for i in model_idx
-        ])
-
-        return -expert_returns.mean() + model_returns.mean()
+        # "maxent": partition over model samples only.
+        return expert_term + th.logsumexp(model_returns, dim=0) - np.log(len(model_returns))
 
     def _traj_sum_reward(self, member, traj: Trajectory) -> th.Tensor:
         """Sum of per-step rewards over a trajectory (supports gradients)."""
@@ -292,11 +338,11 @@ class DemoAlgorithm(BaseAlgorithm):
     # ------------------------------------------------------------------
 
     def _normalize_reward_mean(self) -> None:
-        """Shift each NormalizedRewardNet's EMA mean so output is zero-mean on current rollout.
+        """Shift each NormalizedRewardNet's EMA mean to zero on the current rollout.
 
         The reward model is double-wrapped: each ensemble member has its own
-        NormalizedRewardNet, and the whole ensemble is wrapped again. Both layers
-        are updated here. Only the mean is modified; σ stays at its initial value.
+        NormalizedRewardNet and the ensemble is wrapped again. Both layers are
+        recentered here; only the mean is changed, sigma stays at its initial value.
         """
         all_transitions = [t for traj in self.trajectories for t in traj]
         if not all_transitions:
@@ -311,10 +357,65 @@ class DemoAlgorithm(BaseAlgorithm):
             raw = member.predict_unnormalized(obs, acts, status, done)
             member.set_mean(raw.mean())
 
-        # After centering each member, the outer wrapper should already be near
-        # zero-mean, but we update it explicitly to remove any residual bias.
+        # Centering each member leaves the outer wrapper near zero-mean; update it
+        # explicitly to remove any residual bias.
         raw = self.reward_model.predict_unnormalized(obs, acts, status, done)
         self.reward_model.set_mean(raw.mean())
+
+    def _log_replay_reward_staleness(self, batch_size: int = 2048) -> None:
+        """Compare stored off-policy rewards with current reward-model predictions.
+
+        SAC trains Q targets from replay-buffer rewards. Without relabelling, old
+        transitions keep rewards produced by older reward-model parameters/stats.
+        This debug metric estimates that mismatch without changing training.
+        """
+        if getattr(self.agent, "replay_buffer", None) is None:
+            return
+
+        reward_wrapper = self._find_relabel_debug_wrapper(self.trajectory_generator.venv)
+        if reward_wrapper is None:
+            return
+
+        batch = reward_wrapper.sample_relabel_debug_batch(batch_size, self.rng)
+        if batch is None:
+            return
+
+        obs, actions, status, done, stored_rewards = batch
+        self.reward_model.eval()
+        with th.no_grad():
+            current_rewards = self.reward_model.predict(obs, actions, status, done)
+        self.reward_model.train()
+
+        delta = current_rewards - stored_rewards
+        abs_delta = np.abs(delta)
+        stored_std = float(np.std(stored_rewards))
+        current_std = float(np.std(current_rewards))
+        denom = current_std if current_std > 1e-8 else 1.0
+
+        self.logger.record("replay_relabel_debug/sample_size",          len(stored_rewards), exclude="stdout")
+        self.logger.record("replay_relabel_debug/stored_reward_mean",   float(np.mean(stored_rewards)), exclude="stdout")
+        self.logger.record("replay_relabel_debug/current_reward_mean",  float(np.mean(current_rewards)), exclude="stdout")
+        self.logger.record("replay_relabel_debug/stored_reward_std",    stored_std, exclude="stdout")
+        self.logger.record("replay_relabel_debug/current_reward_std",   current_std, exclude="stdout")
+        self.logger.record("replay_relabel_debug/delta_mean",           float(np.mean(delta)), exclude="stdout")
+        self.logger.record("replay_relabel_debug/delta_std",            float(np.std(delta)), exclude="stdout")
+        self.logger.record("replay_relabel_debug/delta_abs_mean",       float(np.mean(abs_delta)), exclude="stdout")
+        self.logger.record("replay_relabel_debug/delta_abs_p95",        float(np.percentile(abs_delta, 95)), exclude="stdout")
+        self.logger.record("replay_relabel_debug/staleness_ratio",      float(np.mean(abs_delta) / denom), exclude="stdout")
+        self.logger.record("replay_relabel_debug/sign_flip_frac",       float(np.mean(np.sign(stored_rewards) != np.sign(current_rewards))), exclude="stdout")
+
+        if stored_std > 1e-8 and current_std > 1e-8:
+            corr = np.corrcoef(stored_rewards, current_rewards)[0, 1]
+            self.logger.record("replay_relabel_debug/stored_current_corr", float(corr), exclude="stdout")
+
+    @staticmethod
+    def _find_relabel_debug_wrapper(venv):
+        current = venv
+        while current is not None:
+            if hasattr(current, "sample_relabel_debug_batch"):
+                return current
+            current = getattr(current, "venv", None)
+        return None
 
     # ------------------------------------------------------------------
     # Rollout collection and agent training
@@ -333,8 +434,6 @@ class DemoAlgorithm(BaseAlgorithm):
         self.logger.record("rollout/mean_true_reward",  float(np.mean(true_rewards)))
         self.logger.record("rollout/mean_model_reward", float(np.mean(model_rewards)))
         self.logger.record("rollout/mean_length",       float(np.mean(lengths)))
-        self.logger.record("rollout/n_trajectories",    len(trajectories))
-        self.logger.record("rollout/total_transitions", int(np.sum(lengths)))
         self.logger.record("time/sample_rollout",       t_sample)
         self.logger.record_sum("time/loggings",         time.perf_counter() - t0)
 
@@ -357,9 +456,8 @@ class DemoAlgorithm(BaseAlgorithm):
     # ------------------------------------------------------------------
 
     def _log_reward_validation(self, transitions, log_class: str) -> None:
-        """Log MAE per terminal-state type, Kendall τ on running steps and ensemble disagreement."""
-        true_rewards, pred_rewards, pred_std, status = self._run_reward_inference(transitions)
-        pred_norm = self._align_predictions(pred_rewards, true_rewards, status)
+        """Log reward scale, status shortcuts, and ensemble disagreement."""
+        _, pred_rewards, pred_std, status = self._run_reward_inference(transitions)
 
         arrived_mask  = status[:, self.STATUS_ARRIVED]  == 1
         collided_mask = status[:, self.STATUS_COLLIDED] == 1
@@ -367,20 +465,27 @@ class DemoAlgorithm(BaseAlgorithm):
         timeout_mask  = status[:, self.STATUS_TIMEOUT]  == 1
         running_mask  = status[:, self.STATUS_RUNNING]  == 1
 
-        self.logger.record(f"{log_class}/mae_arrived",  np.mean(np.abs(pred_norm[arrived_mask]  - true_rewards[arrived_mask])))
-        self.logger.record(f"{log_class}/mae_collided", np.mean(np.abs(pred_norm[collided_mask] - true_rewards[collided_mask])))
-        self.logger.record(f"{log_class}/mae_offroad",  np.mean(np.abs(pred_norm[offroad_mask]  - true_rewards[offroad_mask])))
-        self.logger.record(f"{log_class}/mae_timeout",  np.mean(np.abs(pred_norm[timeout_mask]  - true_rewards[timeout_mask])))
-        self.logger.record(f"{log_class}/mae_running",  np.mean(np.abs(pred_norm[running_mask]  - true_rewards[running_mask])))
-        kt_running, _ = kendalltau(true_rewards[running_mask], pred_norm[running_mask])
-        self.logger.record(f"{log_class}/kendall_running", kt_running)
+        self.logger.record(f"{log_class}/reward_mean", float(np.mean(pred_rewards)))
+        self.logger.record(f"{log_class}/reward_std",  float(np.std(pred_rewards)))
+        self.logger.record(f"{log_class}/reward_min",  float(np.min(pred_rewards)))
+        self.logger.record(f"{log_class}/reward_max",  float(np.max(pred_rewards)))
 
-        # Ensemble disagreement: rising std signals out-of-distribution inputs.
-        self.logger.record(f"{log_class}/ensemble_std",         float(np.mean(pred_std)))
-        self.logger.record(f"{log_class}/ensemble_std_running", float(np.mean(pred_std[running_mask])))
+        self._record_masked_mean(f"{log_class}/reward_running",  pred_rewards, running_mask)
+        self._record_masked_mean(f"{log_class}/reward_arrived",  pred_rewards, arrived_mask)
+        self._record_masked_mean(f"{log_class}/reward_collided", pred_rewards, collided_mask)
+        self._record_masked_mean(f"{log_class}/reward_offroad",  pred_rewards, offroad_mask)
+        self._record_masked_mean(f"{log_class}/reward_timeout",  pred_rewards, timeout_mask)
+
+        # Rising ensemble disagreement signals inputs that are becoming OOD for the reward model.
+        self.logger.record(f"{log_class}/ensemble_std", float(np.mean(pred_std)))
+        self._record_masked_mean(f"{log_class}/ensemble_std_running", pred_std, running_mask)
+
+    def _record_masked_mean(self, key: str, values: np.ndarray, mask: np.ndarray) -> None:
+        if np.any(mask):
+            self.logger.record(key, float(np.mean(values[mask])))
 
     def _run_reward_inference(self, transitions):
-        """Run reward model in eval+no_grad mode; return (true, pred_mean, pred_std, status) arrays."""
+        """Run the reward model in eval+no_grad mode; return (true, pred_mean, pred_std, status)."""
         self.reward_model.eval()
         with th.no_grad():
             true_rewards = np.array([t.true_reward for t in transitions], dtype=np.float32)
@@ -389,29 +494,14 @@ class DemoAlgorithm(BaseAlgorithm):
             status       = np.array([t.next_status  for t in transitions], dtype=np.float32)
             done         = np.array([float(t.done)  for t in transitions], dtype=np.float32)
             pred_rewards = self.reward_model.predict(obs, acts, status, done)
-            # Per-member predictions (N, n_members); std across members = ensemble disagreement.
+            # Per-member predictions (N, n_members); std across members = disagreement.
             pred_std     = self.reward_model.predict_all(obs, acts, status, done).std(axis=1)
         self.reward_model.train()
         return true_rewards, pred_rewards, pred_std, status
 
-    def _align_predictions(
-        self,
-        pred_rewards: np.ndarray,
-        true_rewards: np.ndarray,
-        status: np.ndarray,
-    ) -> np.ndarray:
-        """Shift pred_rewards to match the true-reward mean on running steps (for logging only)."""
-        pred_rewards = pred_rewards * self.temperature
-
-        # Use only running steps to compute the shift, so terminal bonuses/penalties
-        # don't distort the mean estimate.
-        running_mask = status[:, self.STATUS_RUNNING] == 1
-        shift = np.mean(true_rewards[running_mask]) - np.mean(pred_rewards[running_mask])
-        return pred_rewards + shift
-
     @staticmethod
     def _split_into_trajectories(transitions) -> List[Trajectory]:
-        """Split a flat, sequentially-ordered list of transitions into trajectories on `done`."""
+        """Split a flat, sequentially-ordered transition list into trajectories on `done`."""
         trajectories, current = [], Trajectory()
         for t in transitions:
             current.add_transition(t)
@@ -423,7 +513,7 @@ class DemoAlgorithm(BaseAlgorithm):
         return trajectories
 
     def _log_return_ranking(self, trajectories, log_class: str) -> None:
-        """Spearman ρ between predicted and true trajectory returns (ranking quality)."""
+        """Spearman rho between predicted and true trajectory returns (ranking quality)."""
         if len(trajectories) < 2:
             return
         true_returns, pred_returns = [], []

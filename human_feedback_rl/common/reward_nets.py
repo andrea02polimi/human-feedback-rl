@@ -190,18 +190,18 @@ class NormalizedRewardNet(RewardNet):
     Stats are injected via set_mean() / set_std().
     """
 
-    def __init__(self, net: RewardNet, alfa: float = 1):
+    def __init__(self, net: RewardNet, alpha: float = 1):
         super().__init__(net.observation_space, net.action_space)
         self.net = net
-        self.alfa = alfa
+        self.alpha = alpha
         self._mean: float = 0.0
         self._std: float = 1.0
 
     def set_mean(self, mean: float) -> None:
-        self._mean = (1 - self.alfa)*self._mean + self.alfa*float(mean)
+        self._mean = (1 - self.alpha)*self._mean + self.alpha*float(mean)
 
     def set_std(self, std: float) -> None:
-        self._std = (1 - self.alfa)*self._std + self.alfa*float(std)
+        self._std = (1 - self.alpha)*self._std + self.alpha*float(std)
 
     def forward(
         self,
@@ -249,16 +249,6 @@ class NormalizedRewardNet(RewardNet):
     @property
     def members(self):
         return self.net.members
-    
-    @th.no_grad()
-    def predict_all(
-        self,
-        state: np.ndarray,
-        action: np.ndarray,
-        next_status: Optional[np.ndarray] = None,
-        done: Optional[np.ndarray] = None,
-        ):
-        return self.net.predict_all(state, action, next_status, done)
 
 
 def make_reward_ensemble(
@@ -266,7 +256,7 @@ def make_reward_ensemble(
     n_ensembles: int = 1,
     net_arch: Optional[List[int]] = None,
     activation_fn: str = None,
-    alfa: float = 1,
+    alpha: float = 1,
 ) -> RewardEnsemble:
     
     obs_space = venv.observation_space
@@ -279,7 +269,7 @@ def make_reward_ensemble(
                 act_space, 
                 net_arch=net_arch, 
                 activation_fn=activation_fn
-            ), alfa)
+            ), alpha)
         for _ in range(n_ensembles)
     ]
-    return NormalizedRewardNet(RewardEnsemble(obs_space, act_space, members), alfa)
+    return NormalizedRewardNet(RewardEnsemble(obs_space, act_space, members), alpha)

@@ -1,4 +1,5 @@
 import numpy as np
+from collections import deque
 from typing import List, Tuple, Any, Dict, Callable, Union, Optional
 
 from stable_baselines3.common.vec_env import VecEnvWrapper, VecEnv
@@ -57,11 +58,12 @@ class EnvRewardWrapper(VecEnvWrapper):
     being passed to the agent (Christiano et al. 2017, Section 2.2).
     """
 
-    def __init__(self, venv: VecEnv, reward_model: RewardEnsemble):
+    def __init__(self, venv: VecEnv, reward_model: RewardEnsemble, relabel_debug_size: int = 100_000):
         super().__init__(venv)
         self.reward_model = reward_model
         self._obs: np.ndarray | None = None
         self._actions: np.ndarray | None = None
+        self._relabel_debug_buffer = deque(maxlen=relabel_debug_size)
 
     def reset(self):
         obs = self.venv.reset()
@@ -78,25 +80,45 @@ class EnvRewardWrapper(VecEnvWrapper):
         if self._obs is not None and self._actions is not None:
             next_status = np.array([ego_status_to_onehot(i.get("ego_status", "running")) for i in infos])
             predicted_rew = self.reward_model.predict(self._obs, self._actions, next_status, dones.astype(np.float32))
+            self._store_relabel_debug_batch(self._obs, self._actions, next_status, dones, predicted_rew)
         else:
             predicted_rew = np.zeros(len(obs), dtype=np.float32)
 
         self._obs = np.asarray(obs, dtype=np.float32)
         return obs, predicted_rew, dones, infos
-    
+
+    def _store_relabel_debug_batch(self, obs, actions, next_status, dones, rewards) -> None:
+        for i in range(len(rewards)):
+            self._relabel_debug_buffer.append((
+                np.asarray(obs[i], dtype=np.float32).copy(),
+                np.asarray(actions[i], dtype=np.float32).copy(),
+                np.asarray(next_status[i], dtype=np.float32).copy(),
+                float(dones[i]),
+                float(rewards[i]),
+            ))
+
+    def sample_relabel_debug_batch(self, batch_size: int, rng: np.random.Generator):
+        """Sample rewards as originally passed to the agent for stale-reward diagnostics."""
+        n_items = len(self._relabel_debug_buffer)
+        if n_items == 0:
+            return None
+
+        n_samples = min(batch_size, n_items)
+        indices = rng.choice(n_items, size=n_samples, replace=False)
+        samples = [self._relabel_debug_buffer[int(i)] for i in indices]
+        obs, actions, next_status, dones, rewards = zip(*samples)
+        return (
+            np.asarray(obs, dtype=np.float32),
+            np.asarray(actions, dtype=np.float32),
+            np.asarray(next_status, dtype=np.float32),
+            np.asarray(dones, dtype=np.float32),
+            np.asarray(rewards, dtype=np.float32),
+        )
 
 
 
 class EnvBufferingWrapper(VecEnvWrapper):
-    """
-    Wrapper per VecEnv che salva le transizioni raccolte durante i rollout
-    e le organizza in Trajectory.
-
-    Usa le classi:
-    - Transition
-    - Trajectory
-    - Fragment (= Trajectory)
-    """
+    """VecEnvWrapper that records rollout transitions and groups them into Trajectory objects."""
 
     def __init__(self, venv: VecEnv, error_on_premature_reset: bool = True):
         super().__init__(venv)
@@ -105,16 +127,16 @@ class EnvBufferingWrapper(VecEnvWrapper):
         self._initialized = False
         self._saved_actions = None
 
-        # traiettorie complete terminate
+        # Completed (terminated) trajectories.
         self._finished_trajectories: List[Trajectory] = []
 
-        # frammenti/traiettorie correnti, una per env parallelo
+        # In-progress trajectory, one per parallel env.
         self._partial_trajectories: List[Trajectory] = []
 
-        # contatore timestep per ogni env parallelo
+        # Timestep counter per parallel env.
         self._timesteps: np.ndarray | None = None
 
-        # ultima osservazione vista per ogni env
+        # Last observation seen per env.
         self._last_obs = None
 
     def is_empty(self):
@@ -127,9 +149,7 @@ class EnvBufferingWrapper(VecEnvWrapper):
         self.venv.step_async(actions)
 
     def step_wait(self):
-        """
-        Esegue lo step e salva una Transition per ogni env parallelo.
-        """
+        """Step the env and record one Transition per parallel env."""
         assert self._initialized, "Call reset() before stepping."
         assert self._saved_actions is not None, "step_wait called before step_async."
 
@@ -152,10 +172,8 @@ class EnvBufferingWrapper(VecEnvWrapper):
             self._partial_trajectories[i].add_transition(transition)
 
             if dones[i]:
-                # episodio finito: salva traiettoria completa
+                # Episode finished: store the completed trajectory and start a new one.
                 self._finished_trajectories.append(self._partial_trajectories[i])
-
-                # ricomincia una nuova traiettoria vuota per quell'env
                 self._partial_trajectories[i] = Trajectory()
                 self._timesteps[i] = 0
 
@@ -163,17 +181,9 @@ class EnvBufferingWrapper(VecEnvWrapper):
         return obs, true_rew, dones, infos
 
     def pop_finished_trajectories(self) -> List[Trajectory]:
-        """
-        Restituisce solo le traiettorie complete terminate dall'ultimo pop.
-        """
-
-        if len(self._finished_trajectories) == 0:
-            return []
-
+        """Return and clear the trajectories completed since the last pop."""
         trajectories = self._finished_trajectories
-
         self._finished_trajectories = []
-
         return trajectories
 
     def reset(self, **kwargs):
@@ -182,7 +192,7 @@ class EnvBufferingWrapper(VecEnvWrapper):
             and self.error_on_premature_reset
             and len(self._finished_trajectories) > 0
         ):
-            raise RuntimeError("reset() chiamato prima di aver letto le traiettorie salvate.")
+            raise RuntimeError("reset() called before the buffered trajectories were read.")
 
         self._initialized = True
         self._saved_actions = None
@@ -199,21 +209,11 @@ class EnvBufferingWrapper(VecEnvWrapper):
 
 
 class PolicyExplorationWrapper:
-    """
-    Wrapper che rende una policy più esplorativa.
+    """Epsilon-greedy exploration wrapper around a policy.
 
-    In ogni momento usa una delle due policy possibili:
-    1. la policy vera (wrapped policy)
-    2. una policy casuale che campiona azioni a caso
-
-    Dopo ogni chiamata, con probabilità `switch_prob`,
-    decide se cambiare policy corrente.
-    Quando cambia, sceglie:
-    - policy casuale con probabilità `exploration_eps`
-    - policy vera con probabilità `1 - exploration_eps`
-
-    Limitazione:
-    supporta solo policy stateless, cioè senza stato ricorrente.
+    On each `predict` call, with probability `exploration_eps` it samples random
+    actions from the env's action space, otherwise it defers to the wrapped policy.
+    Only stateless policies are supported.
     """
 
     def __init__(
@@ -225,22 +225,17 @@ class PolicyExplorationWrapper:
     ):
         """
         Args:
-            policy:
-                La policy da wrappare. Deve essere callable e restituire:
-                (actions, state), dove state deve essere None.
-            venv:
-                Ambiente vettorizzato, usato per campionare azioni casuali.
-            exploration_eps:
-                Probabilità di scegliere la policy casuale quando avviene uno switch.
-            rng:
-                Generatore random usato per tutte le scelte casuali.
+            venv: vectorized env, used to sample random actions.
+            policy: wrapped policy; must be callable and return (actions, state).
+            exploration_eps: probability of sampling a random action per call.
+            rng: random generator driving all random choices.
         """
         self.wrapped_policy = policy
         self.venv = venv
         self.exploration_eps = exploration_eps
         self.rng = rng
 
-        # Seed dell'action space, così anche il sampling casuale dipende da rng
+        # Seed the action space so random sampling is also driven by rng.
         seed = int(self.rng.integers(0, 2**31 - 1))
         self.venv.action_space.seed(seed)
 
