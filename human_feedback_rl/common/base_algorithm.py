@@ -8,14 +8,12 @@ Concrete algorithm families (reward learning, imitation learning, …) inherit
 from this and add their own components on top.
 """
 
-import sys
 from abc import ABC, abstractmethod
 from typing import Any, List, Optional
 
 import numpy as np
-from stable_baselines3.common.logger import HumanOutputFormat
 
-from human_feedback_rl.common.loggers import Logger, WandbWriter
+from human_feedback_rl.common.loggers import Logger, WandbWriter, make_human_output_format
 
 
 class BaseAlgorithm(ABC):
@@ -67,7 +65,7 @@ class BaseAlgorithm(ABC):
         Override in a subclass to change the default sinks for that algorithm
         family without having to pass output_formats at every instantiation.
         """
-        return [HumanOutputFormat(sys.stdout), WandbWriter()]
+        return [make_human_output_format(), WandbWriter()]
 
     @abstractmethod
     def train(self, *args, **kwargs) -> Any:

@@ -5,6 +5,14 @@ from stable_baselines3.common.logger import HumanOutputFormat, KVWriter
 from stable_baselines3.common.logger import Logger as SB3Logger
 
 
+HUMAN_OUTPUT_MAX_LENGTH = 96
+
+
+def make_human_output_format(stream=sys.stdout) -> HumanOutputFormat:
+    """Create a text logger wide enough for nested diagnostic metric names."""
+    return HumanOutputFormat(stream, max_length=HUMAN_OUTPUT_MAX_LENGTH)
+
+
 ITERATION_METRIC_PREFIXES = (
     "reward/",
     "reward_val/",

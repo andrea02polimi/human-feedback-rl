@@ -1,13 +1,15 @@
-import sys
 from typing import Optional
 
 import numpy as np
 import torch
-from stable_baselines3.common.logger import HumanOutputFormat
 
 from human_feedback_rl.common import Transition, Trajectory
 from human_feedback_rl.common.base_algorithm import BaseAlgorithm
-from human_feedback_rl.common.loggers import PrefixedLogger, WandbWriter
+from human_feedback_rl.common.loggers import (
+    PrefixedLogger,
+    WandbWriter,
+    make_human_output_format,
+)
 
 try:
     from sumo_rl_ego.policies.base_policy import Policy as RuleBasedPolicy
@@ -70,7 +72,7 @@ class DaggerAlgorithm(BaseAlgorithm):
         self._eval_log   = PrefixedLogger(self.logger, prefix="eval")
 
     def _output_formats(self) -> list:
-        return [HumanOutputFormat(sys.stdout), WandbWriter()]
+        return [make_human_output_format(), WandbWriter()]
 
     # ------------------------------------------------------------------
     # Training loop

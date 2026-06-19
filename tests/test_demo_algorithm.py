@@ -1,4 +1,5 @@
 import unittest
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -10,7 +11,10 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 
 from human_feedback_rl.algorithms import DemoAlgorithm
 from human_feedback_rl.common.env_wrappers import EnvBufferingWrapper
-from human_feedback_rl.common.loggers import configure_wandb_metrics
+from human_feedback_rl.common.loggers import (
+    configure_wandb_metrics,
+    make_human_output_format,
+)
 from human_feedback_rl.common.replay_buffers import RewardRelabelReplayBuffer
 from human_feedback_rl.common.reward_nets import make_reward_ensemble
 from human_feedback_rl.common.trajectory_generators import (
@@ -64,6 +68,18 @@ REWARD_KWARGS = {"n_ensembles": 1, "net_arch": [8], "activation_fn": "tanh"}
 
 
 class DemoAlgorithmTest(unittest.TestCase):
+    def test_human_logger_does_not_collide_on_long_validation_keys(self):
+        output = make_human_output_format(StringIO())
+        metrics = {
+            "reward_val/current_rollout/post_update/ensemble_std": 1.0,
+            "reward_val/current_rollout/post_update/ensemble_std_running": 2.0,
+        }
+        output.write(
+            metrics,
+            {key: None for key in metrics},
+            step=0,
+        )
+
     def test_wandb_metrics_use_semantic_axes_and_hide_secondary_panels(self):
         class FakeRun:
             def __init__(self):
