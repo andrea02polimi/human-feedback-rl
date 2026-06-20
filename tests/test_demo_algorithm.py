@@ -2,6 +2,7 @@ import unittest
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import gymnasium as gym
 import numpy as np
@@ -12,6 +13,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from human_feedback_rl.algorithms import DemoAlgorithm
 from human_feedback_rl.common.env_wrappers import EnvBufferingWrapper
 from human_feedback_rl.common.loggers import (
+    WandbWriter,
     configure_wandb_metrics,
     make_human_output_format,
 )
@@ -97,12 +99,54 @@ class DemoAlgorithmTest(unittest.TestCase):
             "agent/time/total_timesteps",
         )
         self.assertEqual(definitions["reward/*"]["step_metric"], "iterations")
-        self.assertTrue(definitions["agent/action_rate/*"]["hidden"])
-        self.assertTrue(
-            definitions[
-                "reward_val/debug_dataset/post_update/reward_arrived"
-            ]["hidden"]
+        self.assertTrue(definitions["agent/*"]["hidden"])
+        self.assertTrue(definitions["reward_val/*"]["hidden"])
+        self.assertNotIn(
+            "hidden",
+            definitions["agent/event_rate/successes"],
         )
+        self.assertNotIn(
+            "hidden",
+            definitions[
+                "reward_val/debug_dataset/post_update/gap_arrived_collided"
+            ],
+        )
+        self.assertNotIn(
+            "reward_val/debug_dataset/post_update/reward_arrived",
+            definitions,
+        )
+
+    def test_wandb_writer_defines_secondary_metrics_as_exact_hidden_metrics(self):
+        class FakeRun:
+            def __init__(self):
+                self.calls = []
+
+            def define_metric(self, name, **kwargs):
+                self.calls.append((name, kwargs))
+
+        run = FakeRun()
+        writer = WandbWriter()
+        with (
+            patch("human_feedback_rl.common.loggers.wandb.run", run),
+            patch("human_feedback_rl.common.loggers.wandb.log"),
+        ):
+            writer.write(
+                {
+                    "reward/grad_norm": 1.0,
+                    "reward/loss": 2.0,
+                    "unmanaged/value": 3.0,
+                },
+                {},
+            )
+
+        definitions = dict(run.calls)
+        self.assertTrue(definitions["reward/grad_norm"]["hidden"])
+        self.assertEqual(
+            definitions["reward/grad_norm"]["step_metric"],
+            "iterations",
+        )
+        self.assertNotIn("reward/loss", definitions)
+        self.assertNotIn("unmanaged/value", definitions)
 
     def test_ppo_log_prob_uses_tail_mass_for_clipped_actions(self):
         env = make_vec_env()

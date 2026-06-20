@@ -21,68 +21,88 @@ ITERATION_METRIC_PREFIXES = (
     "time/",
 )
 
-# These values remain in W&B history and can still be added to custom panels.
-# Hiding them only keeps the automatically generated workspace focused.
-HIDDEN_METRIC_PREFIXES = (
-    "agent/action_rate/",
-    "agent/time/",
+# Keep the automatically generated workspace deliberately small. All other
+# values are still written to W&B history and can be added to custom panels.
+# A maxent_2 run logs 15 common metrics plus its two loss-specific diagnostics:
+# 17 automatic plots, which can be grouped into eight custom workspace panels.
+VISIBLE_METRICS = (
+    # Policy outcome and environment performance.
+    "agent/event_rate/successes",
+    "agent/event_rate/collisions",
+    "agent/event_rate/off_road",
+    "agent/rewards/ep_fast_return",
+    # SAC stability.
+    "agent/train/critic_loss",
+    "agent/train/ent_coef",
+    # Reward-model stability.
+    "reward/loss",
+    "reward/weight_norm",
+    # Replay reward non-stationarity.
+    "replay_relabel_debug/staleness_ratio",
+    "replay_relabel_debug/sign_flip_frac",
+    "replay_relabel_debug/stored_current_corr",
+    # Generalization: recent policy distribution versus fixed debug data.
+    "reward_val/current_rollout/post_update/spearman_returns",
+    "reward_val/debug_dataset/post_update/spearman_returns",
+    "reward_val/current_rollout/post_update/gap_arrived_collided",
+    "reward_val/debug_dataset/post_update/gap_arrived_collided",
+    # Historical MaxEnt loss diagnostics.
+    "reward/maxent_effective_sample_fraction",
+    "reward/maxent_top1_softmax_weight",
+    "reward/maxent2_effective_sample_fraction",
+    "reward/maxent2_expert_softmax_mass",
+    # Corrected MaxEnt loss diagnostics.
+    "reward/maxent_corrected_effective_sample_fraction",
+    "reward/maxent_corrected_top1_softmax_weight",
+    # Demo loss diagnostics. Only the pair matching the configured loss is
+    # emitted, so unused definitions do not create empty panels.
+    "reward/demo_margin",
+    "reward/demo_scale_std",
+    "reward/demo_corrected_margin",
+    "reward/demo_corrected_scale_std",
 )
+VISIBLE_METRIC_SET = frozenset(VISIBLE_METRICS)
 
-HIDDEN_METRICS = (
-    "reward/grad_norm_max",
-    "reward/return_abs_mean",
-    "reward/return_min",
-    "reward/return_max",
-    "replay_relabel_debug/sample_size",
-    "replay_relabel_debug/stored_reward_mean",
-    "replay_relabel_debug/current_reward_mean",
-    "replay_relabel_debug/stored_reward_std",
-    "replay_relabel_debug/current_reward_std",
-    "replay_relabel_debug/delta_mean",
-    "replay_relabel_debug/delta_std",
-    "replay_relabel_debug/relabel_enabled",
-    "replay_relabel_debug/critic_uses_current_reward",
-    "time/loggings",
-)
-
-VALIDATION_DATASETS = ("current_rollout", "debug_dataset")
-VALIDATION_STAGES = ("pre_update", "post_update")
-HIDDEN_VALIDATION_SUFFIXES = (
-    "reward_min",
-    "reward_max",
-    "reward_running",
-    "reward_arrived",
-    "reward_collided",
-    "reward_offroad",
-    "reward_timeout",
-    "ensemble_std_running",
-    "spearman_returns_defined",
-)
+SEMANTIC_METRIC_PREFIXES = ("agent/", *ITERATION_METRIC_PREFIXES)
+PREDEFINED_METRICS = frozenset({
+    "iterations",
+    "agent/time/total_timesteps",
+    *VISIBLE_METRICS,
+})
 
 
 def configure_wandb_metrics(run) -> None:
-    """Assign semantic X axes and trim W&B's automatically generated panels."""
+    """Assign semantic X axes and expose only the core automatic panels."""
     run.define_metric("iterations", hidden=True, summary="max")
     run.define_metric(
         "agent/time/total_timesteps", hidden=True, summary="max"
     )
     run.define_metric(
-        "agent/*", step_metric="agent/time/total_timesteps", step_sync=True
+        "agent/*",
+        step_metric="agent/time/total_timesteps",
+        step_sync=True,
+        hidden=True,
     )
     for prefix in ITERATION_METRIC_PREFIXES:
         run.define_metric(
-            f"{prefix}*", step_metric="iterations", step_sync=True
+            f"{prefix}*",
+            step_metric="iterations",
+            step_sync=True,
+            hidden=True,
         )
 
-    for prefix in HIDDEN_METRIC_PREFIXES:
-        run.define_metric(f"{prefix}*", hidden=True)
-    for metric in HIDDEN_METRICS:
-        run.define_metric(metric, hidden=True)
-    for dataset in VALIDATION_DATASETS:
-        for stage in VALIDATION_STAGES:
-            prefix = f"reward_val/{dataset}/{stage}"
-            for suffix in HIDDEN_VALIDATION_SUFFIXES:
-                run.define_metric(f"{prefix}/{suffix}", hidden=True)
+    # Exact definitions take precedence over the hidden prefix globs above.
+    # Do not pass hidden=False: W&B represents visibility by the absence of the
+    # hidden option in the exact metric definition.
+    for metric in VISIBLE_METRICS:
+        is_agent_metric = metric.startswith("agent/")
+        run.define_metric(
+            metric,
+            step_metric=(
+                "agent/time/total_timesteps" if is_agent_metric else "iterations"
+            ),
+            step_sync=True,
+        )
 
 
 class Logger(SB3Logger):
@@ -115,10 +135,42 @@ class Logger(SB3Logger):
 # ── WandB writer ──────────────────────────────────────────────────────────────
 
 class WandbWriter(KVWriter):
+    def __init__(self) -> None:
+        # W&B 0.27 creates wildcard-derived metric records with defined=False.
+        # The automatic workspace may ignore their hidden flag, so secondary
+        # metrics are defined explicitly before their first log call.
+        self._defined_metrics = set(PREDEFINED_METRICS)
+
+    @staticmethod
+    def _step_metric(metric: str) -> str:
+        return (
+            "agent/time/total_timesteps"
+            if metric.startswith("agent/")
+            else "iterations"
+        )
+
+    def _define_secondary_metrics(self, metrics) -> None:
+        run = wandb.run
+        if run is None:
+            return
+        for metric in metrics:
+            if metric in self._defined_metrics or not metric.startswith(
+                SEMANTIC_METRIC_PREFIXES
+            ):
+                continue
+            run.define_metric(
+                metric,
+                step_metric=self._step_metric(metric),
+                step_sync=True,
+                hidden=metric not in VISIBLE_METRIC_SET,
+            )
+            self._defined_metrics.add(metric)
+
     def write(self, key_values: dict, key_excluded: dict, step: int = 0) -> None:
         metrics = {k: v for k, v in key_values.items()
                    if key_excluded.get(k) is None or "wandb" not in key_excluded[k]}
         if metrics:
+            self._define_secondary_metrics(metrics)
             wandb.log(metrics)
 
     def close(self) -> None:
