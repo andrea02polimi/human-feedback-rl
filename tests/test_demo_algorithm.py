@@ -199,6 +199,7 @@ class DemoAlgorithmTest(unittest.TestCase):
 
         raw_before = model(*tensors).detach().clone()
         model.set_mean(10.0)
+        model.set_std(2.0)
         raw_after = model(*tensors).detach().clone()
         self.assertTrue(th.equal(raw_before, raw_after))
 
@@ -216,6 +217,43 @@ class DemoAlgorithmTest(unittest.TestCase):
         legacy_restored = make_reward_ensemble(env, **REWARD_KWARGS)
         legacy_restored.load_state_dict(legacy_state)
         env.close()
+
+    def test_agent_reward_normalization_uses_rollout_without_changing_raw_forward(self):
+        train_env, rollout_env = make_vec_env(), make_vec_env()
+        agent = PPO(
+            "MlpPolicy", train_env, n_steps=5, batch_size=5, n_epochs=1,
+            device="cpu", verbose=0,
+        )
+        algorithm = DemoAlgorithm(
+            train_env,
+            agent,
+            [make_expert_trajectory()],
+            rollout_env=rollout_env,
+            gradient_steps_rew=1,
+            batch_size_expert=1,
+            batch_size_model=1,
+            reward_model_kwargs=REWARD_KWARGS,
+            output_formats=[],
+        )
+        algorithm.trajectories = [make_expert_trajectory()]
+        transitions = list(algorithm.trajectories[0])
+        obs = np.asarray([transition.observation for transition in transitions], dtype=np.float32)
+        actions = np.asarray([transition.action for transition in transitions], dtype=np.float32)
+        statuses = np.asarray([transition.next_status for transition in transitions], dtype=np.float32)
+        dones = np.asarray([float(transition.done) for transition in transitions], dtype=np.float32)
+        tensors = algorithm.reward_model.preprocess(obs, actions, statuses, dones)
+
+        raw_before = algorithm.reward_model(*tensors).detach().clone()
+        algorithm._update_agent_reward_normalization()
+        raw_after = algorithm.reward_model(*tensors).detach().clone()
+        normalized = algorithm.reward_model.predict(obs, actions, statuses, dones)
+
+        self.assertTrue(th.equal(raw_before, raw_after))
+        self.assertAlmostEqual(float(np.mean(normalized)), 0.0, places=5)
+        self.assertAlmostEqual(float(np.std(normalized)), 1.0, places=5)
+        self.assertIn("reward/normalization_raw_std", algorithm.logger.name_to_value)
+        train_env.close()
+        rollout_env.close()
 
     def test_ppo_rollout_records_log_prob_and_trains(self):
         train_env, rollout_env = make_vec_env(), make_vec_env()

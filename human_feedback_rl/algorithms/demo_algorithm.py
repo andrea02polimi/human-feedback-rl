@@ -78,6 +78,7 @@ class DemoAlgorithm(BaseAlgorithm):
         debug_dataset: Optional[dict] = None,
         rollout_env=None,
         relabel_rewards: bool = True,
+        normalize_agent_reward: bool = True,
     ):
         if not expert_trajectories:
             raise ValueError("expert_trajectories must be a non-empty list of Trajectory objects.")
@@ -106,6 +107,7 @@ class DemoAlgorithm(BaseAlgorithm):
         self.exploration_frac        = exploration_frac
         self.temperature             = temperature
         self.relabel_rewards         = relabel_rewards
+        self.normalize_agent_reward  = normalize_agent_reward
         self.trajectories            = []
         self.debug_dataset           = debug_dataset or {}
         self._debug_rng              = np.random.default_rng(0)
@@ -164,6 +166,7 @@ class DemoAlgorithm(BaseAlgorithm):
             self.trajectories = self._sample_rollout(self.initial_agent_timesteps)
             print("- Bootstrapping reward model")
             self._train_reward_model()
+            self._update_agent_reward_normalization()
             print(f"- Pre-warming agent for {self.initial_agent_timesteps} timesteps on learned reward")
             self._train_agent(self.initial_agent_timesteps, log_interval)
 
@@ -180,6 +183,7 @@ class DemoAlgorithm(BaseAlgorithm):
 
             print("- Training reward model")
             self._train_reward_model()
+            self._update_agent_reward_normalization()
             self._log_validation_snapshot(all_transitions, "post_update")
 
             self._log_replay_reward_staleness()
@@ -457,6 +461,64 @@ class DemoAlgorithm(BaseAlgorithm):
         done        = th.tensor(np.array([float(t.done) for t in traj]),  dtype=th.float32)
         return member(obs, actions, next_status, done).sum()
 
+    def _update_agent_reward_normalization(self) -> None:
+        """Fit the agent-only reward transform on the current rollout.
+
+        Reward learning continues to use raw ``forward`` outputs. Only
+        ``reward_model.predict`` -- consumed by the environment and replay
+        relabelling -- applies these statistics.
+        """
+        if not self.normalize_agent_reward or not self.trajectories:
+            return
+
+        transitions = [transition for trajectory in self.trajectories for transition in trajectory]
+        if not transitions:
+            return
+
+        obs = np.asarray([transition.observation for transition in transitions], dtype=np.float32)
+        actions = np.asarray([transition.action for transition in transitions], dtype=np.float32)
+        statuses = np.asarray([transition.next_status for transition in transitions], dtype=np.float32)
+        dones = np.asarray([float(transition.done) for transition in transitions], dtype=np.float32)
+
+        raw_rewards = self.reward_model.predict_unnormalized(obs, actions, statuses, dones)
+        if not np.isfinite(raw_rewards).all():
+            raise FloatingPointError("Non-finite raw rewards while fitting agent normalization.")
+
+        raw_mean = float(np.mean(raw_rewards))
+        raw_std = float(np.std(raw_rewards))
+        # A constant reward should remain zero after centering, not be amplified
+        # by division through an arbitrarily small number.
+        safe_std = raw_std if raw_std > 1e-8 else 1.0
+        self.reward_model.set_mean(raw_mean)
+        self.reward_model.set_std(safe_std)
+
+        normalized_rewards = self.reward_model.predict(obs, actions, statuses, dones)
+        if not np.isfinite(normalized_rewards).all():
+            raise FloatingPointError("Non-finite normalized rewards for agent training.")
+
+        self.logger.record("reward/normalization_raw_mean", raw_mean, exclude="stdout")
+        self.logger.record("reward/normalization_raw_std", raw_std, exclude="stdout")
+        self.logger.record(
+            "reward/normalization_applied_mean",
+            self.reward_model.normalization_mean,
+            exclude="stdout",
+        )
+        self.logger.record(
+            "reward/normalization_applied_std",
+            self.reward_model.normalization_std,
+            exclude="stdout",
+        )
+        self.logger.record(
+            "reward/normalization_output_mean",
+            float(np.mean(normalized_rewards)),
+            exclude="stdout",
+        )
+        self.logger.record(
+            "reward/normalization_output_std",
+            float(np.std(normalized_rewards)),
+            exclude="stdout",
+        )
+
     def _log_replay_reward_staleness(self, batch_size: int = 2048) -> None:
         """Compare stored and current rewards on actual replay-buffer entries."""
         replay_buffer = getattr(self.agent, "replay_buffer", None)
@@ -679,6 +741,7 @@ class DemoAlgorithm(BaseAlgorithm):
                 "loss_type": self.loss_type,
                 "temperature": self.temperature,
                 "relabel_rewards": self.relabel_rewards,
+                "normalize_agent_reward": self.normalize_agent_reward,
                 "optimizers": [optimizer.state_dict() for optimizer in self.optimizers],
             },
             os.path.join(ckpt_path, "reward_training.pt"),

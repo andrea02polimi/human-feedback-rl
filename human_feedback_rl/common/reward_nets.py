@@ -205,6 +205,16 @@ class NormalizedRewardNet(RewardNet):
         updated = (1 - self.alpha) * float(self._std) + self.alpha * float(std)
         self._std.fill_(max(updated, 1e-8))
 
+    @property
+    def normalization_mean(self) -> float:
+        """Mean subtracted from agent-facing predictions."""
+        return float(self._mean)
+
+    @property
+    def normalization_std(self) -> float:
+        """Standard deviation used for agent-facing predictions."""
+        return float(self._std)
+
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
     ) -> None:
