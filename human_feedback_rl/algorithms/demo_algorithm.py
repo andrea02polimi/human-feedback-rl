@@ -26,7 +26,7 @@ import numpy as np
 import torch as th
 import torch.nn.functional as F
 from gymnasium import spaces
-from scipy.stats import spearmanr
+from scipy.stats import rankdata, spearmanr
 
 from human_feedback_rl.common.base_algorithm import BaseAlgorithm
 from human_feedback_rl.common.loggers import ExcludeFormatLogger, PrefixedLogger
@@ -46,6 +46,11 @@ class DemoAlgorithm(BaseAlgorithm):
     STATUS_OFFROAD  = 2
     STATUS_TIMEOUT  = 3
     STATUS_RUNNING  = 4
+
+    IMITATION_MAX_TRANSITIONS_PER_CLASS = 5_000
+    IMITATION_CLASSIFIER_STEPS = 100
+    IMITATION_CLASSIFIER_LR = 0.1
+    IMITATION_CLASSIFIER_L2 = 1e-4
 
     VALID_LOSSES = (
         "maxent",
@@ -155,8 +160,11 @@ class DemoAlgorithm(BaseAlgorithm):
         log_interval: int = 1,
         checkpoint_dir: Optional[str] = None,
         checkpoint_interval: int = 10,
+        imitation_diagnostics_interval: int = 10,
     ) -> Any:
         """Run the full alternating reward-learning + agent-training loop."""
+        if imitation_diagnostics_interval < 0:
+            raise ValueError("imitation_diagnostics_interval must be non-negative.")
         n_iterations = int(total_timesteps / timesteps_per_iteration)
 
         # Bootstrap the reward before the agent sees it. This avoids optimizing
@@ -177,6 +185,13 @@ class DemoAlgorithm(BaseAlgorithm):
             exploration_steps = int(self.exploration_frac * timesteps_per_iteration)
             print(f"- Collecting {timesteps_per_iteration} agent + {exploration_steps} exploration transitions")
             self.trajectories = self._sample_rollout(timesteps_per_iteration, exploration_steps)
+
+            should_log_imitation = imitation_diagnostics_interval > 0 and (
+                iteration % imitation_diagnostics_interval == 0
+                or iteration == n_iterations - 1
+            )
+            if should_log_imitation:
+                self._log_imitation_diagnostics()
 
             all_transitions = [t for traj in self.trajectories for t in traj]
             self._log_validation_snapshot(all_transitions, "pre_update")
@@ -598,6 +613,168 @@ class DemoAlgorithm(BaseAlgorithm):
         self.logger.record(
             "rollout/action_component_at_bound_fraction", float(at_bound.mean())
         )
+
+    def _log_imitation_diagnostics(self) -> None:
+        """Log direct expert/agent distribution comparisons.
+
+        These diagnostics never feed back into reward or policy training. The
+        state-action AUC is a classifier two-sample test: 0.5 means held-out
+        expert and agent samples are indistinguishable to a linear classifier,
+        while 1.0 means they are fully separable.
+        """
+        t0 = time.perf_counter()
+
+        auc = self._state_action_classifier_auc(
+            self.expert_trajectories, self.trajectories
+        )
+        if auc is not None:
+            self.logger.record("imitation/state_action_auc", auc)
+
+        self.logger.record_sum(
+            "time/imitation_diagnostics", time.perf_counter() - t0
+        )
+
+    @classmethod
+    def _state_action_classifier_auc(cls, expert_trajectories, agent_trajectories):
+        """Fit a fresh logistic classifier and return held-out AUC.
+
+        Splitting happens at trajectory level to avoid leaking adjacent
+        transitions into both train and validation. Classes are balanced after
+        flattening, so trajectory-length differences cannot determine the AUC.
+        """
+        expert_split = cls._trajectory_train_validation_split(
+            expert_trajectories, seed=0
+        )
+        agent_split = cls._trajectory_train_validation_split(
+            agent_trajectories, seed=1
+        )
+        if expert_split is None or agent_split is None:
+            return None
+
+        expert_train = cls._state_action_features(expert_split[0])
+        expert_validation = cls._state_action_features(expert_split[1])
+        agent_train = cls._state_action_features(agent_split[0])
+        agent_validation = cls._state_action_features(agent_split[1])
+        feature_sets = (
+            expert_train,
+            expert_validation,
+            agent_train,
+            agent_validation,
+        )
+        if any(len(features) == 0 for features in feature_sets):
+            return None
+        if len({features.shape[1] for features in feature_sets}) != 1:
+            return None
+
+        expert_train, agent_train = cls._balance_feature_classes(
+            expert_train, agent_train
+        )
+        expert_validation, agent_validation = cls._balance_feature_classes(
+            expert_validation, agent_validation
+        )
+
+        train_x = np.concatenate([expert_train, agent_train], axis=0)
+        train_y = np.concatenate([
+            np.ones(len(expert_train), dtype=np.float64),
+            np.zeros(len(agent_train), dtype=np.float64),
+        ])
+        validation_x = np.concatenate(
+            [expert_validation, agent_validation], axis=0
+        )
+        validation_y = np.concatenate([
+            np.ones(len(expert_validation), dtype=np.float64),
+            np.zeros(len(agent_validation), dtype=np.float64),
+        ])
+
+        mean = train_x.mean(axis=0)
+        std = train_x.std(axis=0)
+        std = np.where(std > 1e-8, std, 1.0)
+        train_x = (train_x - mean) / std
+        validation_x = (validation_x - mean) / std
+
+        weights = np.zeros(train_x.shape[1], dtype=np.float64)
+        bias = 0.0
+        for _ in range(cls.IMITATION_CLASSIFIER_STEPS):
+            logits = np.clip(train_x @ weights + bias, -30.0, 30.0)
+            probabilities = 1.0 / (1.0 + np.exp(-logits))
+            residual = probabilities - train_y
+            grad_weights = (
+                train_x.T @ residual / len(train_x)
+                + cls.IMITATION_CLASSIFIER_L2 * weights
+            )
+            grad_bias = float(residual.mean())
+            weights -= cls.IMITATION_CLASSIFIER_LR * grad_weights
+            bias -= cls.IMITATION_CLASSIFIER_LR * grad_bias
+
+        scores = validation_x @ weights + bias
+        return cls._binary_auc(validation_y, scores)
+
+    @staticmethod
+    def _trajectory_train_validation_split(trajectories, seed: int):
+        trajectories = [trajectory for trajectory in trajectories if len(trajectory)]
+        if len(trajectories) < 2:
+            return None
+        indices = np.arange(len(trajectories))
+        np.random.default_rng(seed).shuffle(indices)
+        validation_size = max(1, int(round(0.2 * len(indices))))
+        validation_size = min(validation_size, len(indices) - 1)
+        validation_indices = set(indices[:validation_size].tolist())
+        train = [
+            trajectory for index, trajectory in enumerate(trajectories)
+            if index not in validation_indices
+        ]
+        validation = [
+            trajectory for index, trajectory in enumerate(trajectories)
+            if index in validation_indices
+        ]
+        return train, validation
+
+    @staticmethod
+    def _state_action_features(trajectories) -> np.ndarray:
+        rows = []
+        for trajectory in trajectories:
+            for transition in trajectory:
+                if transition.observation is None or transition.action is None:
+                    continue
+                observation = np.asarray(
+                    transition.observation, dtype=np.float64
+                ).reshape(-1)
+                action = np.asarray(
+                    transition.action, dtype=np.float64
+                ).reshape(-1)
+                row = np.concatenate([observation, action])
+                if np.isfinite(row).all():
+                    rows.append(row)
+        if not rows:
+            return np.empty((0, 0), dtype=np.float64)
+        try:
+            return np.stack(rows)
+        except ValueError:
+            return np.empty((0, 0), dtype=np.float64)
+
+    @classmethod
+    def _balance_feature_classes(cls, positive, negative):
+        size = min(
+            len(positive),
+            len(negative),
+            cls.IMITATION_MAX_TRANSITIONS_PER_CLASS,
+        )
+        positive_indices = np.linspace(0, len(positive) - 1, size, dtype=int)
+        negative_indices = np.linspace(0, len(negative) - 1, size, dtype=int)
+        return positive[positive_indices], negative[negative_indices]
+
+    @staticmethod
+    def _binary_auc(labels: np.ndarray, scores: np.ndarray):
+        positive = labels == 1
+        n_positive = int(positive.sum())
+        n_negative = int((~positive).sum())
+        if n_positive == 0 or n_negative == 0:
+            return None
+        ranks = rankdata(scores, method="average")
+        auc = (
+            ranks[positive].sum() - n_positive * (n_positive + 1) / 2
+        ) / (n_positive * n_negative)
+        return float(auc)
 
     def _score_trajectory(self, traj: Trajectory) -> float:
         obs    = np.array([t.observation for t in traj])

@@ -14,6 +14,7 @@ def make_human_output_format(stream=sys.stdout) -> HumanOutputFormat:
 
 
 ITERATION_METRIC_PREFIXES = (
+    "imitation/",
     "reward/",
     "reward_val/",
     "replay_relabel_debug/",
@@ -23,8 +24,8 @@ ITERATION_METRIC_PREFIXES = (
 
 # Keep the automatically generated workspace deliberately small. All other
 # values are still written to W&B history and can be added to custom panels.
-# A maxent_2 run logs 15 common metrics plus its two loss-specific diagnostics:
-# 17 automatic plots, which can be grouped into eight custom workspace panels.
+# A maxent_2 run logs 16 common metrics plus its two loss-specific diagnostics:
+# 18 automatic plots, which can be grouped into nine custom workspace panels.
 VISIBLE_METRICS = (
     # Policy outcome and environment performance.
     "agent/event_rate/successes",
@@ -34,6 +35,8 @@ VISIBLE_METRICS = (
     # SAC stability.
     "agent/train/critic_loss",
     "agent/train/ent_coef",
+    # Direct expert/agent distribution diagnostics.
+    "imitation/state_action_auc",
     # Reward-model stability.
     "reward/loss",
     "reward/weight_norm",
