@@ -9,12 +9,12 @@ from stable_baselines3.common.vec_env import VecNormalize
 from .env_wrappers import ego_status_to_onehot
 
 
-class RewardRelabelReplayBuffer(ReplayBuffer):
-    """Replay buffer with configurable lazy relabelling and staleness diagnostics."""
+class RewardDiagnosticsReplayBuffer(ReplayBuffer):
+    """Standard SB3 replay sampling plus reward-staleness diagnostics."""
 
     STATUS_DIM = 7
 
-    def __init__(self, *args, relabel_rewards: bool = True, **kwargs):
+    def __init__(self, *args, relabel_rewards: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.next_statuses = np.zeros(
             (self.buffer_size, self.n_envs, self.STATUS_DIM), dtype=np.float32
@@ -72,6 +72,27 @@ class RewardRelabelReplayBuffer(ReplayBuffer):
         dones = self.dones[batch_inds, env_indices]
         return self.reward_model.predict(observations, actions, statuses, dones)
 
+    def sample_reward_staleness(self, batch_size: int, rng: np.random.Generator):
+        """Return stored and current rewards for actual replay-buffer entries."""
+        upper_bound = self.buffer_size if self.full else self.pos
+        if upper_bound == 0 or self.reward_model is None:
+            return None
+
+        n_samples = min(batch_size, upper_bound * self.n_envs)
+        flat_indices = rng.choice(upper_bound * self.n_envs, size=n_samples, replace=False)
+        batch_inds = flat_indices // self.n_envs
+        env_indices = flat_indices % self.n_envs
+        stored = self.rewards[batch_inds, env_indices].copy()
+        current = self._predict_rewards(batch_inds, env_indices)
+        return stored, current
+
+
+class RewardRelabelReplayBuffer(RewardDiagnosticsReplayBuffer):
+    """Replay buffer with configurable lazy relabelling and staleness diagnostics."""
+
+    def __init__(self, *args, relabel_rewards: bool = True, **kwargs):
+        super().__init__(*args, relabel_rewards=relabel_rewards, **kwargs)
+
     def _get_samples(
         self,
         batch_inds: np.ndarray,
@@ -99,17 +120,3 @@ class RewardRelabelReplayBuffer(ReplayBuffer):
             self._normalize_reward(rewards, env),
         )
         return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
-
-    def sample_reward_staleness(self, batch_size: int, rng: np.random.Generator):
-        """Return stored and current rewards for actual replay-buffer entries."""
-        upper_bound = self.buffer_size if self.full else self.pos
-        if upper_bound == 0 or self.reward_model is None:
-            return None
-
-        n_samples = min(batch_size, upper_bound * self.n_envs)
-        flat_indices = rng.choice(upper_bound * self.n_envs, size=n_samples, replace=False)
-        batch_inds = flat_indices // self.n_envs
-        env_indices = flat_indices % self.n_envs
-        stored = self.rewards[batch_inds, env_indices].copy()
-        current = self._predict_rewards(batch_inds, env_indices)
-        return stored, current
