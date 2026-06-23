@@ -96,15 +96,16 @@ class RewardDiagnosticsMixin:
             log_prefix = "reward/maxent"
             loss_expert_term = expert_term
             if self.loss_type == "maxent_corrected":
-                log_q = th.tensor(
-                    [self._traj_log_policy_prob(traj) for traj in model_trajs],
-                    dtype=th.float32,
-                )
-                partition_logits = model_returns / self.temperature - log_q
+                # Mirror the fragment-level partition used by the loss so the
+                # logged partition/ESS/loss match what training actually optimises.
+                frag_expert_returns = self._fragment_returns(self.reward_model, expert_trajs)
+                frag_model_returns = self._fragment_returns(self.reward_model, model_trajs)
+                log_q = self._fragment_log_probs(model_trajs)
+                partition_logits = frag_model_returns / self.temperature - log_q
                 log_prefix = "reward/maxent_corrected"
-                loss_expert_term = expert_term / self.temperature
+                loss_expert_term = -frag_expert_returns.mean() / self.temperature
 
-            partition = th.logsumexp(partition_logits, dim=0) - np.log(len(model_returns))
+            partition = th.logsumexp(partition_logits, dim=0) - np.log(len(partition_logits))
             weights = th.softmax(partition_logits, dim=0)
             top_values = th.topk(weights, k=min(5, len(weights))).values
             ess = 1.0 / weights.pow(2).sum()

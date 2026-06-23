@@ -77,6 +77,7 @@ class DemoAlgorithm(
         batch_size_model: int = 64,
         l2_rew: float = 0.01,
         temperature: float = 1.0,
+        fragment_length: Optional[int] = None,
         initial_agent_timesteps: int = 0,
         exploration_frac: float = 0.0,
         exploration_eps: float = 0.5,
@@ -100,6 +101,12 @@ class DemoAlgorithm(
             )
         if temperature <= 0:
             raise ValueError("temperature must be positive.")
+        if fragment_length is not None and (
+            isinstance(fragment_length, (bool, np.bool_))
+            or not isinstance(fragment_length, (int, np.integer))
+            or fragment_length <= 0
+        ):
+            raise ValueError("fragment_length must be a positive integer or None.")
         if gradient_steps_rew <= 0:
             raise ValueError("gradient_steps_rew must be positive.")
         if batch_size_expert <= 0 or batch_size_model <= 0:
@@ -115,6 +122,9 @@ class DemoAlgorithm(
         self.initial_agent_timesteps = initial_agent_timesteps
         self.exploration_frac = exploration_frac
         self.temperature = temperature
+        self.fragment_length = (
+            None if fragment_length is None else int(fragment_length)
+        )
         self.relabel_rewards = relabel_rewards
         self.normalize_agent_reward = normalize_agent_reward
         self.trajectories = []
