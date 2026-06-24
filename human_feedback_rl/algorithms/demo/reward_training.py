@@ -23,6 +23,7 @@ class RewardTrainingMixin:
         if not self.trajectories:
             return
 
+        self._maxent_corrected_steps = []
         t0 = time.perf_counter()
 
         def train_member(member, optimizer):
@@ -58,6 +59,7 @@ class RewardTrainingMixin:
 
         t0 = time.perf_counter()
         self._log_reward_loss_diagnostics()
+        self._log_maxent_corrected_step_diagnostics()
         self.logger.record("reward/grad_norm", float(np.mean(all_norms)), exclude="stdout")
         self.logger.record("reward/grad_norm_max", float(np.max(all_norms)), exclude="stdout")
         self.logger.record(

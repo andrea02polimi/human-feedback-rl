@@ -244,3 +244,110 @@ class RewardDiagnosticsMixin:
         self.logger.record(f"{log_class}/spearman_returns_defined", is_defined)
         if is_defined:
             self.logger.record(f"{log_class}/spearman_returns", float(rho))
+
+    def _log_maxent_corrected_step_diagnostics(self) -> None:
+        """Log the per-gradient-step ESS/variance decomposition (averaged).
+
+        Faithful to the gradient actually applied (the loss stashes one entry per
+        step on its own random sample), unlike ``_log_reward_loss_diagnostics``
+        which recomputes on a separate deterministic subset.
+        """
+        steps = getattr(self, "_maxent_corrected_steps", None)
+        if not steps:
+            return
+        prefix = "reward/maxent_corrected_grad"
+        for key in steps[0]:
+            mean_value = float(np.mean([step[key] for step in steps]))
+            self.logger.record(f"{prefix}/{key}", mean_value, exclude="stdout")
+        # Worst-case across gradient steps: a mean hides degenerate updates
+        # (e.g. ess [1, 1, 1, 100] looks tolerable on average). Use the fraction
+        # for the worst-case since the number of fragments (N) varies per batch,
+        # so absolute ESS is not comparable across steps.
+        ess = [step["ess"] for step in steps]
+        ess_fraction = [step["ess_fraction"] for step in steps]
+        self.logger.record(f"{prefix}/ess_min", float(np.min(ess)), exclude="stdout")
+        self.logger.record(f"{prefix}/ess_median", float(np.median(ess)), exclude="stdout")
+        self.logger.record(
+            f"{prefix}/ess_fraction_min", float(np.min(ess_fraction)), exclude="stdout"
+        )
+        self.logger.record(
+            f"{prefix}/ess_fraction_median", float(np.median(ess_fraction)), exclude="stdout"
+        )
+        self.logger.record(
+            f"{prefix}/top1_softmax_weight_max",
+            float(np.max([step["top1_softmax_weight"] for step in steps])),
+            exclude="stdout",
+        )
+        self.logger.record(
+            f"{prefix}/logit_var_max",
+            float(np.max([step["logit_var"] for step in steps])),
+            exclude="stdout",
+        )
+
+    def _log_outcome_returns(self) -> None:
+        """Log the discounted return under the *current* reward, by terminal outcome.
+
+        For each terminal status records mean raw, normalized and discounted
+        return plus per-step/terminal reward and length. ``disc_return`` is the
+        discounted sum of the current-model normalized reward: it equals what SAC
+        optimizes only when ``relabel_rewards=True`` (otherwise the critic uses
+        stored rewards from older models) and it excludes SAC's entropy term — so
+        it is a faithful *proxy*, not SAC's exact objective. Still, if offroad has
+        a higher disc_return than arrived, the reward — not SAC — is the problem.
+
+        CAVEAT — for ``timeout`` ``disc_return`` is only a *partial* proxy: SAC
+        treats timeouts as truncations and bootstraps the value beyond the
+        episode, while this sum stops at the last step. The comparison is sound
+        for arrived/offroad/collided (true terminations, no bootstrap).
+        """
+        if not self.trajectories:
+            return
+        gamma = float(getattr(self.agent, "gamma", 1.0))
+        status_names = {
+            self.STATUS_ARRIVED: "arrived",
+            self.STATUS_COLLIDED: "collided",
+            self.STATUS_OFFROAD: "offroad",
+            self.STATUS_TIMEOUT: "timeout",
+            5: "teleported",
+            6: "removed_unknown",
+        }
+        buckets = {name: [] for name in status_names.values()}
+        self.reward_model.eval()
+        with th.no_grad():
+            for traj in self.trajectories:
+                if len(traj) == 0:
+                    continue
+                # Only classify genuine terminal transitions with a valid one-hot;
+                # an all-zero status would otherwise be misread as "arrived".
+                last_status = np.asarray(traj[-1].next_status, dtype=np.float64)
+                if not traj[-1].done or not np.isclose(last_status.sum(), 1.0):
+                    continue
+                name = status_names.get(int(np.argmax(last_status)))
+                if name is None:
+                    continue
+                obs = np.array([t.observation for t in traj], dtype=np.float32)
+                acts = np.array([t.action for t in traj], dtype=np.float32)
+                status = np.array([t.next_status for t in traj], dtype=np.float32)
+                done = np.array([float(t.done) for t in traj], dtype=np.float32)
+                raw = self.reward_model.predict_unnormalized(obs, acts, status, done)
+                norm = self.reward_model.predict(obs, acts, status, done)
+                discounts = gamma ** np.arange(len(norm), dtype=np.float64)
+                buckets[name].append((
+                    float(raw.sum()), float(norm.sum()), float(np.sum(norm * discounts)),
+                    float(norm.mean()), float(norm[-1]), float(len(traj)),
+                ))
+        self.reward_model.train()
+
+        fields = ("raw_return", "norm_return", "disc_return",
+                  "mean_step_reward", "terminal_reward", "length")
+        for name, rows in buckets.items():
+            # Always log count (even 0) so "no episodes of this type" is
+            # distinguishable from "metric not run"; skip only the means.
+            self.logger.record(f"reward/outcome/{name}/count", len(rows), exclude="stdout")
+            if not rows:
+                continue
+            values = np.asarray(rows, dtype=np.float64)
+            for i, field in enumerate(fields):
+                self.logger.record(
+                    f"reward/outcome/{name}/{field}", float(values[:, i].mean()), exclude="stdout"
+                )

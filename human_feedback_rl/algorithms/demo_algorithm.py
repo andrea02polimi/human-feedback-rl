@@ -128,6 +128,8 @@ class DemoAlgorithm(
         self.relabel_rewards = relabel_rewards
         self.normalize_agent_reward = normalize_agent_reward
         self.trajectories = []
+        # Per-gradient-step diagnostics for maxent_corrected (populated by the loss).
+        self._maxent_corrected_steps = []
         self.debug_dataset = debug_dataset or {}
         self._debug_rng = np.random.default_rng(0)
         self._debug_trajectories = self._split_into_trajectories(self.debug_dataset)
@@ -199,6 +201,10 @@ class DemoAlgorithm(
                 or iteration == n_iterations - 1
             )
             if should_log_imitation:
+                # In Python la ricerca degli attributi avviene sull'istanza, non sulla
+                # classe che definisce il metodo. A runtime, quando chiami
+                # _log_imitation_diagnostics, self è sempre un'istanza concreta di
+                # DemoAlgorithm
                 self._log_imitation_diagnostics()
 
             all_transitions = [transition for traj in self.trajectories for transition in traj]
@@ -208,6 +214,7 @@ class DemoAlgorithm(
             self._train_reward_model()
             self._update_agent_reward_normalization()
             self._log_validation_snapshot(all_transitions, "post_update")
+            self._log_outcome_returns()
             self._log_replay_reward_staleness()
 
             print(f"- Training agent for {timesteps_per_iteration} timesteps")

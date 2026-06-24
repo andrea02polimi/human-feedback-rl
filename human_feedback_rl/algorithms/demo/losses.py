@@ -73,17 +73,61 @@ class RewardLossMixin:
         """Importance-corrected MaxEnt NLL with optional fragment-level partition.
 
         With ``fragment_length=None`` each trajectory is a single fragment, which
-        reproduces the historical whole-trajectory formula exactly. Shorter
-        fragments shrink the variance of ``log q`` (which grows with horizon) and
-        keep the importance-sampling effective sample size from collapsing.
+        reproduces the historical whole-trajectory formula exactly (verified
+        bit-for-bit) and is the consistent importance-sampling estimator.
+
+        CAVEAT — ``fragment_length>0`` changes the objective and is NOT proven
+        correct. Fragments are consecutive chunks of one rollout, not i.i.d. draws
+        from a fixed proposal, so the importance-sampling consistency that
+        justifies ``maxent_corrected`` does not transfer to the fragment level.
+        It becomes a *local* (windowed) MaxEnt objective in the spirit of
+        GCL/AIRL: a heuristic for shrinking the ``log q`` variance, whose benefit
+        is unverified. Treat it as experimental, not as "the correct loss".
         """
         expert_trajs, model_trajs = self._sample_trajectories()
         expert_returns = self._fragment_returns(member, expert_trajs)
         model_returns = self._fragment_returns(member, model_trajs)
         log_q = self._fragment_log_probs(model_trajs)
-        corrected_logits = model_returns / self.temperature - log_q
+        scaled_returns = model_returns / self.temperature
+        corrected_logits = scaled_returns - log_q
         partition = th.logsumexp(corrected_logits, dim=0) - np.log(len(corrected_logits))
+        self._record_maxent_corrected_step(scaled_returns, log_q, corrected_logits)
         return -expert_returns.mean() / self.temperature + partition
+
+    def _record_maxent_corrected_step(self, scaled_returns, log_q, logits) -> None:
+        """Stash ESS and variance decomposition of the *actual* gradient sample.
+
+        Lets us see which term inflates the partition-logit spread that controls
+        the importance-sampling ESS: ``Var(R/τ)`` (reward scale) vs ``Var(log q)``
+        (proposal/horizon), with their covariance. Logged (averaged) by the
+        reward-training loop, so it reflects the gradient that was really applied.
+        """
+        if not hasattr(self, "_maxent_corrected_steps"):
+            self._maxent_corrected_steps = []
+        with th.no_grad():
+            n = logits.shape[0]
+            weights = th.softmax(logits, dim=0)
+            ess = float(1.0 / weights.pow(2).sum())
+            top_k = th.topk(weights, k=min(5, n)).values
+            var_scaled = float(scaled_returns.var(unbiased=False))
+            var_log_q = float(log_q.var(unbiased=False))
+            if n > 1:
+                cov = float(
+                    ((scaled_returns - scaled_returns.mean()) * (log_q - log_q.mean())).mean()
+                )
+            else:
+                cov = 0.0
+            self._maxent_corrected_steps.append({
+                "ess": ess,
+                "ess_fraction": ess / n,
+                "n_fragments": float(n),
+                "top1_softmax_weight": float(weights.max()),
+                "top5_softmax_mass": float(top_k.sum()),
+                "logit_var": float(logits.var(unbiased=False)),
+                "var_scaled_return": var_scaled,
+                "var_log_q": var_log_q,
+                "cov_return_log_q": cov,
+            })
 
     @staticmethod
     def _demo_corrected_margins(expert_returns, model_returns, expert_trajs, model_trajs):
