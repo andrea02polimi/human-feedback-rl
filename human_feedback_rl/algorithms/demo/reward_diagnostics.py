@@ -3,6 +3,7 @@
 import numpy as np
 import torch as th
 import torch.nn.functional as F
+import wandb
 from scipy.stats import spearmanr
 
 from human_feedback_rl.common.types import Trajectory
@@ -244,6 +245,42 @@ class RewardDiagnosticsMixin:
         self.logger.record(f"{log_class}/spearman_returns_defined", is_defined)
         if is_defined:
             self.logger.record(f"{log_class}/spearman_returns", float(rho))
+
+    def _log_return_scatter(self, trajectories, log_class: str, iteration: int) -> None:
+        """Log a W&B image scatter of per-trajectory returns: x = predicted
+        (current reward model), y = true.
+
+        Logged as ``wandb.Image`` (not ``wandb.plot.scatter``) so every step is
+        retained in the media panel: the slider scrubs the historical scatters
+        instead of overwriting them. ``commit=False`` attaches the image to the
+        iteration's pending log so it shares the step of the rest of the metrics.
+        The y-limits are derived from the (fixed) true returns so every frame
+        shares a stable vertical reference; x autoscales with the model.
+        """
+        if wandb.run is None or len(trajectories) < 2:
+            return
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        true_returns, pred_returns = [], []
+        for traj in trajectories:
+            _, pred_rewards, _, _ = self._run_reward_inference(traj)
+            true_returns.append(float(sum(t.true_reward for t in traj)))
+            pred_returns.append(float(pred_rewards.sum()))
+
+        fig, ax = plt.subplots(figsize=(5, 5))
+        ax.scatter(pred_returns, true_returns, alpha=0.6)
+        ax.set_xlabel("predicted return (current reward model)")
+        ax.set_ylabel("true return")
+        ax.set_title(f"{log_class} iter {iteration}")
+        y_min, y_max = min(true_returns), max(true_returns)
+        y_pad = 0.05 * (y_max - y_min) if y_max > y_min else 1.0
+        ax.set_ylim(y_min - y_pad, y_max + y_pad)
+        try:
+            wandb.log({f"{log_class}/return_scatter": wandb.Image(fig)}, commit=False)
+        finally:
+            plt.close(fig)
 
     def _log_maxent_corrected_step_diagnostics(self) -> None:
         """Log the per-gradient-step ESS/variance decomposition (averaged).

@@ -168,10 +168,15 @@ class DemoAlgorithm(
         checkpoint_dir: Optional[str] = None,
         checkpoint_interval: int = 10,
         imitation_diagnostics_interval: int = 10,
+        scatter_interval: Optional[int] = None,
     ) -> Any:
         """Run the full alternating reward-learning and agent-training loop."""
         if imitation_diagnostics_interval < 0:
             raise ValueError("imitation_diagnostics_interval must be non-negative.")
+        if scatter_interval is None:
+            scatter_interval = imitation_diagnostics_interval
+        if scatter_interval < 0:
+            raise ValueError("scatter_interval must be non-negative.")
         n_iterations = int(total_timesteps / timesteps_per_iteration)
 
         if self.initial_agent_timesteps > 0:
@@ -216,6 +221,16 @@ class DemoAlgorithm(
             self._log_validation_snapshot(all_transitions, "post_update")
             self._log_outcome_returns()
             self._log_replay_reward_staleness()
+
+            should_log_scatter = self.debug_dataset and scatter_interval > 0 and (
+                iteration % scatter_interval == 0 or iteration == n_iterations - 1
+            )
+            if should_log_scatter:
+                self._log_return_scatter(
+                    self._debug_trajectories,
+                    "reward_val/debug_dataset/post_update",
+                    iteration,
+                )
 
             print(f"- Training agent for {timesteps_per_iteration} timesteps")
             self._train_agent(timesteps_per_iteration, log_interval)
