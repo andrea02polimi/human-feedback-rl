@@ -278,7 +278,10 @@ class RewardDiagnosticsMixin:
         y_pad = 0.05 * (y_max - y_min) if y_max > y_min else 1.0
         ax.set_ylim(y_min - y_pad, y_max + y_pad)
         try:
-            wandb.log({f"{log_class}/return_scatter": wandb.Image(fig)}, commit=False)
+            wandb.log({
+                "iterations": iteration,
+                f"{log_class}/return_scatter": wandb.Image(fig),
+            }, commit=True)
         finally:
             plt.close(fig)
 
