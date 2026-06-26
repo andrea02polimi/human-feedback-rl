@@ -217,3 +217,14 @@ expert_policies/
 
 wandb/
 project
+
+*.DS_Store
+
+*.aux
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz
+*.tex
+*.yml
+*.pkl
