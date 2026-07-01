@@ -255,7 +255,8 @@ class RewardDiagnosticsMixin:
         instead of overwriting them. ``commit=False`` attaches the image to the
         iteration's pending log so it shares the step of the rest of the metrics.
         The y-limits are derived from the (fixed) true returns so every frame
-        shares a stable vertical reference; x autoscales with the model.
+        shares a stable vertical reference; x is the predicted return after a
+        global affine alignment to the true-reward scale (running steps).
         """
         if wandb.run is None or len(trajectories) < 2:
             return
@@ -263,15 +264,78 @@ class RewardDiagnosticsMixin:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        true_returns, pred_returns = [], []
+        class_names = {
+            self.STATUS_ARRIVED: "arrived",
+            self.STATUS_COLLIDED: "collided",
+            self.STATUS_OFFROAD: "offroad",
+            self.STATUS_TIMEOUT: "timeout",
+        }
+
+        colors = {
+            "arrived": "tab:green",
+            "collided": "tab:red",
+            "offroad": "tab:orange",
+            "timeout": "tab:blue",
+            "other": "tab:gray",
+        }
+
+        true_returns, outcomes = [], []
+        pred_step_lists, true_step_lists, running_lists, traj_lengths = [], [], [], []
+
         for traj in trajectories:
-            _, pred_rewards, _, _ = self._run_reward_inference(traj)
-            true_returns.append(float(sum(t.true_reward for t in traj)))
-            pred_returns.append(float(pred_rewards.sum()))
+            true_rewards, pred_rewards, _, status = self._run_reward_inference(traj)
+            true_returns.append(float(true_rewards.sum()))
+            pred_step_lists.append(np.asarray(pred_rewards, dtype=np.float64))
+            true_step_lists.append(np.asarray(true_rewards, dtype=np.float64))
+            running_lists.append(status[:, self.STATUS_RUNNING] == 1)
+            traj_lengths.append(len(pred_rewards))
+
+            final_status = np.asarray(traj[-1].next_status)
+            outcome = (
+                class_names.get(int(np.argmax(final_status)), "other")
+                if np.isclose(final_status.sum(), 1.0)
+                else "other"
+            )
+            outcomes.append(outcome)
+
+        # A single global affine maps step-level predictions onto the true-reward
+        # scale, fitted on RUNNING steps only (terminal rewards stay the signal we
+        # want to reconstruct). One shift/scale shared by every trajectory, so the
+        # cross-trajectory ranking is untouched and only the x-axis units change.
+        pred_steps = np.concatenate(pred_step_lists) * float(self.temperature)
+        true_steps = np.concatenate(true_step_lists)
+        running = np.concatenate(running_lists)
+        ref = running if running.any() else np.ones(len(pred_steps), dtype=bool)
+
+        pred_mean, true_mean = pred_steps[ref].mean(), true_steps[ref].mean()
+        pred_std, true_std = pred_steps[ref].std(), true_steps[ref].std()
+        scale = (true_std / pred_std) if pred_std > 1e-8 else 1.0
+        shift = true_mean - scale * pred_mean
+
+        pred_returns = np.asarray([
+            scale * (float(self.temperature) * p.sum()) + shift * n
+            for p, n in zip(pred_step_lists, traj_lengths)
+        ])
 
         fig, ax = plt.subplots(figsize=(5, 5))
-        ax.scatter(pred_returns, true_returns, alpha=0.6)
-        ax.set_xlabel("predicted return (current reward model)")
+
+        true_returns = np.asarray(true_returns)
+        pred_returns = np.asarray(pred_returns)
+        outcomes = np.asarray(outcomes)
+
+        for outcome, color in colors.items():
+            mask = outcomes == outcome
+            if mask.any():
+                ax.scatter(
+                    pred_returns[mask],
+                    true_returns[mask],
+                    color=color,
+                    label=outcome,
+                    alpha=0.7,
+                )
+
+        ax.legend(title="Final outcome")
+        ax.set_xlabel("predicted return (aligned to true, running-step affine)")
         ax.set_ylabel("true return")
         ax.set_title(f"{log_class} iter {iteration}")
         y_min, y_max = min(true_returns), max(true_returns)
