@@ -6,7 +6,6 @@ import torch
 from human_feedback_rl.common import Transition, Trajectory
 from human_feedback_rl.common.base_algorithm import BaseAlgorithm
 from human_feedback_rl.common.loggers import (
-    PrefixedLogger,
     WandbWriter,
     make_human_output_format,
 )
@@ -17,6 +16,11 @@ try:
 except ImportError:
     RuleBasedPolicy = None
     _ModelPolicy    = None
+
+try:
+    from sumo_gym_ego import EgoStatus
+except ImportError:
+    EgoStatus = None
 
 
 class DaggerAlgorithm(BaseAlgorithm):
@@ -41,6 +45,7 @@ class DaggerAlgorithm(BaseAlgorithm):
         bc_batch_size: int = 64,
         bc_lr: float = 1e-3,
         n_eval_episodes: int = 5,
+        n_expert_rollout_episodes: int = 5,
         beta_decay: float = 0.7,
         rng: Optional[np.random.Generator] = None,
         log_folder: Optional[str] = None,
@@ -50,9 +55,11 @@ class DaggerAlgorithm(BaseAlgorithm):
 
         self.expert          = expert
         self.dataset         = []
+        self.dataset_expert  = []
         self.bc_epochs       = bc_epochs
         self.bc_batch_size   = bc_batch_size
         self.n_eval_episodes = n_eval_episodes
+        self.n_expert_rollout_episodes = n_expert_rollout_episodes
         self.beta_decay      = beta_decay
         self.discrete_actions = hasattr(env.action_space, "n")
 
@@ -66,11 +73,6 @@ class DaggerAlgorithm(BaseAlgorithm):
 
         self._optimizer = torch.optim.Adam(agent.parameters(), lr=bc_lr)
 
-        self._bc_log     = PrefixedLogger(self.logger, prefix="bc")
-        self._dagger_log = PrefixedLogger(self.logger, prefix="dagger")
-        self._train_log  = PrefixedLogger(self.logger, prefix="train")
-        self._eval_log   = PrefixedLogger(self.logger, prefix="eval")
-
     def _output_formats(self) -> list:
         return [make_human_output_format(), WandbWriter()]
 
@@ -81,6 +83,15 @@ class DaggerAlgorithm(BaseAlgorithm):
     def train(self, n_rounds: int, num_episodes: int):
         cumulative_bc_epochs    = 0
         cumulative_eval_episodes = 0
+
+        # Fixed held-out expert dataset (pure-expert rollouts, beta=1) collected
+        # once so the imitation error is measured against a stable reference
+        # instead of the growing, mixture-visited aggregated dataset.
+        print(f"[setup] Collecting expert rollouts ({self.n_expert_rollout_episodes} episodes)...")
+        expert_trajectories, _ = self._collect_trajectories(self.n_expert_rollout_episodes, beta=1.0)
+        for traj in expert_trajectories:
+            self.dataset_expert.extend(traj)
+        print(f"[setup] Expert dataset collected ({len(self.dataset_expert)} transitions).")
 
         for round_idx in range(n_rounds):
             beta = self._beta_schedule(round_idx)
@@ -95,9 +106,9 @@ class DaggerAlgorithm(BaseAlgorithm):
                 f"expert_usage={collect_stats['expert_usage']:.3f}"
             )
 
-            # 2) Aggregate dataset
+            # 2) Aggregate dataset (Trajectory is a list subclass of Transition)
             for traj in trajectories:
-                self.dataset.extend(traj.transitions)
+                self.dataset.extend(traj)
             print(f"[2/3] Dataset aggregated (total transitions: {len(self.dataset)})...")
 
             # 3) Behaviour cloning on aggregated dataset
@@ -111,30 +122,50 @@ class DaggerAlgorithm(BaseAlgorithm):
 
             # 4) Evaluate agent
             eval_stats = self._evaluate(self.n_eval_episodes)
+            event_rates = eval_stats["event_rates"]
             print(
                 f"      eval — mean_reward={eval_stats['mean_ep_reward']:.3f}  "
                 f"mean_length={eval_stats['mean_ep_length']:.1f}"
+            )
+            print(
+                f"      events — success={event_rates['successes']:.2%}  "
+                f"collision={event_rates['collisions']:.2%}  "
+                f"off_road={event_rates['off_road']:.2%}  "
+                f"timeout={event_rates['timeouts']:.2%}"
+            )
+
+            # 5) Imitation errors against the fixed expert dataset
+            imitation_stats = self._log_imitation_errors()
+            print(
+                f"      imitation — nll={imitation_stats['expert_action_nll']:.4f}  "
+                f"{imitation_stats['error_name']}={imitation_stats['action_error']:.4f}"
             )
 
             cumulative_bc_epochs     += self.bc_epochs
             cumulative_eval_episodes += self.n_eval_episodes
 
-            self._dagger_log.record("beta",              beta)
-            self._dagger_log.record("dataset_size",      len(self.dataset))
-            self._dagger_log.record("expert_usage",      collect_stats["expert_usage"])
-            self._dagger_log.record("disagreement_rate", collect_stats["disagreement_rate"])
-            self._dagger_log.record("round_reward",      collect_stats["round_reward"])
+            self.logger.record("dagger/beta",              beta)
+            self.logger.record("dagger/dataset_size",      len(self.dataset))
+            self.logger.record("dagger/expert_usage",      collect_stats["expert_usage"])
+            self.logger.record("dagger/disagreement_rate", collect_stats["disagreement_rate"])
+            self.logger.record("dagger/round_reward",      collect_stats["round_reward"])
 
-            self._bc_log.record("loss",          bc_stats["loss"])
-            self._bc_log.record("log_prob_mean", bc_stats["log_prob_mean"])
-            self._bc_log.record("entropy",       bc_stats["entropy"])
+            self.logger.record("bc/loss",          bc_stats["loss"])
+            self.logger.record("bc/log_prob_mean", bc_stats["log_prob_mean"])
+            self.logger.record("bc/entropy",       bc_stats["entropy"])
 
-            self._train_log.record("grad_norm", bc_stats["grad_norm"])
-            self._train_log.record("lr",        bc_stats["lr"])
+            self.logger.record("train/grad_norm", bc_stats["grad_norm"])
+            self.logger.record("train/lr",        bc_stats["lr"])
 
-            self._eval_log.record("mean_ep_reward", eval_stats["mean_ep_reward"])
-            self._eval_log.record("mean_ep_length", eval_stats["mean_ep_length"])
+            self.logger.record("eval/mean_ep_reward", eval_stats["mean_ep_reward"])
+            self.logger.record("eval/mean_ep_length", eval_stats["mean_ep_length"])
 
+            self.logger.record("eval/event_rate/successes",  event_rates["successes"])
+            self.logger.record("eval/event_rate/collisions", event_rates["collisions"])
+            self.logger.record("eval/event_rate/off_road",   event_rates["off_road"])
+            self.logger.record("eval/event_rate/timeouts",   event_rates["timeouts"])
+
+            self.logger.record("iterations",      round_idx + 1)
             self.logger.record("num_rounds",      round_idx + 1)
             self.logger.record("bc_epochs",       cumulative_bc_epochs)
             self.logger.record("n_eval_episodes", cumulative_eval_episodes)
@@ -203,7 +234,11 @@ class DaggerAlgorithm(BaseAlgorithm):
 
                 total_reward += float(reward[0])
                 episode_data.append(
-                    Transition(obs=obs[0].copy(), action=expert_action_for_transition, reward=float(reward[0]))
+                    Transition(
+                        observation=obs[0].copy(),
+                        action=expert_action_for_transition,
+                        true_reward=float(reward[0]),
+                    )
                 )
                 obs = next_obs
 
@@ -225,7 +260,7 @@ class DaggerAlgorithm(BaseAlgorithm):
         if not self.dataset:
             return empty_stats
 
-        obs_t = torch.as_tensor(np.stack([t.obs for t in self.dataset]).astype(np.float32))
+        obs_t = torch.as_tensor(np.stack([t.observation for t in self.dataset]).astype(np.float32))
         if self.discrete_actions:
             act_t = torch.as_tensor(np.array([t.action for t in self.dataset], dtype=np.int64))
         else:
@@ -265,10 +300,65 @@ class DaggerAlgorithm(BaseAlgorithm):
             "lr":            self._get_lr(),
         }
 
+    def _log_imitation_errors(self) -> dict:
+        """Agent-vs-expert imitation errors over the fixed expert dataset.
+
+        Records two metrics on the ``imitation`` logger (and thus W&B):
+
+        * ``imitation/expert_action_nll`` — mean negative log-likelihood of the
+          expert actions under the agent policy (KL surrogate: it equals the
+          cross-entropy H(expert, agent), differing from the true KL only by the
+          expert's entropy, constant w.r.t. the agent).
+        * ``imitation/action_rmse`` (continuous) or ``imitation/action_accuracy``
+          (discrete) — deterministic agent action vs the expert action.
+        """
+        empty_stats = {
+            "expert_action_nll": 0.0,
+            "action_error": 0.0,
+            "error_name": "action_accuracy" if self.discrete_actions else "action_rmse",
+        }
+        if not self.dataset_expert:
+            return empty_stats
+
+        obs_np = np.stack([t.observation for t in self.dataset_expert]).astype(np.float32)
+        obs_t = torch.as_tensor(obs_np)
+        if self.discrete_actions:
+            act_t = torch.as_tensor(np.array([t.action for t in self.dataset_expert], dtype=np.int64))
+        else:
+            act_t = torch.as_tensor(np.stack([t.action for t in self.dataset_expert]).astype(np.float32))
+
+        # NLL surrogate via the same evaluate_actions path used for BC training.
+        with torch.no_grad():
+            _, log_prob, _ = self.agent.evaluate_actions(obs_t, act_t)
+        finite = torch.isfinite(log_prob)
+        nll = float(-log_prob[finite].mean().item()) if finite.any() else 0.0
+
+        # Deterministic action error: accuracy for discrete, RMSE for continuous.
+        agent_actions, _ = self.agent.predict(obs_np, deterministic=True)
+        if self.discrete_actions:
+            expert_actions = act_t.numpy()
+            action_error = float(np.mean(agent_actions.reshape(-1) == expert_actions.reshape(-1)))
+            error_name = "action_accuracy"
+        else:
+            expert_actions = act_t.numpy().reshape(len(obs_np), -1)
+            agent_actions = np.asarray(agent_actions, dtype=np.float64).reshape(len(obs_np), -1)
+            action_error = float(np.sqrt(np.mean((agent_actions - expert_actions) ** 2)))
+            error_name = "action_rmse"
+
+        self.logger.record("imitation/expert_action_nll", nll)
+        self.logger.record(f"imitation/{error_name}", action_error)
+
+        return {"expert_action_nll": nll, "action_error": action_error, "error_name": error_name}
+
     def _evaluate(self, n_eval_episodes: int) -> dict:
-        """Run the agent deterministically for n_eval_episodes and return stats."""
+        """Run the agent deterministically for n_eval_episodes and return stats.
+
+        Alongside reward/length, tallies the four mutually exclusive terminal
+        outcomes (arrived, collided, off_road, timeout) into per-episode rates.
+        """
         total_reward = 0.0
         total_length = 0
+        events = {"successes": 0, "collisions": 0, "off_road": 0, "timeouts": 0}
 
         for _ in range(n_eval_episodes):
             obs = self.env.reset()
@@ -277,24 +367,34 @@ class DaggerAlgorithm(BaseAlgorithm):
             done      = np.zeros(self.env.num_envs, dtype=bool)
             ep_reward = 0.0
             ep_length = 0
+            info      = {}
 
             while not done[0]:
                 action, _ = self.agent.predict(obs, deterministic=True)
                 step_result = self.env.step(action)
                 if len(step_result) == 5:
-                    obs, reward, terminated, truncated, _ = step_result
+                    obs, reward, terminated, truncated, infos = step_result
                     done = terminated | truncated
                 else:
-                    obs, reward, done, _ = step_result
+                    obs, reward, done, infos = step_result
+                info = infos[0] if len(infos) else {}
                 ep_reward += float(reward[0])
                 ep_length += 1
 
             total_reward += ep_reward
             total_length += ep_length
 
+            if EgoStatus is not None:
+                ego_status = info.get("ego_status", EgoStatus.RUNNING)
+                events["successes"]  += int(ego_status == EgoStatus.ARRIVED.value)
+                events["collisions"] += int(ego_status == EgoStatus.COLLIDED.value)
+                events["off_road"]   += int(ego_status == EgoStatus.OFF_ROAD.value)
+                events["timeouts"]   += int(ego_status == EgoStatus.TIMEOUT.value)
+
         return {
             "mean_ep_reward": total_reward / n_eval_episodes,
             "mean_ep_length": total_length / n_eval_episodes,
+            "event_rates": {k: v / n_eval_episodes for k, v in events.items()},
         }
 
     def _get_lr(self) -> float:
