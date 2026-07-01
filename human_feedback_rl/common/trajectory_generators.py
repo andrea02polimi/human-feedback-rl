@@ -216,7 +216,7 @@ def policy_action_log_probs(policy: Any, obs: np.ndarray, actions: np.ndarray) -
     obs_tensor, _ = sb3_policy.obs_to_tensor(obs)
 
     with th.no_grad():
-        if hasattr(sb3_policy, "evaluate_actions"):
+        if hasattr(sb3_policy, "evaluate_actions"): # PPO
             action_tensor = th.as_tensor(actions, device=sb3_policy.device)
             if isinstance(policy.action_space, spaces.Discrete):
                 action_tensor = action_tensor.long().flatten()
@@ -243,16 +243,23 @@ def policy_action_log_probs(policy: Any, obs: np.ndarray, actions: np.ndarray) -
                     log_prob = component_log_prob.sum(dim=1)
                 else:
                     _, log_prob, _ = sb3_policy.evaluate_actions(obs_tensor, action_tensor)
-        elif hasattr(policy, "actor"):
+        elif hasattr(policy, "actor"): # SAC
+            # sac parte da una gaussiana, ma poi applica una funzione tanh per limitare le azioni in [-1, 1]. La log-probabilità della gaussiana non è la stessa della log-probabilità dopo la trasformazione tanh.
+
+
+            # L'ATTORE DI SAC PRODUCE AZIONI CHE SONO [-1, 1] PER OGNI DIMENSIONE. DOBBIAMO SCALARE LE AZIONI DELL'AMBIENTE IN QUESTO INTERVALLO PRIMA DI VALUTARE LA LOG-PROBABILITÀ.
             scaled_actions = sb3_policy.scale_action(np.asarray(actions))
             action_tensor = th.as_tensor(scaled_actions, dtype=th.float32, device=sb3_policy.device)
+            # LA POLICY è UNA DISTRIBUZIONE CONDIZIONATA ALLO STATO, QUINDI QUI STAMO DICENDO PER CIASCUNA OSSERVAZIONE DIMMI LA DISTRIBUZIONE DELLE AZIONI
             mean, log_std, kwargs = policy.actor.get_action_dist_params(obs_tensor)
             distribution = policy.actor.action_dist.proba_distribution(mean, log_std, **kwargs)
+            # CALCOLIAMO QUANTO è PROBABILE CHE QUESTA DISTRIBUZIONE GENERI PROPRIO L'AZIONE
             log_prob = distribution.log_prob(action_tensor)
             # SAC's density is in normalized action coordinates. Convert it to
             # the environment action measure used by the trajectory objective.
             action_scale = (policy.action_space.high - policy.action_space.low) / 2.0
-            log_prob = log_prob - float(np.log(action_scale).sum())
+            # CONVERTIAMO LA DENSITà DAL SISTE,MA INTERNO DI SAC AL SISTEMA DELL'AMBIENTE
+            log_prob = log_prob - float(np.log(action_scale).sum()) # jacobian 
         else:
             raise TypeError(f"Unsupported policy type for log-prob evaluation: {type(policy).__name__}")
 

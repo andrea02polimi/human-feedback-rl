@@ -212,6 +212,10 @@ class DemoAlgorithm(
                 # DemoAlgorithm
                 self._log_imitation_diagnostics()
 
+            # Direct expert-imitation errors (RMSE + KL-proxy NLL) are cheap
+            # relative to the AUC classifier, so log them every iteration.
+            self._log_expert_imitation_errors()
+
             all_transitions = [transition for traj in self.trajectories for transition in traj]
             self._log_validation_snapshot(all_transitions, "pre_update")
 
