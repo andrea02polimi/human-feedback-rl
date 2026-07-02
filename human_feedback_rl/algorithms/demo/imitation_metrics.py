@@ -55,10 +55,15 @@ class ImitationMetricsMixin:
         )
         # Errore per dimensione (per una singola azione == |agente - esperto| su ciascuna dimensione).
         per_dim_error = np.sqrt(squared_error[batch_indices])
-        print(f"[imitation] action_rmse per dimensione di {batch_size} azioni casuali:")
+        print(f"[imitation] azione agente vs esperto (e RMSE) per dimensione di {batch_size} azioni casuali:")
         for index, errors in zip(batch_indices, per_dim_error):
-            formatted = ", ".join(f"{value:.6f}" for value in errors)
-            print(f"  azione {index}: [{formatted}]")
+            agent_formatted = ", ".join(f"{value:.6f}" for value in agent_actions[index])
+            expert_formatted = ", ".join(f"{value:.6f}" for value in expert_actions[index])
+            error_formatted = ", ".join(f"{value:.6f}" for value in errors)
+            print(f"  azione {index}:")
+            print(f"    agente:  [{agent_formatted}]")
+            print(f"    esperto: [{expert_formatted}]")
+            print(f"    rmse:    [{error_formatted}]")
         per_dim_rmse = np.sqrt(np.mean(squared_error, axis=0))
         for dim, value in enumerate(per_dim_rmse):
             self.logger.record(f"imitation/action_rmse_dim{dim}", float(value))
