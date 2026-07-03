@@ -244,6 +244,7 @@ class DemoAlgorithm2(
             # 3. Policy update: weighted behavior cloning toward q_t * exp(R).
             print(f"- Weighted behavior cloning ({self.gradient_steps_policy} steps)")
             self._weighted_behavior_cloning()
+            self._log_policy_stats()
 
             self._log_iteration(t_iter, iteration)
             if checkpoint_dir is not None and (iteration + 1) % checkpoint_interval == 0:
@@ -266,13 +267,25 @@ class DemoAlgorithm2(
         rollout_agent(self.policy, self._buffering, agent_steps, deterministic_policy=False)
         trajectories = _get_trajectories(self._buffering.pop_finished_trajectories(), agent_steps)
         t_sample = time.perf_counter() - t0
-        self._num_env_steps += sum(len(traj) for traj in trajectories)
+        # Advance the timestep counter by the *requested* steps, not the actual
+        # collected count. rollout_agent overshoots by a run-dependent amount
+        # (it finishes in-flight episodes), so the actual count differs across
+        # seeds and would misalign the x-axis, breaking W&B group min/max bands.
+        # The nominal schedule is identical across seeds -> bands render, and it
+        # matches SAC's deterministic ``num_timesteps`` semantics.
+        collected = sum(len(traj) for traj in trajectories)
+        self._num_env_steps += agent_steps
+        self.logger.record("rollout/collected_transitions", collected, exclude="stdout")
 
         t0 = time.perf_counter()
         true_rewards = [traj.total_reward() for traj in trajectories]
         model_rewards = [self._score_trajectory(traj) for traj in trajectories]
         lengths = [len(traj) for traj in trajectories]
-        self.logger.record("rollout/mean_true_reward", float(np.mean(true_rewards)))
+        mean_true_reward = float(np.mean(true_rewards))
+        self.logger.record("rollout/mean_true_reward", mean_true_reward)
+        # Twin under an ``agent/*`` name so the same series is also available with
+        # ``agent/time/total_timesteps`` as the x-axis (``rollout/*`` uses iterations).
+        self.logger.record("agent/rollout/mean_true_reward", mean_true_reward)
         self.logger.record("rollout/mean_model_reward", float(np.mean(model_rewards)))
         self.logger.record("rollout/mean_length", float(np.mean(lengths)))
         self._log_action_boundaries(trajectories)
@@ -317,7 +330,7 @@ class DemoAlgorithm2(
             losses.append(float(loss.detach()))
         self.policy.eval()
 
-        self._log_bc_diagnostics(scores, weights, losses, len(expert_trajs))
+        self._log_bc_diagnostics(scores, weights, losses, batch, len(expert_trajs))
         self.logger.record("time/weighted_bc", time.perf_counter() - t0)
 
     def _softmax_weights(self, scores: np.ndarray) -> np.ndarray:
@@ -361,6 +374,7 @@ class DemoAlgorithm2(
         scores: np.ndarray,
         weights: np.ndarray,
         losses: List[float],
+        batch: list,
         n_expert: int,
     ) -> None:
         expert_scores = scores[:n_expert]
@@ -378,6 +392,47 @@ class DemoAlgorithm2(
         # Fraction of target weight assigned to expert vs agent samples: a healthy
         # run should not put all mass on the expert (that would be plain BC).
         self.logger.record("bc/weight_mass_expert", float(weights[:n_expert].sum()))
+
+        # How much cloning weight lands on the *agent's own* trajectories, split
+        # by terminal outcome. A rising bc/weight_mass_agent/collisions is the
+        # direct signature of the self-reinforcing spiral: the update is cloning
+        # the agent's collision rollouts.
+        agent_mass = {name: 0.0 for name in ("successes", "collisions", "off_road", "timeouts")}
+        for traj, w in zip(batch[n_expert:], weights[n_expert:]):
+            outcome = self._terminal_outcome(traj)
+            if outcome is not None:
+                agent_mass[outcome] += float(w)
+        for name, mass in agent_mass.items():
+            self.logger.record(f"bc/weight_mass_agent/{name}", mass)
+
+    def _terminal_outcome(self, traj: Trajectory) -> Optional[str]:
+        """Terminal-outcome name of a trajectory, or None if not a clean terminal."""
+        rate_names = {
+            self.STATUS_ARRIVED: "successes",
+            self.STATUS_COLLIDED: "collisions",
+            self.STATUS_OFFROAD: "off_road",
+            self.STATUS_TIMEOUT: "timeouts",
+        }
+        if len(traj) == 0:
+            return None
+        last_status = np.asarray(traj[-1].next_status, dtype=np.float64)
+        if not traj[-1].done or not np.isclose(last_status.sum(), 1.0):
+            return None
+        return rate_names.get(int(np.argmax(last_status)))
+
+    def _log_policy_stats(self) -> None:
+        """Log the policy's action-distribution spread on the current rollout states.
+
+        Falling ``policy/mean_log_std`` / ``policy/gaussian_entropy`` means the
+        policy is collapsing onto the deterministic expert mode — the stiffening
+        that trades closed-loop robustness for tighter action matching.
+        """
+        observations = [t.observation for traj in self.trajectories for t in traj]
+        if not observations:
+            return
+        stats = self.policy.distribution_stats(np.asarray(observations, dtype=np.float32))
+        for name, value in stats.items():
+            self.logger.record(f"policy/{name}", value)
 
     def _log_event_rates(self) -> None:
         """Log terminal-outcome frequencies of the current rollouts.
@@ -401,7 +456,7 @@ class DemoAlgorithm2(
             self.STATUS_OFFROAD: "off_road",
             self.STATUS_TIMEOUT: "timeouts",
         }
-        counts = {name: 0 for name in rate_names.values()}
+        counts = dict.fromkeys(rate_names.values(), 0)
         n_episodes = 0
         for traj in self.trajectories:
             if len(traj) == 0:
@@ -418,7 +473,12 @@ class DemoAlgorithm2(
         if n_episodes == 0:
             return
         for name, count in counts.items():
-            self.logger.record(f"agent/event_rate/{name}", count / n_episodes)
+            rate = count / n_episodes
+            # ``agent/*`` -> x-axis agent/time/total_timesteps; the ``rollout/*``
+            # twin -> x-axis iterations. Logging both lets either be plotted
+            # automatically without a manual custom-panel x-axis change.
+            self.logger.record(f"agent/event_rate/{name}", rate)
+            self.logger.record(f"rollout/event_rate/{name}", rate)
 
     def _save_checkpoint(self, checkpoint_dir: str, iteration: int) -> None:
         """Persist the reward model and the standalone policy (no SB3 agent)."""

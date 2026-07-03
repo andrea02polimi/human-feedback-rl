@@ -20,6 +20,8 @@ ITERATION_METRIC_PREFIXES = (
     "replay_relabel_debug/",
     "rollout/",
     "time/",
+    "bc/",
+    "policy/",
 )
 
 # Keep the automatically generated workspace deliberately small. All other
@@ -32,6 +34,12 @@ VISIBLE_METRICS = (
     "agent/event_rate/collisions",
     "agent/event_rate/off_road",
     "agent/rewards/ep_fast_return",
+    # DemoAlgorithm2 dual-axis twins: the same success rate / true return also
+    # plotted against the alternate x-axis (agent/* -> total_timesteps,
+    # rollout/* -> iterations). Only emitted by the weighted-BC algorithm.
+    "rollout/event_rate/successes",
+    "rollout/mean_true_reward",
+    "agent/rollout/mean_true_reward",
     # SAC stability.
     "agent/train/critic_loss",
     "agent/train/ent_coef",

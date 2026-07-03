@@ -20,6 +20,7 @@ SB3 policy interface used by
 rollout/metric code works unchanged.
 """
 
+import math
 from typing import Optional, Tuple
 
 import numpy as np
@@ -125,6 +126,26 @@ class SquashedGaussianPolicy(nn.Module):
         # Affine-scale Jacobian: d a / d a_tanh = scale (constant).
         log_prob = log_prob - th.log(self._scale).sum()
         return log_prob
+
+    def distribution_stats(self, observation) -> dict:
+        """Spread diagnostics of the pre-squash Gaussian over a set of states.
+
+        A shrinking ``mean_log_std`` / ``gaussian_entropy`` signals the policy
+        collapsing onto the (deterministic) expert mode — the "stiffening" that
+        makes weighted BC brittle in closed loop.
+        """
+        was_training = self.training
+        self.eval()
+        with th.no_grad():
+            _, log_std = self._dist_params(self._obs_tensor(observation))
+        self.train(was_training)
+        # Differential entropy of a diagonal Gaussian, summed over action dims.
+        gaussian_entropy = (log_std + 0.5 * math.log(2 * math.pi * math.e)).sum(dim=-1)
+        return {
+            "mean_log_std": float(log_std.mean()),
+            "mean_std": float(log_std.exp().mean()),
+            "gaussian_entropy": float(gaussian_entropy.mean()),
+        }
 
     def _sample(self, obs_tensor: th.Tensor, deterministic: bool) -> th.Tensor:
         mean, log_std = self._dist_params(obs_tensor)
