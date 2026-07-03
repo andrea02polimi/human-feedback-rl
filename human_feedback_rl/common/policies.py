@@ -147,6 +147,31 @@ class SquashedGaussianPolicy(nn.Module):
             "gaussian_entropy": float(gaussian_entropy.mean()),
         }
 
+    def log_prob_and_entropy(
+        self, obs_tensor: th.Tensor, action_env: th.Tensor
+    ) -> Tuple[th.Tensor, th.Tensor]:
+        """Differentiable ``(log pi(a|s), H(pi(.|s)))`` per sample. Shapes ``(N,)``.
+
+        ``log_prob`` is the squashed density (as in :meth:`log_prob`); the entropy
+        is the differential entropy of the *pre-squash* diagonal Gaussian, summed
+        over action dims. Both flow gradient into the policy, so a weighted-BC loss
+        can add ``- beta * entropy`` to keep the policy from collapsing to a point.
+        """
+        mean, log_std = self._dist_params(obs_tensor)
+        std = log_std.exp()
+
+        a_tanh = ((action_env - self._center) / self._scale).clamp(
+            -1.0 + self.eps, 1.0 - self.eps
+        )
+        pre_tanh = th.atanh(a_tanh)
+        normal = th.distributions.Normal(mean, std)
+        log_prob = normal.log_prob(pre_tanh).sum(dim=-1)
+        log_prob = log_prob - th.log(1.0 - a_tanh.pow(2) + self.eps).sum(dim=-1)
+        log_prob = log_prob - th.log(self._scale).sum()
+
+        entropy = (log_std + 0.5 * math.log(2 * math.pi * math.e)).sum(dim=-1)
+        return log_prob, entropy
+
     def _sample(self, obs_tensor: th.Tensor, deterministic: bool) -> th.Tensor:
         mean, log_std = self._dist_params(obs_tensor)
         if deterministic:

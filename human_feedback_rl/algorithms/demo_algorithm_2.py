@@ -105,6 +105,7 @@ class DemoAlgorithm2(
         gradient_steps_policy: int = 32,
         weight_temperature: float = 1.0,
         standardize_weights: bool = True,
+        ent_coef: float = 0.0,
         policy_kwargs: Optional[dict] = None,
         # -----------------------------------------------------
         initial_reward_timesteps: int = 0,
@@ -127,6 +128,8 @@ class DemoAlgorithm2(
             raise ValueError("temperature must be positive.")
         if weight_temperature <= 0:
             raise ValueError("weight_temperature (eta) must be positive.")
+        if ent_coef < 0:
+            raise ValueError("ent_coef must be non-negative.")
         if gradient_steps_rew <= 0 or gradient_steps_policy <= 0:
             raise ValueError("gradient_steps_rew and gradient_steps_policy must be positive.")
         if batch_size_expert <= 0 or batch_size_model <= 0:
@@ -151,6 +154,7 @@ class DemoAlgorithm2(
         self.gradient_steps_policy = gradient_steps_policy
         self.weight_temperature = weight_temperature
         self.standardize_weights = standardize_weights
+        self.ent_coef = ent_coef
 
         # ``maxent_corrected``-only machinery kept as no-ops so the reused reward
         # mixins (which reference these) behave consistently.
@@ -302,8 +306,14 @@ class DemoAlgorithm2(
 
         Draws the mixed batch ``B = B_E ∪ B_pi`` (samples from ``q_t``), computes
         the softmax importance weights ``w_j ∝ exp(R_theta(tau_j) / eta)``, then
-        maximizes the weighted policy log-likelihood
-        ``sum_j w_j sum_t log pi_phi(a_t^j | s_t^j)``.
+        maximizes the weighted policy log-likelihood plus an optional entropy
+        bonus ``sum_j w_j sum_t [ log pi_phi(a_t^j | s_t^j) + ent_coef * H(pi(.|s_t^j)) ]``.
+
+        The entropy term (``ent_coef > 0``) counteracts the fact that pure
+        maximum-likelihood projection onto a Gaussian discards the intrinsic
+        stochasticity of the target ``q_t * e^R``, letting the policy collapse to a
+        near-deterministic mode. It keeps the policy stochastic, per-step and on
+        the same scale as the log-likelihood term.
         """
         if not self.trajectories:
             return
@@ -318,18 +328,23 @@ class DemoAlgorithm2(
         weights_th = th.as_tensor(weights, dtype=th.float32, device=self.policy.device)
 
         self.policy.train()
-        losses = []
+        losses, entropies = [], []
         for _ in range(self.gradient_steps_policy):
-            log_probs = th.stack([self._policy_traj_log_prob(traj) for traj in batch])
-            loss = -(weights_th * log_probs).sum()
+            stats = [self._policy_traj_stats(traj) for traj in batch]
+            log_probs = th.stack([s[0] for s in stats])
+            traj_entropy = th.stack([s[1] for s in stats])
+            weighted_entropy = (weights_th * traj_entropy).sum()
+            loss = -(weights_th * log_probs).sum() - self.ent_coef * weighted_entropy
             if not th.isfinite(loss):
                 raise FloatingPointError("Non-finite weighted-BC loss.")
             self.policy_optimizer.zero_grad()
             loss.backward()
             self.policy_optimizer.step()
             losses.append(float(loss.detach()))
+            entropies.append(float(weighted_entropy.detach()))
         self.policy.eval()
 
+        self.logger.record("bc/weighted_traj_entropy", float(np.mean(entropies)))
         self._log_bc_diagnostics(scores, weights, losses, batch, len(expert_trajs))
         self.logger.record("time/weighted_bc", time.perf_counter() - t0)
 
@@ -357,13 +372,14 @@ class DemoAlgorithm2(
         done = np.array([float(t.done) for t in traj])
         return float(self.reward_model.predict_unnormalized(obs, acts, status, done).sum())
 
-    def _policy_traj_log_prob(self, traj: Trajectory) -> th.Tensor:
-        """Differentiable ``sum_t log pi_phi(a_t | s_t)`` for one trajectory."""
+    def _policy_traj_stats(self, traj: Trajectory) -> tuple:
+        """Differentiable ``(sum_t log pi(a_t|s_t), sum_t H(pi(.|s_t)))`` for one traj."""
         obs = np.array([t.observation for t in traj], dtype=np.float32)
         actions = np.array([t.action for t in traj], dtype=np.float32).reshape(len(traj), -1)
         obs_tensor = self.policy._obs_tensor(obs)
         action_tensor = th.as_tensor(actions, dtype=th.float32, device=self.policy.device)
-        return self.policy.log_prob(obs_tensor, action_tensor).sum()
+        log_prob, entropy = self.policy.log_prob_and_entropy(obs_tensor, action_tensor)
+        return log_prob.sum(), entropy.sum()
 
     # ------------------------------------------------------------------ #
     # Diagnostics
