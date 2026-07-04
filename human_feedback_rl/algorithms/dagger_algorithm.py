@@ -329,7 +329,7 @@ class DaggerAlgorithm(BaseAlgorithm):
 
         # NLL surrogate via the same evaluate_actions path used for BC training.
         with torch.no_grad():
-            _, log_prob, _ = self.agent.evaluate_actions(obs_t, act_t)
+            _, log_prob, _ = self.agent.evaluate_actions(obs_t, act_t) # questo metodo è ereditato da SB3 self.agent è impostato in base_algorithm.py e in test_dagger.py l'agente è un BCPolicy che estende ActorCriticPolicy di sb3 e non fa override di evaluate_actions quindi viene chiamato quello di ActorCriticPolicy 
         finite = torch.isfinite(log_prob)
         nll = float(-log_prob[finite].mean().item()) if finite.any() else 0.0
 

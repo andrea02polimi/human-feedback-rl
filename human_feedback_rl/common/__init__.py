@@ -3,6 +3,7 @@ from .base_reward_learning_algorithm import BaseRewardLearningAlgorithm, QUERY_S
 from .base_policy import BCPolicy
 from .datasets import PreferenceDataset
 from .reward_nets import RewardNet, RewardEnsemble
+from .gcl import GuidedCostNet
 from .env_wrappers import EnvRewardWrapper
 from .schedules import InverseSchedule
 from .loggers import PrefixedLogger, WandbWriter
@@ -22,6 +23,7 @@ __all__ = [
     "QUERY_SCHEDULES",
     "RewardEnsemble",
     "RewardNet",
+    "GuidedCostNet",
     "EnvRewardWrapper",
     "Fragment",
     "FragmentPair",

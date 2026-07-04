@@ -14,6 +14,9 @@ def make_human_output_format(stream=sys.stdout) -> HumanOutputFormat:
 
 
 ITERATION_METRIC_PREFIXES = (
+    "cost_model/",
+    "eval/",
+    "gcl/",
     "imitation/",
     "reward/",
     "reward_val/",
@@ -30,6 +33,8 @@ ITERATION_METRIC_PREFIXES = (
 # 18 automatic plots, which can be grouped into nine custom workspace panels.
 VISIBLE_METRICS = (
     # Policy outcome and environment performance.
+    "eval/fast_return",
+    "eval/success_rate",
     "agent/event_rate/successes",
     "agent/event_rate/collisions",
     "agent/event_rate/off_road",
@@ -71,6 +76,16 @@ VISIBLE_METRICS = (
     "reward/demo_scale_std",
     "reward/demo_corrected_margin",
     "reward/demo_corrected_scale_std",
+    # Guided Cost Learning.
+    "cost_model/loss",
+    "cost_model/ioc_loss",
+    "cost_model/effective_sample_fraction",
+    "cost_model/top1_importance_weight",
+    "cost_model/expert_softmax_mass",
+    "cost_model/partition_log_term_span",
+    "cost_model/partition_clipped_fraction",
+    "policy/loss",
+    "imitation/expert_action_rmse",
 )
 VISIBLE_METRIC_SET = frozenset(VISIBLE_METRICS)
 
@@ -202,6 +217,7 @@ class PrefixedLogger:
         self._logger = logger
         self.prefix  = prefix.rstrip("/")
         self._data: list = []  # (method_name, key, value, exclude)
+        self.last_values: dict = {}
 
     def _pk(self, key: str) -> str:
         return f"{self.prefix}/{key}"
@@ -216,8 +232,11 @@ class PrefixedLogger:
         self._data.append(("record_sum", self._pk(key), value, exclude))
 
     def dump(self, step=0):
+        if not self._data:
+            return
         keys = [key for _, key, _, _ in self._data]
         for method, key, value, exclude in self._data:
+            self.last_values[key] = value
             getattr(self._logger, method)(key, value, exclude)
         self._data.clear()
         self._logger.dump_keys(keys, step)
