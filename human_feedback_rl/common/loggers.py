@@ -65,6 +65,9 @@ VISIBLE_METRICS = (
     # Corrected MaxEnt loss diagnostics.
     "reward/maxent_corrected_effective_sample_fraction",
     "reward/maxent_corrected_top1_softmax_weight",
+    # Self-normalized MaxEnt (adaptive proposal): return gap → 0 at convergence.
+    "reward/maxent_selfnorm_return_gap",
+    "reward/maxent_selfnorm_scaled_return_gap",
     # Demo loss diagnostics. Only the pair matching the configured loss is
     # emitted, so unused definitions do not create empty panels.
     "reward/demo_margin",

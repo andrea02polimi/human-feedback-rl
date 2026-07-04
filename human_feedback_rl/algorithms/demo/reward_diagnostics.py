@@ -92,6 +92,23 @@ class RewardDiagnosticsMixin:
                 self.reward_model.train()
                 return
 
+            if self.loss_type == "maxent_selfnorm":
+                scaled_returns = all_returns / self.temperature
+                log_q = th.log_softmax(scaled_returns, dim=0)
+                corrected_logits = scaled_returns - log_q
+                partition = th.logsumexp(corrected_logits, dim=0) - np.log(len(corrected_logits))
+                loss = -expert_returns.mean() / self.temperature + partition
+                weights = th.softmax(corrected_logits, dim=0)
+                gap = model_mean - expert_returns.mean()
+                self.logger.record("reward/loss", float(loss), exclude="stdout")
+                self.logger.record("reward/maxent_selfnorm_partition_all", float(partition), exclude="stdout")
+                self.logger.record("reward/maxent_selfnorm_return_gap", float(gap), exclude="stdout")
+                self.logger.record("reward/maxent_selfnorm_scaled_return_gap", float(gap / self.temperature), exclude="stdout")
+                # ≈ 1.0 confirms the proposal collapsed the partition to uniform.
+                self.logger.record("reward/maxent_selfnorm_partition_weight_uniformity", float(weights.max() * len(weights)), exclude="stdout")
+                self.reward_model.train()
+                return
+
             log_q = None
             partition_logits = model_returns
             log_prefix = "reward/maxent"
@@ -386,6 +403,30 @@ class RewardDiagnosticsMixin:
             f"{prefix}/logit_var_max",
             float(np.max([step["logit_var"] for step in steps])),
             exclude="stdout",
+        )
+
+    def _log_maxent_selfnorm_step_diagnostics(self) -> None:
+        """Log the per-gradient-step convergence signal for ``maxent_selfnorm``.
+
+        The adaptive proposal collapses the partition weights to uniform, so ESS
+        is trivially N and useless. What matters is the return gap
+        ``E_model[R] − E_expert[R]`` that the gradient drives to zero: we log its
+        mean and worst-case magnitude across the gradient steps actually applied,
+        plus a uniformity check on the partition weights.
+        """
+        steps = getattr(self, "_maxent_selfnorm_steps", None)
+        if not steps:
+            return
+        prefix = "reward/maxent_selfnorm_grad"
+        for key in steps[0]:
+            mean_value = float(np.mean([step[key] for step in steps]))
+            self.logger.record(f"{prefix}/{key}", mean_value, exclude="stdout")
+        abs_gap = [step["abs_return_gap"] for step in steps]
+        self.logger.record(f"{prefix}/abs_return_gap_max", float(np.max(abs_gap)), exclude="stdout")
+        self.logger.record(f"{prefix}/abs_return_gap_median", float(np.median(abs_gap)), exclude="stdout")
+        weight_unif = [step["partition_weight_max_x_n"] for step in steps]
+        self.logger.record(
+            f"{prefix}/partition_weight_max_x_n_max", float(np.max(weight_unif)), exclude="stdout"
         )
 
     def _log_outcome_returns(self) -> None:

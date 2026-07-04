@@ -10,6 +10,8 @@ Historical losses are preserved as separate configuration choices:
     maxent_2           historical expert+model partition surrogate
     demo / demo_loss    historical difference-of-means loss
     maxent_corrected   importance-corrected MaxEnt negative log-likelihood
+    maxent_selfnorm    MaxEnt with an adaptive self-proposal q=softmax(R/τ);
+                       gradient → 0 at feature matching (agent ≈ expert)
     demo_corrected     bounded ranking loss on mean trajectory rewards
 """
 
@@ -128,8 +130,10 @@ class DemoAlgorithm(
         self.relabel_rewards = relabel_rewards
         self.normalize_agent_reward = normalize_agent_reward
         self.trajectories = []
-        # Per-gradient-step diagnostics for maxent_corrected (populated by the loss).
+        # Per-gradient-step diagnostics for maxent_corrected / maxent_selfnorm
+        # (populated by the loss).
         self._maxent_corrected_steps = []
+        self._maxent_selfnorm_steps = []
         self.debug_dataset = debug_dataset or {}
         self._debug_rng = np.random.default_rng(0)
         self._debug_trajectories = self._split_into_trajectories(self.debug_dataset)

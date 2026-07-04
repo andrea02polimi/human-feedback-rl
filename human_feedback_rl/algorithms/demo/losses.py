@@ -14,6 +14,7 @@ VALID_LOSSES = (
     "demo",
     "demo_loss",
     "maxent_corrected",
+    "maxent_selfnorm",
     "demo_corrected",
 )
 
@@ -49,6 +50,8 @@ class RewardLossMixin:
         # the only one that benefits from (and uses) fragment-level partitioning.
         if self.loss_type == "maxent_corrected":
             return self._maxent_corrected_loss(member)
+        if self.loss_type == "maxent_selfnorm":
+            return self._maxent_selfnorm_loss(member)
 
         expert_returns, model_returns, expert_trajs, model_trajs = self._sample_returns(member)
 
@@ -127,6 +130,64 @@ class RewardLossMixin:
                 "var_scaled_return": var_scaled,
                 "var_log_q": var_log_q,
                 "cov_return_log_q": cov,
+            })
+
+    def _maxent_selfnorm_loss(self, member) -> th.Tensor:
+        """Self-normalized MaxEnt NLL with an adaptive, detached proposal q(τ).
+
+        The partition sample combines agent rollouts and expert demos (as in
+        ``maxent_2``). The importance proposal is the model's *own* softmax over
+        rewards, ``q(τ) = softmax(R_θ(τ)/τ)``, detached: it depends on R_θ but
+        contributes no gradient. Dividing the partition by q (subtracting
+        ``log q``) makes the corrected logits constant in value, so the partition
+        softmax collapses to uniform and
+
+            ∇partition = mean_j ∇R_θ(τ_j)/τ .
+
+        Together with the expert term this yields
+        ``∇L ∝ E_model[∇R_θ] − E_expert[∇R_θ]``, which vanishes at feature
+        matching (agent ≈ expert).
+
+        NOTE — this is NOT a behaviour-policy importance correction like
+        ``maxent_corrected``: q is the adaptive self-proposal, not the sampling
+        density, so ESS/top-weight diagnostics are trivially degenerate here. The
+        resulting gradient equals the ``demo`` loss gradient up to the constant
+        factor ``N_model / N``.
+        """
+        expert_returns, model_returns, _, _ = self._sample_returns(member)
+        all_returns = th.cat([model_returns, expert_returns], dim=0)
+        scaled_returns = all_returns / self.temperature
+        log_q = th.log_softmax(scaled_returns, dim=0).detach()
+        corrected_logits = scaled_returns - log_q
+        partition = th.logsumexp(corrected_logits, dim=0) - np.log(len(corrected_logits))
+        self._record_maxent_selfnorm_step(model_returns, expert_returns, corrected_logits)
+        return -expert_returns.mean() / self.temperature + partition
+
+    def _record_maxent_selfnorm_step(self, model_returns, expert_returns, corrected_logits) -> None:
+        """Stash the convergence signal of the self-normalized MaxEnt gradient.
+
+        The adaptive proposal makes the partition softmax uniform, so ESS/top1
+        are meaningless here. What actually drives (and, at convergence, cancels)
+        the gradient is the return gap ``E_model[R] − E_expert[R]``; we log that
+        plus a uniformity sanity check on the partition weights (``max·N`` should
+        be ≈ 1 once the softmax has collapsed).
+        """
+        if not hasattr(self, "_maxent_selfnorm_steps"):
+            self._maxent_selfnorm_steps = []
+        with th.no_grad():
+            n = corrected_logits.shape[0]
+            weights = th.softmax(corrected_logits, dim=0)
+            model_mean = float(model_returns.mean())
+            expert_mean = float(expert_returns.mean())
+            gap = model_mean - expert_mean
+            self._maxent_selfnorm_steps.append({
+                "return_gap": gap,
+                "scaled_return_gap": gap / self.temperature,
+                "abs_return_gap": abs(gap),
+                "model_return_mean": model_mean,
+                "expert_return_mean": expert_mean,
+                "n_samples": float(n),
+                "partition_weight_max_x_n": float(weights.max()) * n,
             })
 
     @staticmethod
