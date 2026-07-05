@@ -43,8 +43,6 @@ VISIBLE_METRICS = (
     # SAC stability.
     "agent/train/critic_loss",
     "agent/train/ent_coef",
-    # Direct expert/agent distribution diagnostics.
-    "imitation/state_action_auc",
     # Reward-model stability.
     "reward/loss",
     "reward/weight_norm",

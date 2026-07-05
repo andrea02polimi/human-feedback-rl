@@ -205,17 +205,6 @@ class DemoAlgorithm(
                 timesteps_per_iteration, exploration_steps
             )
 
-            should_log_imitation = imitation_diagnostics_interval > 0 and (
-                iteration % imitation_diagnostics_interval == 0
-                or iteration == n_iterations - 1
-            )
-            if should_log_imitation:
-                # In Python la ricerca degli attributi avviene sull'istanza, non sulla
-                # classe che definisce il metodo. A runtime, quando chiami
-                # _log_imitation_diagnostics, self è sempre un'istanza concreta di
-                # DemoAlgorithm
-                self._log_imitation_diagnostics()
-
             # Direct expert-imitation errors (RMSE + KL-proxy NLL) are cheap
             # relative to the AUC classifier, so log them every iteration.
             self._log_expert_imitation_errors()
