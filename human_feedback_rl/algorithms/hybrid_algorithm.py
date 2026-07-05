@@ -263,35 +263,62 @@ class HybridAlgorithm(DemoAlgorithm):
         use_pref = self._use_pref and len(self.dataset_train) > 0
 
         t0 = time.perf_counter()
-        demo_losses, pref_losses, total_losses, grad_norms = [], [], [], []
+        demo_losses, pref_losses, total_losses = [], [], []
+        grad_norms, demo_grad_norms, pref_grad_norms = [], [], []
 
         for member, optimizer in zip(self.reward_model.members, self.optimizers):
             member.train()
             boot = self.dataset_train.bootstrap() if use_pref else None
             for _ in range(self.gradient_steps_rew):
-                loss = th.zeros((), dtype=th.float32)
+                demo_term = None
+                pref_term = None
                 demo_val = float("nan")
                 pref_val = float("nan")
 
                 if self._use_demo:
                     gcl = self._reward_loss(member)
-                    loss = loss + self.lambda_demo * gcl
+                    demo_term = self.lambda_demo * gcl
                     demo_val = float(gcl.detach())
 
                 if use_pref:
                     batch = boot.sample(self.pref_batch_size)
                     pref = self._preference_loss(member, batch)
-                    loss = loss + self.lambda_pref * pref
+                    pref_term = self.lambda_pref * pref
                     pref_val = float(pref.detach())
 
+                loss = th.zeros((), dtype=th.float32)
+                if demo_term is not None:
+                    loss = loss + demo_term
+                if pref_term is not None:
+                    loss = loss + pref_term
                 if not th.isfinite(loss):
                     raise FloatingPointError(
                         f"Non-finite hybrid reward loss (mode={self.mode}): {loss.item()}"
                     )
 
+                # Backprop each source in isolation so their gradient norms are
+                # separable (diagnoses whether the GCL demo gradient dominates the
+                # preference gradient on the shared reward net), then combine for
+                # the actual optimizer step. The demo and preference losses live on
+                # independent forward graphs, so retain_graph lets us reuse them.
                 optimizer.zero_grad()
-                loss.backward()
-                grad_norm = self._grad_norm(member)
+                demo_gn = float("nan")
+                pref_gn = float("nan")
+                if demo_term is not None and pref_term is not None:
+                    demo_term.backward(retain_graph=True)  # demo graph reused below
+                    demo_gn = self._grad_norm(member)
+                    optimizer.zero_grad()
+                    pref_term.backward()
+                    pref_gn = self._grad_norm(member)
+                    demo_term.backward()  # accumulate demo onto pref -> combined
+                    grad_norm = self._grad_norm(member)
+                elif demo_term is not None:
+                    demo_term.backward()
+                    grad_norm = demo_gn = self._grad_norm(member)
+                else:
+                    pref_term.backward()
+                    grad_norm = pref_gn = self._grad_norm(member)
+
                 if not np.isfinite(grad_norm):
                     raise FloatingPointError("Non-finite hybrid reward gradient norm.")
                 optimizer.step()
@@ -300,6 +327,8 @@ class HybridAlgorithm(DemoAlgorithm):
                 pref_losses.append(pref_val)
                 total_losses.append(float(loss.detach()))
                 grad_norms.append(grad_norm)
+                demo_grad_norms.append(demo_gn)
+                pref_grad_norms.append(pref_gn)
 
         t_train = time.perf_counter() - t0
 
@@ -311,6 +340,17 @@ class HybridAlgorithm(DemoAlgorithm):
         self._log_maxent_selfnorm_step_diagnostics()
         self.logger.record("reward/grad_norm", float(np.mean(grad_norms)), exclude="stdout")
         self.logger.record("reward/grad_norm_max", float(np.max(grad_norms)), exclude="stdout")
+        # Per-source gradient norms on the shared reward net: if the demo (GCL)
+        # norm dwarfs the preference one, the preference signal is being drowned.
+        if self._use_demo:
+            self.logger.record("reward/grad_norm_demo", float(np.nanmean(demo_grad_norms)), exclude="stdout")
+        if use_pref:
+            pref_mean = float(np.nanmean(pref_grad_norms))
+            self.logger.record("reward/grad_norm_pref", pref_mean, exclude="stdout")
+            if self._use_demo:
+                demo_mean = float(np.nanmean(demo_grad_norms))
+                ratio = demo_mean / pref_mean if pref_mean > 1e-12 else float("inf")
+                self.logger.record("reward/grad_norm_demo_pref_ratio", ratio, exclude="stdout")
         self.logger.record("reward/weight_norm", self._param_norm(self.reward_model), exclude="stdout")
         self.logger.record("time/train_reward_model", t_train)
         self.logger.record_sum("time/loggings", time.perf_counter() - t0)

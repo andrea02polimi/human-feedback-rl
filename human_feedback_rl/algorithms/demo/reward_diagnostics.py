@@ -4,7 +4,7 @@ import numpy as np
 import torch as th
 import torch.nn.functional as F
 import wandb
-from scipy.stats import spearmanr
+from scipy.stats import pearsonr, spearmanr
 
 from human_feedback_rl.common.types import Trajectory
 
@@ -192,7 +192,7 @@ class RewardDiagnosticsMixin:
             self._log_return_ranking(self._debug_trajectories, debug_prefix)
 
     def _log_reward_validation(self, transitions, log_class: str) -> None:
-        _, pred_rewards, pred_std, status = self._run_reward_inference(transitions)
+        true_rewards, pred_rewards, pred_std, status = self._run_reward_inference(transitions)
         arrived_mask = status[:, self.STATUS_ARRIVED] == 1
         collided_mask = status[:, self.STATUS_COLLIDED] == 1
         offroad_mask = status[:, self.STATUS_OFFROAD] == 1
@@ -214,6 +214,26 @@ class RewardDiagnosticsMixin:
             self.logger.record(f"{log_class}/gap_arrived_running", arrived_mean - running_mean)
         self.logger.record(f"{log_class}/ensemble_std", float(np.mean(pred_std)))
         self._record_masked_mean(f"{log_class}/ensemble_std_running", pred_std, running_mask)
+
+        # Per-step correlation between predicted and true reward. This is the
+        # health signal for the reward model itself (invariant to the affine
+        # agent-normalization): unlike the Bradley-Terry loss it does not
+        # saturate at ln(2), so it stays informative in the hybrid setting.
+        self._record_reward_correlation(f"{log_class}/pred_true", pred_rewards, true_rewards, running_mask)
+
+    def _record_reward_correlation(self, key: str, pred, true, running_mask) -> None:
+        """Log pearson/spearman(pred, true) over all steps and running-only steps."""
+        for suffix, mask in (("all", None), ("running", running_mask)):
+            p = pred if mask is None else pred[mask]
+            t = true if mask is None else true[mask]
+            if len(p) < 2 or np.std(p) < 1e-8 or np.std(t) < 1e-8:
+                continue
+            pear, _ = pearsonr(p, t)
+            spear, _ = spearmanr(p, t)
+            if np.isfinite(pear):
+                self.logger.record(f"{key}/pearson_{suffix}", float(pear))
+            if np.isfinite(spear):
+                self.logger.record(f"{key}/spearman_{suffix}", float(spear))
 
     def _record_masked_mean(self, key: str, values: np.ndarray, mask: np.ndarray):
         if np.any(mask):
