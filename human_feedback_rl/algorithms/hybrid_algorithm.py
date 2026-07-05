@@ -73,6 +73,12 @@ class HybridAlgorithm(DemoAlgorithm):
         # --- hybrid loss weights -------------------------------------------
         lambda_demo: float = 1.0,
         lambda_pref: float = 1.0,
+        # Equalize the demo (GCL) and preference (BT) gradient norms on the
+        # shared reward net before combining, so the ~1000x-larger GCL gradient
+        # no longer buries the preference signal. lambda_demo/lambda_pref then
+        # weight the *equalized* contributions instead of the raw-scale ones.
+        balance_reward_grads: bool = False,
+        max_grad_balance: float = 1e5,
         # --- demonstration (GCL / MaxEnt IRL) branch -----------------------
         loss_type: str = "maxent_2",
         batch_size_expert: int = 32,
@@ -140,6 +146,8 @@ class HybridAlgorithm(DemoAlgorithm):
 
         self.lambda_demo = float(lambda_demo)
         self.lambda_pref = float(lambda_pref)
+        self.balance_reward_grads = bool(balance_reward_grads)
+        self.max_grad_balance = float(max_grad_balance)
         self.mode = self._resolve_mode(self.lambda_demo, self.lambda_pref)
 
         # ---- preference machinery (only wired when it is actually used) ----
@@ -243,6 +251,53 @@ class HybridAlgorithm(DemoAlgorithm):
         )
         return -(labels * bt_probs.clamp(min=1e-7).log()).sum(dim=1).mean()
 
+    def _backward_reward_step(self, member, optimizer, gcl, pref):
+        """Populate ``member.grad`` for one optimizer step; return grad diagnostics.
+
+        The demo (GCL) and preference (BT) losses live on independent forward
+        graphs sharing ``member``'s params, so ``retain_graph`` lets us measure
+        each one's isolated (unweighted) gradient norm and then backprop the
+        combined loss. When ``balance_reward_grads`` is set, the preference term
+        is rescaled so ``lambda_pref``-weighted BT gradient reaches parity with the
+        (typically ~1000x larger) GCL gradient — after which lambda_demo/lambda_pref
+        act as clean relative weights instead of raw-scale-dependent ones.
+
+        Returns ``(grad_norm, demo_gn, pref_gn, pref_scale)``. Isolated norms are
+        NaN for an inactive source; ``pref_scale`` is 1.0 unless balancing applied.
+        """
+        for name, loss in (("demo", gcl), ("pref", pref)):
+            if loss is not None and not th.isfinite(loss):
+                raise FloatingPointError(
+                    f"Non-finite {name} reward loss (mode={self.mode}): {loss.item()}"
+                )
+
+        optimizer.zero_grad()
+        demo_gn = float("nan")
+        pref_gn = float("nan")
+        pref_scale = 1.0
+
+        if gcl is not None and pref is not None:
+            gcl.backward(retain_graph=True)
+            demo_gn = self._grad_norm(member)
+            optimizer.zero_grad()
+            pref.backward(retain_graph=True)
+            pref_gn = self._grad_norm(member)
+            if self.balance_reward_grads and pref_gn > 1e-8 and demo_gn > 0.0:
+                pref_scale = min(demo_gn / pref_gn, self.max_grad_balance)
+            optimizer.zero_grad()
+            (self.lambda_demo * gcl + (self.lambda_pref * pref_scale) * pref).backward()
+        elif gcl is not None:
+            (self.lambda_demo * gcl).backward()
+            demo_gn = self._grad_norm(member)
+        else:
+            (self.lambda_pref * pref).backward()
+            pref_gn = self._grad_norm(member)
+
+        grad_norm = self._grad_norm(member)
+        if not np.isfinite(grad_norm):
+            raise FloatingPointError("Non-finite hybrid reward gradient norm.")
+        return grad_norm, demo_gn, pref_gn, pref_scale
+
     # ------------------------------------------------------------------
     # Combined reward-model training (overrides RewardTrainingMixin)
     # ------------------------------------------------------------------
@@ -264,71 +319,34 @@ class HybridAlgorithm(DemoAlgorithm):
 
         t0 = time.perf_counter()
         demo_losses, pref_losses, total_losses = [], [], []
-        grad_norms, demo_grad_norms, pref_grad_norms = [], [], []
+        grad_norms, demo_grad_norms, pref_grad_norms, pref_scales = [], [], [], []
 
         for member, optimizer in zip(self.reward_model.members, self.optimizers):
             member.train()
             boot = self.dataset_train.bootstrap() if use_pref else None
             for _ in range(self.gradient_steps_rew):
-                demo_term = None
-                pref_term = None
-                demo_val = float("nan")
-                pref_val = float("nan")
-
-                if self._use_demo:
-                    gcl = self._reward_loss(member)
-                    demo_term = self.lambda_demo * gcl
-                    demo_val = float(gcl.detach())
-
+                gcl = self._reward_loss(member) if self._use_demo else None
+                pref = None
                 if use_pref:
-                    batch = boot.sample(self.pref_batch_size)
-                    pref = self._preference_loss(member, batch)
-                    pref_term = self.lambda_pref * pref
-                    pref_val = float(pref.detach())
+                    pref = self._preference_loss(member, boot.sample(self.pref_batch_size))
 
-                loss = th.zeros((), dtype=th.float32)
-                if demo_term is not None:
-                    loss = loss + demo_term
-                if pref_term is not None:
-                    loss = loss + pref_term
-                if not th.isfinite(loss):
-                    raise FloatingPointError(
-                        f"Non-finite hybrid reward loss (mode={self.mode}): {loss.item()}"
-                    )
-
-                # Backprop each source in isolation so their gradient norms are
-                # separable (diagnoses whether the GCL demo gradient dominates the
-                # preference gradient on the shared reward net), then combine for
-                # the actual optimizer step. The demo and preference losses live on
-                # independent forward graphs, so retain_graph lets us reuse them.
-                optimizer.zero_grad()
-                demo_gn = float("nan")
-                pref_gn = float("nan")
-                if demo_term is not None and pref_term is not None:
-                    demo_term.backward(retain_graph=True)  # demo graph reused below
-                    demo_gn = self._grad_norm(member)
-                    optimizer.zero_grad()
-                    pref_term.backward()
-                    pref_gn = self._grad_norm(member)
-                    demo_term.backward()  # accumulate demo onto pref -> combined
-                    grad_norm = self._grad_norm(member)
-                elif demo_term is not None:
-                    demo_term.backward()
-                    grad_norm = demo_gn = self._grad_norm(member)
-                else:
-                    pref_term.backward()
-                    grad_norm = pref_gn = self._grad_norm(member)
-
-                if not np.isfinite(grad_norm):
-                    raise FloatingPointError("Non-finite hybrid reward gradient norm.")
+                grad_norm, demo_gn, pref_gn, pref_scale = self._backward_reward_step(
+                    member, optimizer, gcl, pref
+                )
                 optimizer.step()
 
+                demo_val = float(gcl.detach()) if gcl is not None else float("nan")
+                pref_val = float(pref.detach()) if pref is not None else float("nan")
+                total = (self.lambda_demo * demo_val if gcl is not None else 0.0) + (
+                    self.lambda_pref * pref_val if pref is not None else 0.0
+                )
                 demo_losses.append(demo_val)
                 pref_losses.append(pref_val)
-                total_losses.append(float(loss.detach()))
+                total_losses.append(total)
                 grad_norms.append(grad_norm)
                 demo_grad_norms.append(demo_gn)
                 pref_grad_norms.append(pref_gn)
+                pref_scales.append(pref_scale)
 
         t_train = time.perf_counter() - t0
 
@@ -338,22 +356,28 @@ class HybridAlgorithm(DemoAlgorithm):
         # Reuse the demo-side reward diagnostics (maxent_2 partition, ESS, ...).
         self._log_reward_loss_diagnostics()
         self._log_maxent_selfnorm_step_diagnostics()
+        self._log_reward_grad_norms(grad_norms, demo_grad_norms, pref_grad_norms, pref_scales, use_pref)
+        self.logger.record("reward/weight_norm", self._param_norm(self.reward_model), exclude="stdout")
+        self.logger.record("time/train_reward_model", t_train)
+        self.logger.record_sum("time/loggings", time.perf_counter() - t0)
+
+    def _log_reward_grad_norms(self, grad_norms, demo_grad_norms, pref_grad_norms, pref_scales, use_pref) -> None:
         self.logger.record("reward/grad_norm", float(np.mean(grad_norms)), exclude="stdout")
         self.logger.record("reward/grad_norm_max", float(np.max(grad_norms)), exclude="stdout")
         # Per-source gradient norms on the shared reward net: if the demo (GCL)
         # norm dwarfs the preference one, the preference signal is being drowned.
         if self._use_demo:
             self.logger.record("reward/grad_norm_demo", float(np.nanmean(demo_grad_norms)), exclude="stdout")
-        if use_pref:
-            pref_mean = float(np.nanmean(pref_grad_norms))
-            self.logger.record("reward/grad_norm_pref", pref_mean, exclude="stdout")
-            if self._use_demo:
-                demo_mean = float(np.nanmean(demo_grad_norms))
-                ratio = demo_mean / pref_mean if pref_mean > 1e-12 else float("inf")
-                self.logger.record("reward/grad_norm_demo_pref_ratio", ratio, exclude="stdout")
-        self.logger.record("reward/weight_norm", self._param_norm(self.reward_model), exclude="stdout")
-        self.logger.record("time/train_reward_model", t_train)
-        self.logger.record_sum("time/loggings", time.perf_counter() - t0)
+        if not use_pref:
+            return
+        pref_mean = float(np.nanmean(pref_grad_norms))
+        self.logger.record("reward/grad_norm_pref", pref_mean, exclude="stdout")
+        if self._use_demo:
+            demo_mean = float(np.nanmean(demo_grad_norms))
+            ratio = demo_mean / pref_mean if pref_mean > 1e-12 else float("inf")
+            self.logger.record("reward/grad_norm_demo_pref_ratio", ratio, exclude="stdout")
+            if self.balance_reward_grads:
+                self.logger.record("reward/grad_balance_scale", float(np.mean(pref_scales)), exclude="stdout")
 
     # ------------------------------------------------------------------
     # Logging
