@@ -5,7 +5,6 @@ from .reward_nets import RewardNet
 from .loggers import NullLogger
 from .env_wrappers import EnvRewardWrapper, EnvBufferingWrapper, PolicyExplorationWrapper
 from . import types
-import math
 import numpy as np
 import time
 from typing import List, Any, Sequence, Optional
@@ -21,7 +20,6 @@ class TrajectoryGeneratorFromAgent:
         agent: BaseAlgorithm,
         reward_model: RewardNet,
         venv: VecEnv,
-        exploration_frac: float = 0.0,
         exploration_eps: float = 0.5,
         logger=None,
         rng: np.random.Generator = None,
@@ -33,7 +31,6 @@ class TrajectoryGeneratorFromAgent:
 
         self.rng = rng if rng is not None else np.random.default_rng()
         self.reward_model    = reward_model
-        self.exploration_frac = exploration_frac
 
         # The BufferingWrapper records all trajectories, so we can return
         # them after training. This should come first (before the wrapper that
@@ -244,22 +241,23 @@ def policy_action_log_probs(policy: Any, obs: np.ndarray, actions: np.ndarray) -
                 else:
                     _, log_prob, _ = sb3_policy.evaluate_actions(obs_tensor, action_tensor)
         elif hasattr(policy, "actor"): # SAC
-            # sac parte da una gaussiana, ma poi applica una funzione tanh per limitare le azioni in [-1, 1]. La log-probabilità della gaussiana non è la stessa della log-probabilità dopo la trasformazione tanh.
-
-
-            # L'ATTORE DI SAC PRODUCE AZIONI CHE SONO [-1, 1] PER OGNI DIMENSIONE. DOBBIAMO SCALARE LE AZIONI DELL'AMBIENTE IN QUESTO INTERVALLO PRIMA DI VALUTARE LA LOG-PROBABILITÀ.
+            # SAC samples from a Gaussian and squashes through tanh, so its
+            # action density lives in normalized [-1, 1] coordinates, not in the
+            # environment's action space. Three steps recover the environment
+            # log-density:
+            #   1. Scale the environment action into [-1, 1] (the actor's
+            #      output coordinates) before evaluating the log-probability.
+            #   2. Evaluate the squashed distribution's log-prob there — SB3's
+            #      SquashedDiagGaussian already includes the tanh Jacobian.
+            #   3. Subtract log(action_scale) per dimension: the Jacobian of
+            #      the affine map from normalized to environment coordinates.
             scaled_actions = sb3_policy.scale_action(np.asarray(actions))
             action_tensor = th.as_tensor(scaled_actions, dtype=th.float32, device=sb3_policy.device)
-            # LA POLICY è UNA DISTRIBUZIONE CONDIZIONATA ALLO STATO, QUINDI QUI STAMO DICENDO PER CIASCUNA OSSERVAZIONE DIMMI LA DISTRIBUZIONE DELLE AZIONI
             mean, log_std, kwargs = policy.actor.get_action_dist_params(obs_tensor)
             distribution = policy.actor.action_dist.proba_distribution(mean, log_std, **kwargs)
-            # CALCOLIAMO QUANTO è PROBABILE CHE QUESTA DISTRIBUZIONE GENERI PROPRIO L'AZIONE
             log_prob = distribution.log_prob(action_tensor)
-            # SAC's density is in normalized action coordinates. Convert it to
-            # the environment action measure used by the trajectory objective.
             action_scale = (policy.action_space.high - policy.action_space.low) / 2.0
-            # CONVERTIAMO LA DENSITà DAL SISTE,MA INTERNO DI SAC AL SISTEMA DELL'AMBIENTE
-            log_prob = log_prob - float(np.log(action_scale).sum()) # jacobian 
+            log_prob = log_prob - float(np.log(action_scale).sum())
         else:
             raise TypeError(f"Unsupported policy type for log-prob evaluation: {type(policy).__name__}")
 

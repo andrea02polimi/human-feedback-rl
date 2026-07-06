@@ -1,46 +1,11 @@
 import numpy as np
-from typing import List, Tuple, Any, Dict, Callable, Union, Optional
+from typing import Callable, List, Optional
 
 from stable_baselines3.common.vec_env import VecEnvWrapper, VecEnv
 
 from .reward_nets import RewardEnsemble
+from .status import ego_status_to_onehot
 from .types import Trajectory, Transition
-
-# order: arrived, collided, off_road, timeout, running, teleported, removed_unknown
-_STATUS_ONEHOT = {
-    "arrived":         np.array([1, 0, 0, 0, 0, 0, 0], dtype=np.float32),
-    "collided":        np.array([0, 1, 0, 0, 0, 0, 0], dtype=np.float32),
-    "offroad":         np.array([0, 0, 1, 0, 0, 0, 0], dtype=np.float32),
-    "timeout":         np.array([0, 0, 0, 1, 0, 0, 0], dtype=np.float32),
-    "running":         np.array([0, 0, 0, 0, 1, 0, 0], dtype=np.float32),
-    "teleported":      np.array([0, 0, 0, 0, 0, 1, 0], dtype=np.float32),
-    "removed_unknown": np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32),
-}
-
-def ego_status_to_onehot(status: str) -> np.ndarray:
-    return _STATUS_ONEHOT.get(status, _STATUS_ONEHOT["running"])
-
-class _RunningMeanStd:
-    """Welford's online algorithm for running mean and variance."""
-
-    def __init__(self):
-        self.mean = 0.0
-        self.var = 0.0
-        self.count = 0
-
-    def update(self, values: np.ndarray) -> None:
-        for x in values.flat:
-            self.count += 1
-            delta = x - self.mean
-            self.mean += delta / self.count
-            self.var += (x - self.mean) * delta  # M2
-
-    @property
-    def std(self) -> float:
-        if self.count < 2:
-            return 1.0
-        s = float(np.sqrt(max(0.0, self.var / (self.count - 1))))
-        return s if s > 0 else 1.0
 
 
 # ---------------------------------------------------------------------------

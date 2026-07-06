@@ -175,7 +175,7 @@ class RewardDiagnosticsMixin:
             self._log_return_ranking(self._debug_trajectories, debug_prefix)
 
     def _log_reward_validation(self, transitions, log_class: str) -> None:
-        _, pred_rewards, pred_std, status = self._run_reward_inference(transitions)
+        _, pred_rewards, pred_std, status = self._run_reward_inference_with_std(transitions)
         arrived_mask = status[:, self.STATUS_ARRIVED] == 1
         collided_mask = status[:, self.STATUS_COLLIDED] == 1
         offroad_mask = status[:, self.STATUS_OFFROAD] == 1
@@ -205,7 +205,7 @@ class RewardDiagnosticsMixin:
             return mean
         return None
 
-    def _run_reward_inference(self, transitions):
+    def _run_reward_inference_with_std(self, transitions):
         self.reward_model.eval()
         with th.no_grad():
             true_rewards = np.array([t.true_reward for t in transitions], dtype=np.float32)
@@ -237,7 +237,7 @@ class RewardDiagnosticsMixin:
             return
         true_returns, pred_returns = [], []
         for traj in trajectories:
-            _, pred_rewards, _, _ = self._run_reward_inference(traj)
+            _, pred_rewards, _, _ = self._run_reward_inference_with_std(traj)
             true_returns.append(float(sum(t.true_reward for t in traj)))
             pred_returns.append(float(pred_rewards.sum()))
         rho, _ = spearmanr(true_returns, pred_returns)
@@ -283,7 +283,7 @@ class RewardDiagnosticsMixin:
         pred_step_lists, true_step_lists, running_lists, traj_lengths = [], [], [], []
 
         for traj in trajectories:
-            true_rewards, pred_rewards, _, status = self._run_reward_inference(traj)
+            true_rewards, pred_rewards, _, status = self._run_reward_inference_with_std(traj)
             true_returns.append(float(true_rewards.sum()))
             pred_step_lists.append(np.asarray(pred_rewards, dtype=np.float64))
             true_step_lists.append(np.asarray(true_rewards, dtype=np.float64))
@@ -302,6 +302,9 @@ class RewardDiagnosticsMixin:
         # scale, fitted on RUNNING steps only (terminal rewards stay the signal we
         # want to reconstruct). One shift/scale shared by every trajectory, so the
         # cross-trajectory ranking is untouched and only the x-axis units change.
+        # Temperature is applied exactly once per prediction: here on the steps
+        # the affine is fitted on, and below on the raw per-trajectory sums the
+        # affine is applied to — both sites see the same scaled quantity.
         pred_steps = np.concatenate(pred_step_lists) * float(self.temperature)
         true_steps = np.concatenate(true_step_lists)
         running = np.concatenate(running_lists)

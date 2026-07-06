@@ -1,6 +1,5 @@
 import numpy as np
-import time
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from .types import Trajectory, Fragment, FragmentPair
 from .reward_nets import RewardEnsemble
@@ -23,8 +22,9 @@ class RandomFragmenter:
         num_fragments: int,
     ) -> List[Fragment]:
 
-        traj_array = np.array(trajectories, dtype=object)
-
+        # Sample trajectory indices, not the trajectories themselves:
+        # np.array(list_of_equal_length_lists, dtype=object) silently builds a
+        # 2-D array, which breaks rng.choice.
         if fragment_length is None:
             if num_fragments > len(trajectories):
                 self.logger.warn(
@@ -35,7 +35,7 @@ class RandomFragmenter:
             weights = np.ones(len(trajectories))
             fragments: List[Fragment] = []
             for _ in range(num_fragments):
-                traj = self.rng.choice(traj_array, p=weights / weights.sum())
+                traj = trajectories[self.rng.choice(len(trajectories), p=weights / weights.sum())]
                 fragments.append(Fragment(traj[:]))
             return fragments
 
@@ -53,7 +53,7 @@ class RandomFragmenter:
 
         fragments = []
         for _ in range(num_fragments):
-            traj = self.rng.choice(traj_array, p=np.array(weights) / sum(weights))
+            traj = trajectories[self.rng.choice(len(trajectories), p=np.array(weights) / sum(weights))]
 
             n = len(traj)
             if n >= fragment_length:
@@ -151,20 +151,5 @@ class HighVariancePairFragmenter(HighVarianceFragmenter):
             FragmentPair(frag1=fragments[i], frag2=fragments[i + 1])
             for i in range(0, len(fragments) - 1, 2)
         ]
-        
+
         return pairs
-
-
-class HighVarianceSingleFragmenter(HighVarianceFragmenter):
-
-    def __call__(
-        self,
-        trajectories: List[Trajectory],
-        fragment_length: Optional[int],
-        num_fragments: int,
-    ) -> List[Fragment]:
-        
-        candidates = self._sample_fragments(trajectories, fragment_length, self.oversample * num_fragments)
-        fragments  = self._select_high_variance(candidates, num_fragments)
-        
-        return fragments

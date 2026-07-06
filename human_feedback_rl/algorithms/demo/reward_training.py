@@ -1,7 +1,6 @@
 """Optimization and agent-facing normalization of the learned reward."""
 
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import torch as th
@@ -26,7 +25,7 @@ class RewardTrainingMixin:
         self._maxent_corrected_steps = []
         t0 = time.perf_counter()
 
-        def train_member(member, optimizer):
+        def member_step(member, optimizer):
             member.train()
             norms = []
             for _ in range(self.gradient_steps_rew):
@@ -46,14 +45,7 @@ class RewardTrainingMixin:
                 optimizer.step()
             return norms
 
-        all_norms = []
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            futures = [
-                executor.submit(train_member, member, optimizer)
-                for member, optimizer in zip(self.reward_model.members, self.optimizers)
-            ]
-            for future in as_completed(futures):
-                all_norms.extend(future.result())
+        all_norms = [norm for norms in self.train_reward_members(member_step) for norm in norms]
 
         t_train = time.perf_counter() - t0
 

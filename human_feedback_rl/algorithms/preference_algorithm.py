@@ -4,22 +4,26 @@ from typing import Any, Callable, List, Optional, Union
 import numpy as np
 import torch as th
 
+from human_feedback_rl.common import status
 from human_feedback_rl.common.base_reward_learning_algorithm import BaseRewardLearningAlgorithm
-from human_feedback_rl.common.reward_nets import make_reward_ensemble, NormalizedRewardNet
 from human_feedback_rl.common.datasets import PreferenceDataset
 from human_feedback_rl.common.fragmenters import HighVariancePairFragmenter, RandomPairFragmenter
 from human_feedback_rl.common.gatherers import PreferenceGathererFromReward
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from human_feedback_rl.common.losses import (
+    bradley_terry_probs,
+    preference_accuracy,
+    preference_nll,
+)
+from human_feedback_rl.common.reward_nets import make_reward_ensemble
 
 
 class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
     """
     Preference-based reward learning following Christiano et al. (2017).
 
-    Human (or synthetic) preferences over trajectory pairs are used to train
-    an ensemble reward model with the Bradley-Terry loss.  The model is updated
-    in the inner loop while a policy is trained with PPO in the outer loop.
+    Human (or synthetic) preferences over trajectory-fragment pairs train an
+    ensemble reward model with the Bradley-Terry loss; the agent trains on the
+    predicted rewards in an alternating outer loop driven by a query schedule.
     """
 
     def __init__(
@@ -69,22 +73,86 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
         self.batch_size_rew      = batch_size_rew
 
         self.fragmenter          = self._make_fragmenter(fragmenter_type)
-        self.preference_gatherer = PreferenceGathererFromReward(logger=self.logger, labels_type=labels_type, temperature=temperature)
+        self.preference_gatherer = PreferenceGathererFromReward(
+            logger=self.logger, labels_type=labels_type, temperature=temperature, rng=self.rng
+        )
         self.dataset_train       = PreferenceDataset(queue_size=comparison_queue_size, rng=self.rng)
         self.dataset_val         = PreferenceDataset(queue_size=comparison_queue_size, rng=self.rng)
 
-        self.optimizers    = [
+        self.optimizers = [
             th.optim.Adam(m.parameters(), lr=lr_rew, weight_decay=l2_rew)
             for m in self.reward_model.members
         ]
 
+    # ------------------------------------------------------------------
+    # Main training loop
+    # ------------------------------------------------------------------
+
+    def train(
+        self,
+        total_timesteps: int = 1_000_000,
+        total_queries: int = 10_000,
+        timesteps_per_iteration: int = 1024,
+        log_interval: int = 1,
+        checkpoint_dir: Optional[str] = None,
+        checkpoint_interval: int = 10,
+    ) -> Any:
+        """Run the alternating preference-collection / reward-learning / agent-training loop."""
+
+        self.iteration = 0
+        n_iterations = int(total_timesteps / timesteps_per_iteration)
+        schedule = self.build_query_schedule(n_iterations, total_queries)
+
+        print("=" * 100)
+        print("Preference-based reward learning (Christiano et al. 2017)")
+        print("=" * 100)
+        print("")
+        print(f"Query {self.query_schedule_name} schedule: {schedule}")
+
+        for num_queries in schedule:
+            t_iter = time.perf_counter()
+            print(f"\nIteration {self.iteration}/{len(schedule) - 1}")
+
+            # ---- Data collection ----------------------------------------
+            exploration_steps = int(self.exploration_frac * timesteps_per_iteration)
+            print(f"- Collecting {timesteps_per_iteration} agent + {exploration_steps} exploration transitions")
+            self.trajectories = self.sample_rollout(timesteps_per_iteration, exploration_steps)
+
+            # ---- Feedback collection & reward model training -------------
+            # Iterations without new queries skip feedback collection and RM
+            # retraining (no new data), but the agent still trains below.
+            if num_queries > 0:
+                print(f"- Collecting {num_queries} feedbacks on the current rollout")
+                fragments, feedback = self.collect_feedback(num_queries)
+                self.push_data(fragments, feedback)
+
+                self.before_reward_training()
+
+                print("- Training reward model")
+                self.train_reward_model()
+
+            # ---- Agent training -----------------------------------------
+            self.before_agent_training()
+
+            print(f"- Training agent for {timesteps_per_iteration} timesteps")
+            self.train_agent(timesteps_per_iteration, log_interval)
+
+            # ---- Logging & checkpointing --------------------------------
+            self.log_iteration(t_iter)
+
+            if checkpoint_dir is not None and (self.iteration + 1) % checkpoint_interval == 0:
+                self.save_checkpoint(checkpoint_dir, self.iteration + 1)
+
+            self.iteration += 1
+
+        return self.trajectory_generator.agent
 
     # ------------------------------------------------------------------
-    # Abstract hook implementations
+    # Loop steps
     # ------------------------------------------------------------------
 
-    def collect_feedback(self, num_queries):
-
+    def collect_feedback(self, num_queries: int) -> tuple:
+        """Fragment the current rollout and label fragment pairs via the gatherer."""
         t0 = time.perf_counter()
         fragment_pairs = self.fragmenter(self.trajectories, self.fragment_length, num_queries)
         preferences = self.preference_gatherer(fragment_pairs)
@@ -94,11 +162,10 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
         self.logger.record("time/collect_feedback", t_collect_feedback)
         self.logger.record_sum("time/loggings", time.perf_counter() - t0)
 
-
         return fragment_pairs, preferences
 
     def push_data(self, fragments, feedback) -> None:
-
+        """Shuffle and split into train/val datasets by ``train_comparison_frac``."""
         t0 = time.perf_counter()
         idx = self.rng.permutation(len(fragments))
         fragments = [fragments[i] for i in idx]
@@ -120,10 +187,19 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
         self.logger.record("time/push_data",               t_push_data)
         self.logger.record_sum("time/loggings",            time.perf_counter() - t0)
 
+    def before_reward_training(self) -> None:
+        """Log reward-model validation metrics on the current rollout (and debug dataset)."""
+        all_transitions = [t for traj in self.trajectories for t in traj]
+        self.log_reward_model_validation(all_transitions, "reward_val/current_rollout")
+
+        if self.debug_dataset:
+            self.log_reward_model_validation(self.debug_dataset, "reward_val/debug_dataset")
+
     def train_reward_model(self) -> None:
+        """Train each ensemble member on its own bootstrap of the preference dataset."""
         t0 = time.perf_counter()
 
-        def train_member(member, optimizer):
+        def member_step(member, optimizer):
             member.train()
             boot_dataset = self.dataset_train.bootstrap()
             for _ in range(self.gradient_steps_rew):
@@ -131,30 +207,19 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
 
                 r1 = th.stack([member.fragment_avg_reward(p.frag1) for p in batch.fragment_pairs])
                 r2 = th.stack([member.fragment_avg_reward(p.frag2) for p in batch.fragment_pairs])
-                
-                prob1 = th.sigmoid(r1 - r2)
-                bt_probs = th.stack([prob1, 1 - prob1], dim=1)
+                bt_probs = bradley_terry_probs(r1, r2)
 
                 labels = th.tensor(
                     [[p.pref1, p.pref2] for p in batch.preferences], dtype=th.float32
                 )
+                loss = preference_nll(bt_probs, labels)
 
-                loss = -(labels * bt_probs.clamp(min=1e-7).log()).sum(dim=1).mean()
-                
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            futures = [
-                executor.submit(train_member, member, optimizer)
-                for member, optimizer in zip(self.reward_model.members, self.optimizers)
-            ]
-            for future in as_completed(futures):
-                future.result()
-
+        self.train_reward_members(member_step)
         t_train = time.perf_counter() - t0
-
 
         t0 = time.perf_counter()
         loss_train, acc_train = self._evaluate_reward_model(self.dataset_train.get_all())
@@ -170,36 +235,28 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
         self.logger.record_sum("time/loggings",         time.perf_counter() - t0)
 
     def _evaluate_reward_model(self, data) -> tuple:
+        """Return (loss, accuracy) of the full ensemble on a preference batch."""
         self.reward_model.eval()
-
         with th.no_grad():
             r1 = th.stack([self.reward_model.fragment_avg_reward(p.frag1) for p in data.fragment_pairs])
             r2 = th.stack([self.reward_model.fragment_avg_reward(p.frag2) for p in data.fragment_pairs])
-
-            prob1 = th.sigmoid(r1 - r2)
-            bt_probs = th.stack([prob1, 1 - prob1], dim=1)
-
+            bt_probs = bradley_terry_probs(r1, r2)
         self.reward_model.train()
 
         labels = th.tensor([[p.pref1, p.pref2] for p in data.preferences], dtype=th.float32)
-        loss = -(labels * bt_probs.clamp(min=1e-7).log()).sum(dim=1).mean().item()
-        acc  = (bt_probs.argmax(dim=1) == labels.argmax(dim=1)).float().mean().item()
-        return loss, acc
+        return preference_nll(bt_probs, labels).item(), preference_accuracy(bt_probs, labels).item()
 
     def before_agent_training(self):
+        """Center the agent-facing reward on the current rollout's mean raw reward."""
         all_transitions = [t for traj in self.trajectories for t in traj]
         if not all_transitions:
             return
-        obs    = np.array([t.observation for t in all_transitions])
-        acts   = np.array([t.action      for t in all_transitions])
-        status = np.array([t.next_status for t in all_transitions])
-        done   = np.array([float(t.done) for t in all_transitions])
+        obs         = np.array([t.observation for t in all_transitions])
+        acts        = np.array([t.action      for t in all_transitions])
+        next_status = np.array([t.next_status for t in all_transitions])
+        done        = np.array([float(t.done) for t in all_transitions])
 
-        for member in self.reward_model.members:
-            raw = member.predict_unnormalized(obs, acts, status, done)
-            member.set_mean(raw.mean())
-        
-        raw = self.reward_model.predict_unnormalized(obs, acts, status, done)
+        raw = self.reward_model.predict_unnormalized(obs, acts, next_status, done)
         self.reward_model.set_mean(raw.mean())
 
     # ------------------------------------------------------------------
@@ -208,8 +265,12 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
 
     @staticmethod
     def _fragment_status_pct(fragment_pairs) -> dict:
-        # next_status is 7-dim one-hot: [arrived, collided, off_road, timeout, running, teleported, removed_unknown]
-        STATUS_IDX = {"arrived": 0, "collided": 1, "offroad": 2, "timeout": 3}
+        STATUS_IDX = {
+            "arrived": status.STATUS_ARRIVED,
+            "collided": status.STATUS_COLLIDED,
+            "offroad": status.STATUS_OFFROAD,
+            "timeout": status.STATUS_TIMEOUT,
+        }
         frags = [fp.frag1 for fp in fragment_pairs] + [fp.frag2 for fp in fragment_pairs]
         n = len(frags)
         if n == 0:
@@ -239,26 +300,3 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
             )
         else:
             raise ValueError(f"Unknown fragmenter_type: {fragmenter_type!r}")
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def train(
-        self,
-        total_timesteps: int = 1_000_000,
-        total_queries: int = 10_000,
-        timesteps_per_iteration: int = 1024,
-        log_interval: int = 1,
-        checkpoint_dir: Optional[str] = None,
-        checkpoint_interval: int = 10,
-    ) -> Any:
-        return super().train(
-            total_timesteps=total_timesteps,
-            total_queries=total_queries,
-            timesteps_per_iteration=timesteps_per_iteration,
-            log_interval=log_interval,
-            checkpoint_dir=checkpoint_dir,
-            checkpoint_interval=checkpoint_interval,
-        )
-

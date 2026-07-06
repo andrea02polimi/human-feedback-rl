@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, List, Tuple, Sequence
+from typing import Any, List
 
 
 @dataclass
@@ -12,12 +12,17 @@ class Transition:
     log_policy_prob: float | None = None
 
 
-@dataclass
 class Trajectory(List[Transition]):
+    """A list of transitions forming one (partial) episode.
+
+    Deliberately a plain ``list`` subclass: slicing, equality and iteration all
+    behave like list operations on the underlying transitions.
+    """
 
     def __init__(self, transitions=None):
         super().__init__(list(transitions) if transitions is not None else [])
-        
+
+
     def total_reward(self) -> float:
         return sum(t.true_reward for t in self)
     

@@ -7,6 +7,8 @@ import torch as th
 import torch.nn as nn
 from stable_baselines3.common.vec_env import VecEnv
 
+from .status import STATUS_DIM
+
 
 def make_net(in_dim: int, net_arch: list[int], activation_fn: str) -> nn.Sequential:
     """Build an MLP with the given architecture and activation function."""
@@ -16,35 +18,6 @@ def make_net(in_dim: int, net_arch: list[int], activation_fn: str) -> nn.Sequent
         layers += [nn.Linear(in_dim, out_dim), act()]
         in_dim = out_dim
     layers.append(nn.Linear(in_dim, 1))
-    return nn.Sequential(*layers)
-
-class ResidualBlock(nn.Module):
-    """Simple residual block with optional skip connection."""
-    def __init__(self, dim: int, activation_fn: str):
-        super().__init__()
-        act = {"relu": nn.ReLU, "tanh": nn.Tanh}[activation_fn]
-        self.fc = nn.Linear(dim, dim)
-        self.activation = act()
-    
-    def forward(self, x):
-        return x + self.activation(self.fc(x))
-
-
-def make_residual_net(in_dim: int, net_arch: list[int], activation_fn: str) -> nn.Sequential:
-    """Build an MLP with residual connections."""
-    act = {"relu": nn.ReLU, "tanh": nn.Tanh}[activation_fn]
-    layers = []
-    
-    # Project input to first hidden dimension
-    layers.append(nn.Linear(in_dim, net_arch[0]))
-    layers.append(act())
-    
-    # Residual blocks for hidden layers
-    for dim in net_arch:
-        layers.append(ResidualBlock(dim, activation_fn))
-    
-    # Output layer
-    layers.append(nn.Linear(net_arch[-1], 1))
     return nn.Sequential(*layers)
 
 class RewardNet(nn.Module, abc.ABC):
@@ -103,11 +76,11 @@ class RewardNet(nn.Module, abc.ABC):
 class SumoRewardNet(RewardNet):
     """MLP reward network for SUMO tasks.
 
-    Input: (state, action, next_status, done), where next_status is a 7-dim one-hot
-    encoding [arrived, collided, off_road, timeout, running, teleported, removed_unknown].
+    Input: (state, action, next_status, done), where next_status is the one-hot
+    status encoding defined in :mod:`human_feedback_rl.common.status`.
     """
 
-    STATUS_DIM = 7
+    STATUS_DIM = STATUS_DIM
 
     def __init__(
         self,
@@ -121,9 +94,8 @@ class SumoRewardNet(RewardNet):
         obs_dim = observation_space.shape[0]
         act_dim = action_space.shape[0]
         in_dim = obs_dim + act_dim + self.STATUS_DIM + 1  # +1 for done
-        
+
         self.net = make_net(in_dim, net_arch, activation_fn)
-        # self.net = make_residual_net(in_dim, net_arch, activation_fn)
 
     def forward(self, state, action, next_status=None, done=None):
         x = th.cat([state, action, next_status, done.unsqueeze(-1)], dim=1)
@@ -144,6 +116,24 @@ class RewardEnsemble(RewardNet):
             raise ValueError("RewardEnsemble needs at least 1 member.")
         super().__init__(observation_space, action_space)
         self.members = nn.ModuleList(members)
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ) -> None:
+        # Checkpoints written before v0.2 wrapped each member in its own
+        # NormalizedRewardNet: weights lived under members.{i}.net.net.* with
+        # per-member _mean/_std buffers. Remap them to the flat member layout.
+        for i in range(len(self.members)):
+            member_prefix = f"{prefix}members.{i}."
+            for key in [k for k in state_dict if k.startswith(member_prefix)]:
+                rest = key[len(member_prefix):]
+                if rest in ("_mean", "_std"):
+                    del state_dict[key]
+                elif rest.startswith("net.net."):
+                    state_dict[member_prefix + "net." + rest[len("net.net."):]] = state_dict.pop(key)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
 
     def forward(
         self,
@@ -293,15 +283,7 @@ def make_reward_ensemble(
     net_arch = net_arch or [128, 128]
     activation_fn = activation_fn or "tanh"
     members = [
-        NormalizedRewardNet(
-            SumoRewardNet(
-                obs_space,
-                act_space,
-                net_arch=net_arch,
-                activation_fn=activation_fn,
-            ),
-            alpha,
-        )
+        SumoRewardNet(obs_space, act_space, net_arch=net_arch, activation_fn=activation_fn)
         for _ in range(n_ensembles)
     ]
     return NormalizedRewardNet(RewardEnsemble(obs_space, act_space, members), alpha)

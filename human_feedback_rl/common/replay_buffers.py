@@ -6,13 +6,13 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
 from stable_baselines3.common.vec_env import VecNormalize
 
-from .env_wrappers import ego_status_to_onehot
+from .status import STATUS_DIM, ego_status_to_onehot
 
 
 class RewardDiagnosticsReplayBuffer(ReplayBuffer):
     """Standard SB3 replay sampling plus reward-staleness diagnostics."""
 
-    STATUS_DIM = 7
+    STATUS_DIM = STATUS_DIM
 
     def __init__(self, *args, relabel_rewards: bool = False, **kwargs):
         super().__init__(*args, **kwargs)

@@ -1,8 +1,9 @@
 import numpy as np
 from collections import deque
-from typing import Any, List, Optional
-from .types import FragmentPair, Fragment, Preference, Trajectory
 from dataclasses import dataclass
+from typing import Any, List, Optional
+
+from .types import FragmentPair, Preference
 
 
 class BaseDataset:
@@ -27,7 +28,9 @@ class BaseDataset:
             yield self._to_batch([data[i] for i in indices[start:start + batch_size]])
 
     def sample(self, batch_size: int):
-        """Return a single random batch of batch_size items."""
+        """Return a single random batch of at most batch_size items, without replacement."""
+        if not self._data:
+            raise ValueError(f"Cannot sample from an empty {type(self).__name__}.")
         data = list(self._data)
         indices = self.rng.choice(len(data), size=min(batch_size, len(data)), replace=False)
         return self._to_batch([data[i] for i in indices])
@@ -50,10 +53,15 @@ class PreferenceDataset(BaseDataset):
         super().__init__(queue_size=queue_size, rng=rng)
 
     def push(self, fragment_pairs: List[FragmentPair], preferences: List[Preference]) -> None:
-        assert len(fragment_pairs) == len(preferences)
+        if len(fragment_pairs) != len(preferences):
+            raise ValueError(
+                f"Got {len(fragment_pairs)} fragment pairs but {len(preferences)} preferences."
+            )
         super().push(*zip(fragment_pairs, preferences))
 
     def _to_batch(self, items: List) -> PreferenceBatch:
+        if not items:
+            return PreferenceBatch([], [])
         fragment_pairs, preferences = zip(*items)
         return PreferenceBatch(list(fragment_pairs), list(preferences))
 
@@ -67,33 +75,3 @@ class PreferenceDataset(BaseDataset):
             frag, pref = data[i]
             boot.push([frag], [pref])
         return boot
-
-
-@dataclass
-class DemoBatch:
-    fragments: List[Fragment]
-    expert_fragments: List[Fragment]
-
-
-class DemonstrationDataset(BaseDataset):
-    def __init__(self, queue_size: int = 1000, rng: Optional[np.random.Generator] = None):
-        super().__init__(queue_size=queue_size, rng=rng)
-
-    def push(self, fragments: List[Fragment], expert_fragments: List[Fragment]) -> None:
-        assert len(fragments) == len(expert_fragments)
-        super().push(*zip(fragments, expert_fragments))
-
-    def _to_batch(self, items: List) -> DemoBatch:
-        fragments, expert_fragments = zip(*items)
-        return DemoBatch(list(fragments), list(expert_fragments))
-
-    def bootstrap(self) -> "DemonstrationDataset":
-        data = list(self._data)
-        n = len(data)
-        indices = self.rng.choice(n, size=n, replace=True)
-        boot = DemonstrationDataset(queue_size=n, rng=self.rng)
-        for i in indices:
-            frag, frag_exp = data[i]
-            boot.push([frag], [frag_exp])
-        return boot
-

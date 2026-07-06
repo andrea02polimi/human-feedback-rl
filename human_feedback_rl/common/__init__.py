@@ -4,7 +4,6 @@ from .base_policy import BCPolicy
 from .datasets import PreferenceDataset
 from .reward_nets import RewardNet, RewardEnsemble
 from .env_wrappers import EnvRewardWrapper
-from .schedules import InverseSchedule
 from .loggers import PrefixedLogger, WandbWriter
 from .custom_logging_callback import CustomLoggingCallback
 
@@ -29,7 +28,6 @@ __all__ = [
     "Trajectory",
     "Transition",
     "PreferenceDataset",
-    "InverseSchedule",
     "PrefixedLogger",
     "WandbWriter",
     "BCPolicy",

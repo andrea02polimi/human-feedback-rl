@@ -17,11 +17,6 @@ except ImportError:
     RuleBasedPolicy = None
     _ModelPolicy    = None
 
-try:
-    from sumo_gym_ego import EgoStatus
-except ImportError:
-    EgoStatus = None
-
 
 class DaggerAlgorithm(BaseAlgorithm):
     """
@@ -62,6 +57,9 @@ class DaggerAlgorithm(BaseAlgorithm):
         self.n_expert_rollout_episodes = n_expert_rollout_episodes
         self.beta_decay      = beta_decay
         self.discrete_actions = hasattr(env.action_space, "n")
+
+        # Continuous agent/expert actions closer than this are not a disagreement.
+        self.disagreement_atol = 0.1
 
         # True only for hand-coded rule-based experts (e.g. FastPolicy).
         # ModelPolicy wraps SB3 models and must use the vectorised branch.
@@ -204,7 +202,9 @@ class DaggerAlgorithm(BaseAlgorithm):
                     if self.discrete_actions:
                         disagrees = int(agent_action[0]) != int(expert_action_scalar)
                     else:
-                        disagrees = not np.allclose(agent_action[0], expert_action_scalar, atol=0.1)
+                        disagrees = not np.allclose(
+                            agent_action[0], expert_action_scalar, atol=self.disagreement_atol
+                        )
                     expert_action_for_transition = (
                         int(expert_action_scalar) if self.discrete_actions
                         else np.asarray(expert_action_scalar, dtype=np.float32)
@@ -214,7 +214,9 @@ class DaggerAlgorithm(BaseAlgorithm):
                     if self.discrete_actions:
                         disagrees = int(agent_action[0]) != int(expert_action_vec[0])
                     else:
-                        disagrees = not np.allclose(agent_action[0], expert_action_vec[0], atol=0.1)
+                        disagrees = not np.allclose(
+                            agent_action[0], expert_action_vec[0], atol=self.disagreement_atol
+                        )
                     expert_action_for_transition = (
                         int(expert_action_vec[0]) if self.discrete_actions
                         else expert_action_vec[0].copy()
@@ -251,6 +253,25 @@ class DaggerAlgorithm(BaseAlgorithm):
         }
         return trajectories, collect_stats
 
+    def _obs_actions_tensors(self, dataset) -> tuple:
+        """Stack a transition dataset into (obs, actions) tensors.
+
+        Actions are int64 for discrete action spaces, float32 otherwise.
+        """
+        obs_t = torch.as_tensor(np.stack([t.observation for t in dataset]).astype(np.float32))
+        if self.discrete_actions:
+            act_t = torch.as_tensor(np.array([t.action for t in dataset], dtype=np.int64))
+        else:
+            act_t = torch.as_tensor(np.stack([t.action for t in dataset]).astype(np.float32))
+        return obs_t, act_t
+
+    @staticmethod
+    def _grad_norm(parameters) -> float:
+        grads = [p.grad.detach().flatten() for p in parameters if p.grad is not None]
+        if not grads:
+            return 0.0
+        return float(torch.linalg.vector_norm(torch.cat(grads)).item())
+
     def _bc_train(self) -> dict:
         """Behaviour cloning: minimize negative log-likelihood on expert actions."""
         empty_stats = {
@@ -260,11 +281,7 @@ class DaggerAlgorithm(BaseAlgorithm):
         if not self.dataset:
             return empty_stats
 
-        obs_t = torch.as_tensor(np.stack([t.observation for t in self.dataset]).astype(np.float32))
-        if self.discrete_actions:
-            act_t = torch.as_tensor(np.array([t.action for t in self.dataset], dtype=np.int64))
-        else:
-            act_t = torch.as_tensor(np.stack([t.action for t in self.dataset]).astype(np.float32))
+        obs_t, act_t = self._obs_actions_tensors(self.dataset)
 
         total_loss = total_log_prob = total_entropy = total_grad_norm = 0.0
         n_steps = 0
@@ -280,15 +297,13 @@ class DaggerAlgorithm(BaseAlgorithm):
 
                 self._optimizer.zero_grad()
                 loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.agent.parameters(), max_norm=float("inf")
-                )
+                grad_norm = self._grad_norm(list(self.agent.parameters()))
                 self._optimizer.step()
 
                 total_loss     += loss.item()
                 total_log_prob += log_prob.mean().item()
                 total_entropy  += entropy.mean().item() if entropy is not None else 0.0
-                total_grad_norm += grad_norm.item()
+                total_grad_norm += grad_norm
                 n_steps += 1
 
         n = max(n_steps, 1)
@@ -320,17 +335,18 @@ class DaggerAlgorithm(BaseAlgorithm):
         if not self.dataset_expert:
             return empty_stats
 
-        obs_np = np.stack([t.observation for t in self.dataset_expert]).astype(np.float32)
-        obs_t = torch.as_tensor(obs_np)
-        if self.discrete_actions:
-            act_t = torch.as_tensor(np.array([t.action for t in self.dataset_expert], dtype=np.int64))
-        else:
-            act_t = torch.as_tensor(np.stack([t.action for t in self.dataset_expert]).astype(np.float32))
+        obs_t, act_t = self._obs_actions_tensors(self.dataset_expert)
+        obs_np = obs_t.numpy()
 
         # NLL surrogate via the same evaluate_actions path used for BC training.
         with torch.no_grad():
             _, log_prob, _ = self.agent.evaluate_actions(obs_t, act_t)
         finite = torch.isfinite(log_prob)
+        n_dropped = int((~finite).sum().item())
+        if n_dropped:
+            self.logger.warn(
+                f"imitation NLL: dropped {n_dropped}/{len(log_prob)} non-finite log-probs"
+            )
         nll = float(-log_prob[finite].mean().item()) if finite.any() else 0.0
 
         # Deterministic action error: accuracy for discrete, RMSE for continuous.
@@ -384,12 +400,11 @@ class DaggerAlgorithm(BaseAlgorithm):
             total_reward += ep_reward
             total_length += ep_length
 
-            if EgoStatus is not None:
-                ego_status = info.get("ego_status", EgoStatus.RUNNING)
-                events["successes"]  += int(ego_status == EgoStatus.ARRIVED.value)
-                events["collisions"] += int(ego_status == EgoStatus.COLLIDED.value)
-                events["off_road"]   += int(ego_status == EgoStatus.OFF_ROAD.value)
-                events["timeouts"]   += int(ego_status == EgoStatus.TIMEOUT.value)
+            ego_status = info.get("ego_status", "running")
+            events["successes"]  += int(ego_status == "arrived")
+            events["collisions"] += int(ego_status == "collided")
+            events["off_road"]   += int(ego_status == "offroad")
+            events["timeouts"]   += int(ego_status == "timeout")
 
         return {
             "mean_ep_reward": total_reward / n_eval_episodes,

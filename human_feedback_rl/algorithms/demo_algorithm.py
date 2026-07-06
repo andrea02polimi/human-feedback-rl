@@ -1,8 +1,10 @@
 """Demonstration-based reward learning via MaxEnt IRL.
 
 ``DemoAlgorithm`` is the public facade and owns the alternating training loop.
-Its loss, rollout, diagnostics, and persistence methods live in the focused
-modules under :mod:`human_feedback_rl.algorithms.demo`.
+Loss, reward-training, imitation-metric, and diagnostic methods live in the
+focused mixins under :mod:`human_feedback_rl.algorithms.demo`; rollout,
+checkpointing and validation plumbing comes from the shared
+:class:`BaseRewardLearningAlgorithm`.
 
 Historical losses are preserved as separate configuration choices:
 
@@ -13,55 +15,33 @@ Historical losses are preserved as separate configuration choices:
     demo_corrected     bounded ranking loss on mean trajectory rewards
 """
 
+import os
 import time
 from typing import Any, List, Optional
 
 import numpy as np
 import torch as th
 
-from human_feedback_rl.algorithms.demo.checkpointing import CheckpointingMixin
-from human_feedback_rl.algorithms.demo.imitation_metrics import (
-    IMITATION_CLASSIFIER_L2,
-    IMITATION_CLASSIFIER_LR,
-    IMITATION_CLASSIFIER_STEPS,
-    IMITATION_MAX_TRANSITIONS_PER_CLASS,
-    ImitationMetricsMixin,
-)
+from human_feedback_rl.algorithms.demo.imitation_metrics import ImitationMetricsMixin
 from human_feedback_rl.algorithms.demo.losses import (
     VALID_LOSSES as DEMO_VALID_LOSSES,
     RewardLossMixin,
 )
 from human_feedback_rl.algorithms.demo.reward_diagnostics import RewardDiagnosticsMixin
 from human_feedback_rl.algorithms.demo.reward_training import RewardTrainingMixin
-from human_feedback_rl.algorithms.demo.rollout import RolloutMixin
-from human_feedback_rl.common.base_algorithm import BaseAlgorithm
-from human_feedback_rl.common.loggers import ExcludeFormatLogger, PrefixedLogger
+from human_feedback_rl.common.base_reward_learning_algorithm import BaseRewardLearningAlgorithm
 from human_feedback_rl.common.reward_nets import make_reward_ensemble
-from human_feedback_rl.common.trajectory_generators import TrajectoryGeneratorFromAgent
 from human_feedback_rl.common.types import Trajectory
 
 
 class DemoAlgorithm(
     RewardLossMixin,
     RewardTrainingMixin,
-    RolloutMixin,
     ImitationMetricsMixin,
     RewardDiagnosticsMixin,
-    CheckpointingMixin,
-    BaseAlgorithm,
+    BaseRewardLearningAlgorithm,
 ):
     """Alternating reward-learning (MaxEnt IRL) and agent-training loop."""
-
-    STATUS_ARRIVED = 0
-    STATUS_COLLIDED = 1
-    STATUS_OFFROAD = 2
-    STATUS_TIMEOUT = 3
-    STATUS_RUNNING = 4
-
-    IMITATION_MAX_TRANSITIONS_PER_CLASS = IMITATION_MAX_TRANSITIONS_PER_CLASS
-    IMITATION_CLASSIFIER_STEPS = IMITATION_CLASSIFIER_STEPS
-    IMITATION_CLASSIFIER_LR = IMITATION_CLASSIFIER_LR
-    IMITATION_CLASSIFIER_L2 = IMITATION_CLASSIFIER_L2
 
     VALID_LOSSES = DEMO_VALID_LOSSES
 
@@ -112,7 +92,22 @@ class DemoAlgorithm(
         if batch_size_expert <= 0 or batch_size_model <= 0:
             raise ValueError("Reward-model batch sizes must be positive.")
 
-        super().__init__(env, agent, rng, log_folder=log_folder, output_formats=output_formats)
+        reward_model = make_reward_ensemble(env, **(reward_model_kwargs or {}))
+
+        super().__init__(
+            env=env,
+            agent=agent,
+            reward_model=reward_model,
+            fragment_length=None if fragment_length is None else int(fragment_length),
+            exploration_frac=exploration_frac,
+            exploration_eps=exploration_eps,
+            temperature=temperature,
+            rng=rng,
+            log_folder=log_folder,
+            output_formats=output_formats,
+            debug_dataset=debug_dataset,
+            sampling_venv=rollout_env,
+        )
 
         self.expert_trajectories = list(expert_trajectories)
         self.loss_type = loss_type
@@ -120,32 +115,12 @@ class DemoAlgorithm(
         self.batch_size_expert = batch_size_expert
         self.batch_size_model = batch_size_model
         self.initial_agent_timesteps = initial_agent_timesteps
-        self.exploration_frac = exploration_frac
-        self.temperature = temperature
-        self.fragment_length = (
-            None if fragment_length is None else int(fragment_length)
-        )
         self.relabel_rewards = relabel_rewards
         self.normalize_agent_reward = normalize_agent_reward
-        self.trajectories = []
         # Per-gradient-step diagnostics for maxent_corrected (populated by the loss).
         self._maxent_corrected_steps = []
-        self.debug_dataset = debug_dataset or {}
         self._debug_rng = np.random.default_rng(0)
         self._debug_trajectories = self._split_into_trajectories(self.debug_dataset)
-
-        self.reward_model = make_reward_ensemble(env, **(reward_model_kwargs or {}))
-
-        agent.set_logger(ExcludeFormatLogger(PrefixedLogger(self.logger, "agent"), exclude="stdout"))
-        self.trajectory_generator = TrajectoryGeneratorFromAgent(
-            venv=env,
-            agent=agent,
-            reward_model=self.reward_model,
-            exploration_eps=exploration_eps,
-            rng=self.rng,
-            logger=self.logger,
-            sampling_venv=rollout_env,
-        )
 
         replay_buffer = getattr(agent, "replay_buffer", None)
         if replay_buffer is not None:
@@ -167,28 +142,26 @@ class DemoAlgorithm(
         log_interval: int = 1,
         checkpoint_dir: Optional[str] = None,
         checkpoint_interval: int = 10,
-        imitation_diagnostics_interval: int = 10,
         scatter_interval: Optional[int] = None,
     ) -> Any:
         """Run the full alternating reward-learning and agent-training loop."""
-        if imitation_diagnostics_interval < 0:
-            raise ValueError("imitation_diagnostics_interval must be non-negative.")
         if scatter_interval is None:
-            scatter_interval = imitation_diagnostics_interval
+            scatter_interval = 10
         if scatter_interval < 0:
             raise ValueError("scatter_interval must be non-negative.")
         n_iterations = int(total_timesteps / timesteps_per_iteration)
 
         if self.initial_agent_timesteps > 0:
             print(f"- Collecting {self.initial_agent_timesteps} bootstrap transitions")
-            self.trajectories = self._sample_rollout(self.initial_agent_timesteps)
+            self.trajectories = self.sample_rollout(self.initial_agent_timesteps)
             print("- Bootstrapping reward model")
             self._train_reward_model()
             self._update_agent_reward_normalization()
             print(f"- Pre-warming agent for {self.initial_agent_timesteps} timesteps on learned reward")
-            self._train_agent(self.initial_agent_timesteps, log_interval)
+            self.train_agent(self.initial_agent_timesteps, log_interval)
 
         for iteration in range(n_iterations):
+            self.iteration = iteration
             t_iter = time.perf_counter()
             print(f"\nIteration {iteration}/{n_iterations - 1}")
 
@@ -197,23 +170,10 @@ class DemoAlgorithm(
                 f"- Collecting {timesteps_per_iteration} agent + "
                 f"{exploration_steps} exploration transitions"
             )
-            self.trajectories = self._sample_rollout(
+            self.trajectories = self.sample_rollout(
                 timesteps_per_iteration, exploration_steps
             )
 
-            should_log_imitation = imitation_diagnostics_interval > 0 and (
-                iteration % imitation_diagnostics_interval == 0
-                or iteration == n_iterations - 1
-            )
-            if should_log_imitation:
-                # In Python la ricerca degli attributi avviene sull'istanza, non sulla
-                # classe che definisce il metodo. A runtime, quando chiami
-                # _log_imitation_diagnostics, self è sempre un'istanza concreta di
-                # DemoAlgorithm
-                self._log_imitation_diagnostics()
-
-            # Direct expert-imitation errors (RMSE + KL-proxy NLL) are cheap
-            # relative to the AUC classifier, so log them every iteration.
             self._log_expert_imitation_errors()
 
             all_transitions = [transition for traj in self.trajectories for transition in traj]
@@ -237,18 +197,27 @@ class DemoAlgorithm(
                 )
 
             print(f"- Training agent for {timesteps_per_iteration} timesteps")
-            self._train_agent(timesteps_per_iteration, log_interval)
+            self.train_agent(timesteps_per_iteration, log_interval)
 
-            self._log_iteration(t_iter, iteration)
+            self.log_iteration(t_iter)
             if checkpoint_dir is not None and (iteration + 1) % checkpoint_interval == 0:
-                self._save_checkpoint(checkpoint_dir, iteration + 1)
+                self.save_checkpoint(checkpoint_dir, iteration + 1)
 
         return self.trajectory_generator.agent
 
-    def _log_iteration(self, t_iter: float, iteration: int) -> None:
-        t_log = time.perf_counter()
-        self.logger.record("iterations", iteration)
-        self.logger.record("agent/time/total_timesteps", self.agent.num_timesteps)
-        self.logger.record("time/total", time.perf_counter() - t_iter)
-        self.logger.record_sum("time/loggings", time.perf_counter() - t_log)
-        self.logger.dump()
+    def _save_checkpoint_extras(self, ckpt_path: str, iteration: int) -> None:
+        """Persist reward-training state and the replay buffer next to the checkpoint."""
+        th.save(
+            {
+                "iteration": iteration,
+                "loss_type": self.loss_type,
+                "temperature": self.temperature,
+                "relabel_rewards": self.relabel_rewards,
+                "normalize_agent_reward": self.normalize_agent_reward,
+                "optimizers": [optimizer.state_dict() for optimizer in self.optimizers],
+            },
+            os.path.join(ckpt_path, "reward_training.pt"),
+        )
+        agent = self.trajectory_generator.agent
+        if hasattr(agent, "save_replay_buffer"):
+            agent.save_replay_buffer(os.path.join(ckpt_path, "replay_buffer.pkl"))

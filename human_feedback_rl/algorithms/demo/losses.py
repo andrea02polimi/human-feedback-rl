@@ -18,8 +18,43 @@ VALID_LOSSES = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Pure loss functions (tensor in, scalar tensor out)
+# ---------------------------------------------------------------------------
+
+def maxent_loss(expert_returns: th.Tensor, model_returns: th.Tensor) -> th.Tensor:
+    """Historical MaxEnt surrogate: model-only partition estimate."""
+    return -expert_returns.mean() + th.logsumexp(model_returns, dim=0) - np.log(len(model_returns))
+
+
+def maxent2_loss(expert_returns: th.Tensor, model_returns: th.Tensor) -> th.Tensor:
+    """Historical MaxEnt surrogate: expert+model partition estimate."""
+    all_returns = th.cat([model_returns, expert_returns], dim=0)
+    return -expert_returns.mean() + th.logsumexp(all_returns, dim=0) - np.log(len(all_returns))
+
+
+def demo_loss(expert_returns: th.Tensor, model_returns: th.Tensor) -> th.Tensor:
+    """Historical difference-of-means loss."""
+    return -expert_returns.mean() + model_returns.mean()
+
+
+def demo_corrected_loss(margins: th.Tensor, temperature: float) -> th.Tensor:
+    """Bounded ranking loss on per-pair expert-minus-model mean-reward margins."""
+    return F.softplus(-margins / temperature).mean()
+
+
+def maxent_corrected_partition(corrected_logits: th.Tensor) -> th.Tensor:
+    """Importance-corrected log-partition estimate over fragment logits R/tau - log q."""
+    return th.logsumexp(corrected_logits, dim=0) - np.log(len(corrected_logits))
+
+
 class RewardLossMixin:
-    """Loss computation methods used by :class:`DemoAlgorithm`."""
+    """Sampling and loss orchestration used by :class:`DemoAlgorithm`.
+
+    The loss formulas themselves are the module-level pure functions above;
+    this mixin samples trajectory batches, computes differentiable returns,
+    and dispatches on ``self.loss_type``.
+    """
 
     def _sample_trajectories(self):
         """Sample expert and model trajectory batches (no reward computation)."""
@@ -52,22 +87,19 @@ class RewardLossMixin:
 
         expert_returns, model_returns, expert_trajs, model_trajs = self._sample_returns(member)
 
-        expert_term = -expert_returns.mean()
         if self.loss_type in ("demo", "demo_loss"):
-            return expert_term + model_returns.mean()
+            return demo_loss(expert_returns, model_returns)
 
         if self.loss_type == "demo_corrected":
             margins = self._demo_corrected_margins(
                 expert_returns, model_returns, expert_trajs, model_trajs
             )
-            return F.softplus(-margins / self.temperature).mean()
+            return demo_corrected_loss(margins, self.temperature)
 
         if self.loss_type == "maxent_2":
-            all_returns = th.cat([model_returns, expert_returns], dim=0)
-            return expert_term + th.logsumexp(all_returns, dim=0) - np.log(len(all_returns))
+            return maxent2_loss(expert_returns, model_returns)
 
-        # maxent
-        return expert_term + th.logsumexp(model_returns, dim=0) - np.log(len(model_returns))
+        return maxent_loss(expert_returns, model_returns)
 
     def _maxent_corrected_loss(self, member) -> th.Tensor:
         """Importance-corrected MaxEnt NLL with optional fragment-level partition.
@@ -90,7 +122,7 @@ class RewardLossMixin:
         log_q = self._fragment_log_probs(model_trajs)
         scaled_returns = model_returns / self.temperature
         corrected_logits = scaled_returns - log_q
-        partition = th.logsumexp(corrected_logits, dim=0) - np.log(len(corrected_logits))
+        partition = maxent_corrected_partition(corrected_logits)
         self._record_maxent_corrected_step(scaled_returns, log_q, corrected_logits)
         return -expert_returns.mean() / self.temperature + partition
 
@@ -149,9 +181,6 @@ class RewardLossMixin:
         obs = np.asarray([t.observation for t in traj], dtype=np.float32)
         actions = np.asarray([t.action for t in traj])
         return [float(x) for x in policy_action_log_probs(self.agent, obs, actions)]
-
-    def _traj_log_policy_prob(self, traj: Trajectory) -> float:
-        return float(sum(self._traj_step_log_probs(traj)))
 
     def _traj_step_rewards(self, member, traj: Trajectory) -> th.Tensor:
         """Per-step rewards over a trajectory, preserving gradients. Shape (T,)."""
