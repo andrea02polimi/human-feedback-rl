@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import wandb
 from scipy.stats import spearmanr
 
+from human_feedback_rl.common.batching import fragment_sum_rewards
 from human_feedback_rl.common.types import Trajectory
 
 
@@ -15,8 +16,8 @@ class RewardDiagnosticsMixin:
     def _diagnostic_returns(self, member):
         expert_trajs = self._even_subset(self.expert_trajectories, self.batch_size_expert)
         model_trajs = self._even_subset(self.trajectories, self.batch_size_model)
-        expert_returns = th.stack([self._traj_sum_reward(member, traj) for traj in expert_trajs])
-        model_returns = th.stack([self._traj_sum_reward(member, traj) for traj in model_trajs])
+        expert_returns = fragment_sum_rewards(member, expert_trajs)
+        model_returns = fragment_sum_rewards(member, model_trajs)
         return expert_returns, model_returns, expert_trajs, model_trajs
 
     @staticmethod
@@ -235,11 +236,13 @@ class RewardDiagnosticsMixin:
     def _log_return_ranking(self, trajectories, log_class: str) -> None:
         if len(trajectories) < 2:
             return
-        true_returns, pred_returns = [], []
-        for traj in trajectories:
-            _, pred_rewards, _, _ = self._run_reward_inference_with_std(traj)
-            true_returns.append(float(sum(t.true_reward for t in traj)))
-            pred_returns.append(float(pred_rewards.sum()))
+        # One batched inference over all transitions, split back per trajectory.
+        all_transitions = [t for traj in trajectories for t in traj]
+        _, pred_rewards, _, _ = self._run_reward_inference_with_std(all_transitions)
+        lengths = [len(traj) for traj in trajectories]
+        boundaries = np.cumsum(lengths)[:-1]
+        pred_returns = [float(chunk.sum()) for chunk in np.split(pred_rewards, boundaries)]
+        true_returns = [float(sum(t.true_reward for t in traj)) for traj in trajectories]
         rho, _ = spearmanr(true_returns, pred_returns)
         is_defined = float(np.isfinite(rho))
         self.logger.record(f"{log_class}/spearman_returns_defined", is_defined)

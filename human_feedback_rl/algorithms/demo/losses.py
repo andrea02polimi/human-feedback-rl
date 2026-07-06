@@ -4,6 +4,11 @@ import numpy as np
 import torch as th
 import torch.nn.functional as F
 
+from human_feedback_rl.common.batching import (
+    fragment_sum_rewards,
+    per_step_rewards,
+    stacked_transitions,
+)
 from human_feedback_rl.common.trajectory_generators import policy_action_log_probs
 from human_feedback_rl.common.types import Trajectory
 
@@ -70,12 +75,8 @@ class RewardLossMixin:
     def _sample_returns(self, member):
         """Sample trajectories and compute differentiable whole-trajectory returns."""
         expert_trajs, model_trajs = self._sample_trajectories()
-        expert_returns = th.stack([
-            self._traj_sum_reward(member, traj) for traj in expert_trajs
-        ])
-        model_returns = th.stack([
-            self._traj_sum_reward(member, traj) for traj in model_trajs
-        ])
+        expert_returns = fragment_sum_rewards(member, expert_trajs)
+        model_returns = fragment_sum_rewards(member, model_trajs)
         return expert_returns, model_returns, expert_trajs, model_trajs
 
     def _reward_loss(self, member) -> th.Tensor:
@@ -184,11 +185,7 @@ class RewardLossMixin:
 
     def _traj_step_rewards(self, member, traj: Trajectory) -> th.Tensor:
         """Per-step rewards over a trajectory, preserving gradients. Shape (T,)."""
-        obs = th.tensor(np.array([t.observation for t in traj]), dtype=th.float32)
-        actions = th.tensor(np.array([t.action for t in traj]), dtype=th.float32)
-        next_status = th.tensor(np.array([t.next_status for t in traj]), dtype=th.float32)
-        done = th.tensor(np.array([float(t.done) for t in traj]), dtype=th.float32)
-        return member(obs, actions, next_status, done)
+        return member(*stacked_transitions(traj))
 
     def _traj_sum_reward(self, member, traj: Trajectory) -> th.Tensor:
         """Sum per-step rewards over a trajectory, preserving gradients."""
@@ -203,8 +200,7 @@ class RewardLossMixin:
     def _fragment_returns(self, member, trajectories) -> th.Tensor:
         """Per-fragment differentiable reward sums across all trajectories."""
         fragments = []
-        for traj in trajectories:
-            per_step = self._traj_step_rewards(member, traj)
+        for per_step in per_step_rewards(member, trajectories):
             length = per_step.shape[0]
             step = self._fragment_step(length)
             for i in range(0, length, step):

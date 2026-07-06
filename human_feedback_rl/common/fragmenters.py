@@ -1,6 +1,8 @@
 import numpy as np
+import torch as th
 from typing import List, Optional
 
+from .batching import stacked_transitions
 from .types import Trajectory, Fragment, FragmentPair
 from .reward_nets import RewardEnsemble
 
@@ -114,14 +116,22 @@ class HighVarianceFragmenter(RandomFragmenter):
         self.reward_ensemble = reward_ensemble
         self.oversample      = oversample
 
-    def _fragment_variance(self, fragment: Fragment) -> float:
-        """Variance of predicted returns across ensemble members for one fragment."""
-        obs          = np.stack([t.observation for t in fragment])
-        acts         = np.stack([t.action for t in fragment])
-        next_statuses = np.stack([t.next_status for t in fragment]) if fragment[0].next_status is not None else None
-        dones        = np.array([t.done for t in fragment], dtype=np.float32)
-        all_rewards  = self.reward_ensemble.predict_all(obs, acts, next_statuses, dones)
-        return float(all_rewards.sum(axis=0).var())
+    def _fragment_variances(self, fragments: List[Fragment]) -> np.ndarray:
+        """Variance of predicted returns across ensemble members, per fragment.
+
+        One batched ``predict_all`` over the concatenated fragments instead of
+        one call per fragment.
+        """
+        lengths = [len(f) for f in fragments]
+        parts = [stacked_transitions(f) for f in fragments]
+        obs, acts, statuses, dones = (
+            th.cat([p[i] for p in parts]).numpy() for i in range(4)
+        )
+        all_rewards = self.reward_ensemble.predict_all(obs, acts, statuses, dones)
+        boundaries = np.cumsum(lengths)[:-1]
+        return np.array([
+            chunk.sum(axis=0).var() for chunk in np.split(all_rewards, boundaries)
+        ])
 
     def _select_high_variance(self, fragments: List[Fragment], num_keep: int) -> List[Fragment]:
         seen, unique = set(), []
@@ -130,7 +140,7 @@ class HighVarianceFragmenter(RandomFragmenter):
             if key not in seen:
                 seen.add(key)
                 unique.append(f)
-        variances   = np.array([self._fragment_variance(f) for f in unique])
+        variances   = self._fragment_variances(unique)
         top_indices = np.argsort(variances)[-num_keep:][::-1]
         return [unique[i] for i in top_indices]
 

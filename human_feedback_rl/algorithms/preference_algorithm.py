@@ -6,6 +6,7 @@ import torch as th
 
 from human_feedback_rl.common import status
 from human_feedback_rl.common.base_reward_learning_algorithm import BaseRewardLearningAlgorithm
+from human_feedback_rl.common.batching import fragment_avg_rewards, stacked_transitions
 from human_feedback_rl.common.datasets import PreferenceDataset
 from human_feedback_rl.common.fragmenters import HighVariancePairFragmenter, RandomPairFragmenter
 from human_feedback_rl.common.gatherers import PreferenceGathererFromReward
@@ -205,8 +206,8 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
             for _ in range(self.gradient_steps_rew):
                 batch = boot_dataset.sample(self.batch_size_rew)
 
-                r1 = th.stack([member.fragment_avg_reward(p.frag1) for p in batch.fragment_pairs])
-                r2 = th.stack([member.fragment_avg_reward(p.frag2) for p in batch.fragment_pairs])
+                r1 = fragment_avg_rewards(member, [p.frag1 for p in batch.fragment_pairs])
+                r2 = fragment_avg_rewards(member, [p.frag2 for p in batch.fragment_pairs])
                 bt_probs = bradley_terry_probs(r1, r2)
 
                 labels = th.tensor(
@@ -238,8 +239,8 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
         """Return (loss, accuracy) of the full ensemble on a preference batch."""
         self.reward_model.eval()
         with th.no_grad():
-            r1 = th.stack([self.reward_model.fragment_avg_reward(p.frag1) for p in data.fragment_pairs])
-            r2 = th.stack([self.reward_model.fragment_avg_reward(p.frag2) for p in data.fragment_pairs])
+            r1 = fragment_avg_rewards(self.reward_model, [p.frag1 for p in data.fragment_pairs])
+            r2 = fragment_avg_rewards(self.reward_model, [p.frag2 for p in data.fragment_pairs])
             bt_probs = bradley_terry_probs(r1, r2)
         self.reward_model.train()
 
@@ -276,13 +277,13 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
         if n == 0:
             return {k: 0.0 for k in (*STATUS_IDX, "only_running")}
 
-        def has_status(frag, idx):
-            return any(t.next_status is not None and t.next_status[idx] for t in frag)
-
-        counts = {k: sum(has_status(f, i) for f in frags) for k, i in STATUS_IDX.items()}
-        counts["only_running"] = sum(
-            not any(has_status(f, i) for i in STATUS_IDX.values()) for f in frags
-        )
+        # (n_frags, STATUS_DIM) booleans: does the fragment contain each status?
+        has_status = np.stack([
+            stacked_transitions(f)[2].numpy().any(axis=0) for f in frags
+        ])
+        counts = {k: int(has_status[:, i].sum()) for k, i in STATUS_IDX.items()}
+        terminal_indices = list(STATUS_IDX.values())
+        counts["only_running"] = int((~has_status[:, terminal_indices].any(axis=1)).sum())
         return {k: v / n for k, v in counts.items()}
 
     def _make_fragmenter(self, fragmenter_type: str):
