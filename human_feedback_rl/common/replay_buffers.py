@@ -88,10 +88,69 @@ class RewardDiagnosticsReplayBuffer(ReplayBuffer):
 
 
 class RewardRelabelReplayBuffer(RewardDiagnosticsReplayBuffer):
-    """Replay buffer with configurable lazy relabelling and staleness diagnostics."""
+    """Replay buffer with configurable lazy relabelling and staleness diagnostics.
+
+    The reward model only changes between training iterations, so relabelled
+    rewards are constant while the agent trains. ``refresh_relabel_cache()``
+    relabels the whole buffer once per iteration; sampling then reads the
+    cache instead of running the reward model on every batch. Entries added
+    after the refresh use their stored reward, which the reward wrapper wrote
+    with the same frozen model. Without a refresh, sampling falls back to
+    live per-batch relabelling (the original behavior).
+    """
+
+    RELABEL_CHUNK = 65536
 
     def __init__(self, *args, relabel_rewards: bool = True, **kwargs):
         super().__init__(*args, relabel_rewards=relabel_rewards, **kwargs)
+        self._relabel_cache: Optional[np.ndarray] = None
+        self._refresh_pos = 0
+        self._writes_since_refresh = 0
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["_relabel_cache"] = None
+        return state
+
+    def add(self, *args, **kwargs) -> None:
+        self._writes_since_refresh += 1
+        super().add(*args, **kwargs)
+
+    def refresh_relabel_cache(self) -> None:
+        """Relabel every stored transition with the current (frozen) reward model."""
+        upper = self.buffer_size if self.full else self.pos
+        if upper == 0 or self.reward_model is None:
+            return
+        if self._relabel_cache is None:
+            self._relabel_cache = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+
+        flat_total = upper * self.n_envs
+        for start in range(0, flat_total, self.RELABEL_CHUNK):
+            flat = np.arange(start, min(start + self.RELABEL_CHUNK, flat_total))
+            batch_inds, env_indices = flat // self.n_envs, flat % self.n_envs
+            self._relabel_cache[batch_inds, env_indices] = self._predict_rewards(
+                batch_inds, env_indices
+            )
+
+        self._refresh_pos = self.pos
+        self._writes_since_refresh = 0
+
+    def _relabelled_rewards(
+        self, batch_inds: np.ndarray, env_indices: np.ndarray
+    ) -> np.ndarray:
+        if self._relabel_cache is None:
+            return self._predict_rewards(batch_inds, env_indices)
+
+        rewards = self._relabel_cache[batch_inds, env_indices]
+        writes = min(self._writes_since_refresh, self.buffer_size)
+        if writes:
+            # Positions written after the refresh hold rewards the env wrapper
+            # produced with the same frozen model: use them as stored.
+            fresh = ((batch_inds - self._refresh_pos) % self.buffer_size) < writes
+            if fresh.any():
+                rewards = rewards.copy()
+                rewards[fresh] = self.rewards[batch_inds[fresh], env_indices[fresh]]
+        return rewards
 
     def _get_samples(
         self,
@@ -108,7 +167,7 @@ class RewardRelabelReplayBuffer(RewardDiagnosticsReplayBuffer):
             next_obs = self._normalize_obs(self.next_observations[batch_inds, env_indices], env)
 
         if self.relabel_rewards:
-            rewards = self._predict_rewards(batch_inds, env_indices)
+            rewards = self._relabelled_rewards(batch_inds, env_indices)
         else:
             rewards = self.rewards[batch_inds, env_indices]
         rewards = rewards.reshape(-1, 1)

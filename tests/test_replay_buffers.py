@@ -73,3 +73,84 @@ def test_pickle_drops_reward_model():
     buf = _filled_buffer(RewardDiagnosticsReplayBuffer, relabel=False)
     restored = pickle.loads(pickle.dumps(buf))
     assert restored.reward_model is None
+
+
+class TestRelabelCache:
+    def test_cached_rewards_match_live_relabelling_exactly(self):
+        buf = _filled_buffer(RewardRelabelReplayBuffer, relabel=True)
+        buf.refresh_relabel_cache()
+        upper = buf.buffer_size if buf.full else buf.pos
+        batch_inds = np.arange(upper)
+        for env_idx in range(buf.n_envs):
+            env_indices = np.full(upper, env_idx)
+            cached = buf._relabelled_rewards(batch_inds, env_indices)
+            live = buf._predict_rewards(batch_inds, env_indices)
+            assert np.array_equal(cached, live)
+
+    def test_entries_added_after_refresh_use_stored_rewards(self):
+        buf = _filled_buffer(RewardRelabelReplayBuffer, relabel=True, n_steps=10)
+        buf.refresh_relabel_cache()
+        pos_at_refresh = buf.pos
+
+        env = FakeVecEnv(num_envs=buf.n_envs, episode_len=5, seed=9)
+        obs = env.reset()
+        for _ in range(4):
+            actions = np.stack([env.action_space.sample() for _ in range(buf.n_envs)])
+            env.step_async(actions)
+            next_obs, rewards, dones, infos = env.step_wait()
+            buf.add(obs, next_obs, actions, rewards, dones, infos)
+            obs = next_obs
+
+        fresh_inds = np.array([pos_at_refresh, pos_at_refresh + 1])
+        env_indices = np.zeros(2, dtype=int)
+        got = buf._relabelled_rewards(fresh_inds, env_indices)
+        assert np.array_equal(got, buf.rewards[fresh_inds, env_indices])
+
+    def test_wraparound_freshness_mask(self):
+        # Tiny buffer: refresh when full, then overwrite so fresh entries wrap.
+        buf = _filled_buffer(RewardRelabelReplayBuffer, relabel=True, n_steps=6)
+        small = RewardRelabelReplayBuffer(
+            buffer_size=4,
+            observation_space=buf.observation_space,
+            action_space=buf.action_space,
+            n_envs=1,
+            relabel_rewards=True,
+        )
+        small.set_reward_model(ConstantRewardNet())
+        env = FakeVecEnv(num_envs=1, episode_len=3, seed=2)
+        obs = env.reset()
+
+        def step_into(buffer):
+            nonlocal obs
+            actions = np.stack([env.action_space.sample()])
+            env.step_async(actions)
+            next_obs, rewards, dones, infos = env.step_wait()
+            buffer.add(obs, next_obs, actions, rewards, dones, infos)
+            obs = next_obs
+
+        for _ in range(4):
+            step_into(small)  # fill completely (pos wraps to 0)
+        small.refresh_relabel_cache()
+        for _ in range(3):
+            step_into(small)  # overwrite positions 0, 1, 2 after the refresh
+
+        env_indices = np.zeros(4, dtype=int)
+        got = small._relabelled_rewards(np.arange(4), env_indices)
+        stored = small.rewards[np.arange(4), env_indices]
+        cached = small._relabel_cache[np.arange(4), 0]
+        assert np.array_equal(got[:3], stored[:3])  # fresh (rewritten) entries
+        assert got[3] == cached[3]                  # old entry still from cache
+
+    def test_no_refresh_falls_back_to_live_relabelling(self):
+        buf = _filled_buffer(RewardRelabelReplayBuffer, relabel=True)
+        assert buf._relabel_cache is None
+        batch_inds = np.arange(8)
+        env_indices = np.zeros(8, dtype=int)
+        got = buf._relabelled_rewards(batch_inds, env_indices)
+        assert np.array_equal(got, buf._predict_rewards(batch_inds, env_indices))
+
+    def test_pickle_drops_cache(self):
+        buf = _filled_buffer(RewardRelabelReplayBuffer, relabel=True)
+        buf.refresh_relabel_cache()
+        restored = pickle.loads(pickle.dumps(buf))
+        assert restored._relabel_cache is None

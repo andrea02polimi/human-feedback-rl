@@ -17,6 +17,7 @@ from scipy.stats import kendalltau
 
 from human_feedback_rl.common import status
 from human_feedback_rl.common.base_algorithm import BaseAlgorithm
+from human_feedback_rl.common.batching import stacked_transitions
 from human_feedback_rl.common.fragmenters import RandomSingleFragmenter
 from human_feedback_rl.common.loggers import ExcludeFormatLogger, PrefixedLogger
 from human_feedback_rl.common.reward_nets import RewardNet
@@ -259,7 +260,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         
         t0 = time.perf_counter()
         true_rewards  = [traj.total_reward()              for traj in trajectories]
-        model_rewards = [self._score_trajectory(traj)     for traj in trajectories]
+        model_rewards = self._score_trajectories(trajectories)
         lengths       = [len(traj)                        for traj in trajectories]
 
         self.logger.record("rollout/mean_true_reward",  float(np.mean(true_rewards)))
@@ -295,12 +296,18 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
             "rollout/action_component_at_bound_fraction", float(at_bound.mean())
         )
 
-    def _score_trajectory(self, traj: Trajectory) -> float:
-        obs         = np.array([t.observation for t in traj])
-        acts        = np.array([t.action for t in traj])
-        next_status = np.array([t.next_status for t in traj])
-        done        = np.array([float(t.done) for t in traj])
-        return self.reward_model.predict(obs, acts, next_status, done).sum()
+    def _score_trajectories(self, trajectories) -> List[float]:
+        """Predicted (agent-facing) return of each trajectory, via one batched predict."""
+        if not trajectories:
+            return []
+        lengths = [len(traj) for traj in trajectories]
+        parts = [stacked_transitions(traj) for traj in trajectories]
+        obs, acts, next_status, done = (
+            th.cat([p[i] for p in parts]).numpy() for i in range(4)
+        )
+        rewards = self.reward_model.predict(obs, acts, next_status, done)
+        boundaries = np.cumsum(lengths)[:-1]
+        return [float(chunk.sum()) for chunk in np.split(rewards, boundaries)]
 
 
     def train_agent(self, steps: int, log_interval: int) -> None:

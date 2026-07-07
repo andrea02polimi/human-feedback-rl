@@ -159,6 +159,7 @@ class DemoAlgorithm(
             print("- Bootstrapping reward model")
             self._train_reward_model()
             self._update_agent_reward_normalization()
+            self._refresh_replay_relabel_cache()
             print(f"- Pre-warming agent for {self.initial_agent_timesteps} timesteps on learned reward")
             self.train_agent(self.initial_agent_timesteps, log_interval)
 
@@ -198,6 +199,7 @@ class DemoAlgorithm(
                     iteration,
                 )
 
+            self._refresh_replay_relabel_cache()
             print(f"- Training agent for {timesteps_per_iteration} timesteps")
             self.train_agent(timesteps_per_iteration, log_interval)
 
@@ -206,6 +208,18 @@ class DemoAlgorithm(
                 self.save_checkpoint(checkpoint_dir, iteration + 1)
 
         return self.trajectory_generator.agent
+
+    def _refresh_replay_relabel_cache(self) -> None:
+        """Relabel the replay buffer once per iteration (the model is frozen during learn).
+
+        Must run after ``_update_agent_reward_normalization``: cached rewards
+        use the final normalization statistics for this iteration.
+        """
+        if not self.relabel_rewards:
+            return
+        replay_buffer = getattr(self.agent, "replay_buffer", None)
+        if replay_buffer is not None and hasattr(replay_buffer, "refresh_relabel_cache"):
+            replay_buffer.refresh_relabel_cache()
 
     def _save_checkpoint_extras(self, ckpt_path: str, iteration: int) -> None:
         """Persist reward-training state and the replay buffer next to the checkpoint."""

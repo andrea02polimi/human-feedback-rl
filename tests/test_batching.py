@@ -72,6 +72,24 @@ def test_fragment_sum_rewards_gradients_match_loop(rng, tiny_reward_ensemble):
         assert th.allclose(got, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_score_trajectories_matches_per_trajectory_predict(rng, tiny_reward_ensemble):
+    from human_feedback_rl.common.base_reward_learning_algorithm import (
+        BaseRewardLearningAlgorithm,
+    )
+
+    class _Shim:
+        reward_model = tiny_reward_ensemble
+        _score_trajectories = BaseRewardLearningAlgorithm._score_trajectories
+
+    trajs = make_trajectories(rng, [4, 9, 2, 6])  # unequal lengths
+    batched = _Shim()._score_trajectories(trajs)
+    for traj, got in zip(trajs, batched):
+        obs, acts, status, done = (t.numpy() for t in stacked_transitions(traj))
+        expected = float(tiny_reward_ensemble.predict(obs, acts, status, done).sum())
+        assert got == pytest.approx(expected, rel=1e-6, abs=1e-6)
+    assert _Shim()._score_trajectories([]) == []
+
+
 def test_hand_computed_values_with_constant_net(rng):
     frags = make_trajectories(rng, [2, 3])
     net = ConstantRewardNet()

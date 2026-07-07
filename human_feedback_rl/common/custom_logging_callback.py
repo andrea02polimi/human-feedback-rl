@@ -30,7 +30,8 @@ class FixedIntervalDumpCallback(BaseCallback):
         bucket = self.num_timesteps // self.dump_interval
         if bucket > self._last_bucket:
             self._last_bucket = bucket
-            self.model._dump_logs()
+            # dump_logs() is the public name; _dump_logs() the pre-2.7 one.
+            getattr(self.model, "dump_logs", getattr(self.model, "_dump_logs", None))()
         return True
 
 
