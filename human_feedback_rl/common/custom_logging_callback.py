@@ -1,6 +1,39 @@
 from stable_baselines3.common.callbacks import BaseCallback
 
 
+class FixedIntervalDumpCallback(BaseCallback):
+    """Dump the SB3 logger every ``dump_interval`` environment timesteps.
+
+    Off-policy algorithms (SAC) dump on episode ends, so runs with different
+    seeds log at different ``total_timesteps`` values and W&B grouped panels
+    with a custom x-axis cannot aggregate them into min/max bands. Timesteps
+    advance in identical ``n_envs`` increments for every seed, so dumping on a
+    fixed timestep grid puts every seed's points on the same x values.
+
+    Use together with ``learn(log_interval=None)`` so the episode-based dump
+    is disabled; otherwise the off-grid episode dumps reintroduce misaligned
+    points.
+    """
+
+    def __init__(self, dump_interval: int):
+        super().__init__()
+        if dump_interval <= 0:
+            raise ValueError(f"dump_interval must be positive, got {dump_interval}")
+        self.dump_interval = dump_interval
+        self._last_bucket = None
+
+    def _on_training_start(self) -> None:
+        if self._last_bucket is None:
+            self._last_bucket = self.num_timesteps // self.dump_interval
+
+    def _on_step(self) -> bool:
+        bucket = self.num_timesteps // self.dump_interval
+        if bucket > self._last_bucket:
+            self._last_bucket = bucket
+            self.model._dump_logs()
+        return True
+
+
 class CustomLoggingCallback(BaseCallback):
     """Logs per-episode metrics emitted by the sumo-rl-ego environment.
 

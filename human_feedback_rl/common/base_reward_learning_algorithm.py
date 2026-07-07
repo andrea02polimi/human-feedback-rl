@@ -79,6 +79,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         output_formats: Optional[List] = None,
         debug_dataset: Optional[Dict] = None,
         sampling_venv=None,
+        agent_log_timestep_interval: Optional[int] = None,
     ):
         super().__init__(env, agent, rng, log_folder=log_folder, output_formats=output_formats)
 
@@ -105,6 +106,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
             rng=self.rng,
             logger=self.logger,
             sampling_venv=sampling_venv,
+            dump_timestep_interval=agent_log_timestep_interval,
         )
 
         # Used exclusively for reward-correlation logging (always single fragments).

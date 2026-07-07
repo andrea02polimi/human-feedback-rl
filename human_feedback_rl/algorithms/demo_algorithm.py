@@ -69,6 +69,7 @@ class DemoAlgorithm(
         rollout_env=None,
         relabel_rewards: bool = True,
         normalize_agent_reward: bool = True,
+        agent_log_timestep_interval: Optional[int] = None,
     ):
         if not expert_trajectories:
             raise ValueError("expert_trajectories must be a non-empty list of Trajectory objects.")
@@ -107,6 +108,7 @@ class DemoAlgorithm(
             output_formats=output_formats,
             debug_dataset=debug_dataset,
             sampling_venv=rollout_env,
+            agent_log_timestep_interval=agent_log_timestep_interval,
         )
 
         self.expert_trajectories = list(expert_trajectories)

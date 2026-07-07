@@ -50,6 +50,7 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
         log_folder: Optional[str] = None,
         output_formats: Optional[List] = None,
         debug_dataset: Optional[dict] = None,
+        agent_log_timestep_interval: Optional[int] = None,
     ):
         reward_model = make_reward_ensemble(env, **(reward_model_kwargs or {}))
 
@@ -68,6 +69,7 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
             log_folder=log_folder,
             output_formats=output_formats,
             debug_dataset=debug_dataset,
+            agent_log_timestep_interval=agent_log_timestep_interval,
         )
 
         self.gradient_steps_rew  = gradient_steps_rew

@@ -8,12 +8,18 @@ from . import types
 import numpy as np
 import time
 from typing import List, Any, Sequence, Optional
-from .custom_logging_callback import CustomLoggingCallback
+from .custom_logging_callback import CustomLoggingCallback, FixedIntervalDumpCallback
 import torch as th
 
 
 class TrajectoryGeneratorFromAgent:
-    """Wrapper for training an SB3 agent on an arbitrary reward function."""
+    """Wrapper for training an SB3 agent on an arbitrary reward function.
+
+    ``dump_timestep_interval``: when set, the agent's logs are dumped every N
+    environment timesteps instead of SB3's native cadence (episodes for
+    off-policy algorithms). This aligns the log x-values across seeds, which
+    W&B grouped panels need to draw min/max bands on a custom x-axis.
+    """
 
     def __init__(
         self,
@@ -24,10 +30,12 @@ class TrajectoryGeneratorFromAgent:
         logger=None,
         rng: np.random.Generator = None,
         sampling_venv: Optional[VecEnv] = None,
+        dump_timestep_interval: Optional[int] = None,
     ) -> None:
 
         self.logger = logger if logger is not None else NullLogger()
         self.agent        = agent
+        self.dump_timestep_interval = dump_timestep_interval
 
         self.rng = rng if rng is not None else np.random.default_rng()
         self.reward_model    = reward_model
@@ -75,10 +83,17 @@ class TrajectoryGeneratorFromAgent:
                 "Call AgentTrainer.sample() first to clear them.",
             )
 
+        callbacks = [CustomLoggingCallback()]
+        if self.dump_timestep_interval is not None:
+            # Fixed-grid dumps replace SB3's native cadence entirely:
+            # log_interval=None disables the episode/rollout-based dump.
+            callbacks.append(FixedIntervalDumpCallback(self.dump_timestep_interval))
+            log_interval = None
+
         self.agent.learn(
             total_timesteps=steps,
             reset_num_timesteps=False,
-            callback=CustomLoggingCallback(),
+            callback=callbacks,
             log_interval=log_interval,
             **kwargs,
         )
