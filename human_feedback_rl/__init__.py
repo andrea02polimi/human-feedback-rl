@@ -2,6 +2,17 @@
 
 __version__ = "0.2.0"
 
-from human_feedback_rl.algorithms import DaggerAlgorithm, DemoAlgorithm, PreferenceAlgorithm
+from human_feedback_rl.algorithms import (
+    DaggerAlgorithm,
+    DemoAlgorithm,
+    HybridAlgorithm,
+    PreferenceAlgorithm,
+)
 
-__all__ = ["DaggerAlgorithm", "DemoAlgorithm", "PreferenceAlgorithm", "__version__"]
+__all__ = [
+    "DaggerAlgorithm",
+    "DemoAlgorithm",
+    "HybridAlgorithm",
+    "PreferenceAlgorithm",
+    "__version__",
+]

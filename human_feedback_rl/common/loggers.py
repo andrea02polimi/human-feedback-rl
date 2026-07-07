@@ -64,6 +64,12 @@ VISIBLE_METRICS = (
     "reward/demo_scale_std",
     "reward/demo_corrected_margin",
     "reward/demo_corrected_scale_std",
+    # Hybrid preference + demonstration reward learning.
+    "reward/hybrid_pref_loss",
+    "reward/hybrid_demo_loss",
+    "reward/hybrid_demo_scale",
+    "reward/grad_norm_demo_pref_ratio",
+    "reward/acc_pref_val",
 )
 VISIBLE_METRIC_SET = frozenset(VISIBLE_METRICS)
 

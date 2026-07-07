@@ -5,7 +5,12 @@ import pytest
 import torch as th
 from stable_baselines3 import PPO, SAC
 
-from human_feedback_rl.algorithms import DaggerAlgorithm, DemoAlgorithm, PreferenceAlgorithm
+from human_feedback_rl.algorithms import (
+    DaggerAlgorithm,
+    DemoAlgorithm,
+    HybridAlgorithm,
+    PreferenceAlgorithm,
+)
 from human_feedback_rl.common import BCPolicy
 from human_feedback_rl.common.replay_buffers import RewardRelabelReplayBuffer
 from human_feedback_rl.common.reward_nets import make_reward_ensemble
@@ -92,6 +97,32 @@ def test_demo_algorithm_maxent_corrected_with_rollout_env(rng):
     )
     # The importance correction ran: per-step diagnostics were recorded.
     assert algo._maxent_corrected_steps
+
+
+def test_hybrid_algorithm_trains(rng):
+    env = FakeVecEnv(num_envs=2, episode_len=10)
+    algo = HybridAlgorithm(
+        env,
+        _sac(env),
+        expert_trajectories=make_trajectories(rng, [10, 10, 10]),
+        loss_type="maxent_2",
+        gradient_steps_rew=2,
+        batch_size_expert=2,
+        batch_size_model=2,
+        batch_size_pref=4,
+        total_queries=8,
+        preference_fragment_length=3,
+        relabel_rewards=True,
+        reward_model_kwargs=RM_KWARGS,
+        rng=np.random.default_rng(0),
+        output_formats=[],
+    )
+    agent = algo.train(
+        total_timesteps=64, timesteps_per_iteration=32, log_interval=100, scatter_interval=0
+    )
+    assert agent is algo.agent
+    assert len(algo.dataset_train) > 0 and len(algo.dataset_val) > 0
+    assert algo.reward_model.normalization_std > 0
 
 
 def test_demo_checkpoint_roundtrip(tmp_path, rng):
