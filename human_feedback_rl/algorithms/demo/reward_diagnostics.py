@@ -4,7 +4,7 @@ import numpy as np
 import torch as th
 import torch.nn.functional as F
 import wandb
-from scipy.stats import spearmanr
+from scipy.stats import pearsonr, spearmanr
 
 from human_feedback_rl.common.batching import fragment_sum_rewards
 from human_feedback_rl.common.types import Trajectory
@@ -176,7 +176,9 @@ class RewardDiagnosticsMixin:
             self._log_return_ranking(self._debug_trajectories, debug_prefix)
 
     def _log_reward_validation(self, transitions, log_class: str) -> None:
-        _, pred_rewards, pred_std, status = self._run_reward_inference_with_std(transitions)
+        true_rewards, pred_rewards, pred_std, status = self._run_reward_inference_with_std(transitions)
+        running_only = status[:, self.STATUS_RUNNING] == 1
+        self._record_reward_correlation(f"{log_class}/pred_true", true_rewards, pred_rewards, running_only)
         arrived_mask = status[:, self.STATUS_ARRIVED] == 1
         collided_mask = status[:, self.STATUS_COLLIDED] == 1
         offroad_mask = status[:, self.STATUS_OFFROAD] == 1
@@ -198,6 +200,31 @@ class RewardDiagnosticsMixin:
             self.logger.record(f"{log_class}/gap_arrived_running", arrived_mean - running_mean)
         self.logger.record(f"{log_class}/ensemble_std", float(np.mean(pred_std)))
         self._record_masked_mean(f"{log_class}/ensemble_std_running", pred_std, running_mask)
+
+    def _record_reward_correlation(
+        self,
+        key_prefix: str,
+        true_rewards: np.ndarray,
+        pred_rewards: np.ndarray,
+        running_mask: np.ndarray,
+    ) -> None:
+        """Log per-step pred vs true reward correlation.
+
+        This is the reward model's primary health metric: with soft preference
+        labels the Bradley-Terry loss sits at its ln(2) cross-entropy floor
+        even when learning succeeds, so correlation (and preference accuracy)
+        are what to watch instead.
+        """
+        for suffix, mask in (("all", np.ones(len(true_rewards), dtype=bool)), ("running", running_mask)):
+            t, p = true_rewards[mask], pred_rewards[mask]
+            if len(t) < 2 or np.std(t) < 1e-12 or np.std(p) < 1e-12:
+                continue
+            pearson, _ = pearsonr(t, p)
+            spearman, _ = spearmanr(t, p)
+            if np.isfinite(pearson):
+                self.logger.record(f"{key_prefix}/pearson_{suffix}", float(pearson))
+            if np.isfinite(spearman):
+                self.logger.record(f"{key_prefix}/spearman_{suffix}", float(spearman))
 
     def _record_masked_mean(self, key: str, values: np.ndarray, mask: np.ndarray):
         if np.any(mask):

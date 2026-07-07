@@ -7,6 +7,19 @@ from .types import Trajectory, Fragment, FragmentPair
 from .reward_nets import RewardEnsemble
 
 
+def make_pair_fragmenter(kind: str, rng, logger, reward_ensemble=None, oversample: int = 5):
+    """Build a pair fragmenter by name: "random" or "active" (ensemble disagreement)."""
+    if kind == "active":
+        if reward_ensemble is None:
+            raise ValueError('fragmenter "active" requires a reward_ensemble.')
+        return HighVariancePairFragmenter(
+            rng=rng, logger=logger, reward_ensemble=reward_ensemble, oversample=oversample
+        )
+    if kind == "random":
+        return RandomPairFragmenter(rng=rng, logger=logger)
+    raise ValueError(f"Unknown fragmenter type: {kind!r}")
+
+
 class RandomFragmenter:
 
     def __init__(

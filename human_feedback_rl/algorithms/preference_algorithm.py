@@ -8,11 +8,12 @@ from human_feedback_rl.common import status
 from human_feedback_rl.common.base_reward_learning_algorithm import BaseRewardLearningAlgorithm
 from human_feedback_rl.common.batching import fragment_avg_rewards, stacked_transitions
 from human_feedback_rl.common.datasets import PreferenceDataset
-from human_feedback_rl.common.fragmenters import HighVariancePairFragmenter, RandomPairFragmenter
+from human_feedback_rl.common.fragmenters import make_pair_fragmenter
 from human_feedback_rl.common.gatherers import PreferenceGathererFromReward
 from human_feedback_rl.common.losses import (
     bradley_terry_probs,
-    preference_accuracy,
+    evaluate_preference_batch,
+    preference_labels_tensor,
     preference_nll,
 )
 from human_feedback_rl.common.reward_nets import make_reward_ensemble
@@ -75,7 +76,9 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
         self.gradient_steps_rew  = gradient_steps_rew
         self.batch_size_rew      = batch_size_rew
 
-        self.fragmenter          = self._make_fragmenter(fragmenter_type)
+        self.fragmenter = make_pair_fragmenter(
+            fragmenter_type, rng=self.rng, logger=self.logger, reward_ensemble=self.reward_model
+        )
         self.preference_gatherer = PreferenceGathererFromReward(
             logger=self.logger, labels_type=labels_type, temperature=temperature, rng=self.rng
         )
@@ -211,11 +214,7 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
                 r1 = fragment_avg_rewards(member, [p.frag1 for p in batch.fragment_pairs])
                 r2 = fragment_avg_rewards(member, [p.frag2 for p in batch.fragment_pairs])
                 bt_probs = bradley_terry_probs(r1, r2)
-
-                labels = th.tensor(
-                    [[p.pref1, p.pref2] for p in batch.preferences], dtype=th.float32
-                )
-                loss = preference_nll(bt_probs, labels)
+                loss = preference_nll(bt_probs, preference_labels_tensor(batch.preferences))
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -239,15 +238,7 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
 
     def _evaluate_reward_model(self, data) -> tuple:
         """Return (loss, accuracy) of the full ensemble on a preference batch."""
-        self.reward_model.eval()
-        with th.no_grad():
-            r1 = fragment_avg_rewards(self.reward_model, [p.frag1 for p in data.fragment_pairs])
-            r2 = fragment_avg_rewards(self.reward_model, [p.frag2 for p in data.fragment_pairs])
-            bt_probs = bradley_terry_probs(r1, r2)
-        self.reward_model.train()
-
-        labels = th.tensor([[p.pref1, p.pref2] for p in data.preferences], dtype=th.float32)
-        return preference_nll(bt_probs, labels).item(), preference_accuracy(bt_probs, labels).item()
+        return evaluate_preference_batch(self.reward_model, data)
 
     def before_agent_training(self):
         """Center the agent-facing reward on the current rollout's mean raw reward."""
@@ -288,18 +279,3 @@ class PreferenceAlgorithm(BaseRewardLearningAlgorithm):
         counts["only_running"] = int((~has_status[:, terminal_indices].any(axis=1)).sum())
         return {k: v / n for k, v in counts.items()}
 
-    def _make_fragmenter(self, fragmenter_type: str):
-        if fragmenter_type == "active":
-            return HighVariancePairFragmenter(
-                reward_ensemble=self.reward_model,
-                oversample=5,
-                logger=self.logger,
-                rng=self.rng,
-            )
-        elif fragmenter_type == "random":
-            return RandomPairFragmenter(
-                logger=self.logger,
-                rng=self.rng,
-            )
-        else:
-            raise ValueError(f"Unknown fragmenter_type: {fragmenter_type!r}")
