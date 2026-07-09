@@ -43,6 +43,7 @@ from human_feedback_rl.common.types import Preference, Trajectory
 
 VALID_DEMO_MODES = ("gcl", "preferences")
 VALID_CONFLICT_MODES = ("none", "gate", "project", "pcgrad")
+VALID_DEMO_WEIGHT_SCHEDULES = ("constant", "linear", "cosine")
 
 
 class HybridAlgorithm(DemoAlgorithm):
@@ -89,6 +90,7 @@ class HybridAlgorithm(DemoAlgorithm):
         conflict_mode: str = "none",
         conflict_threshold: float = 0.0,
         demo_weight: float = 1.0,
+        demo_weight_schedule: Optional[dict] = None,
         max_balance_scale: float = 100.0,
         balance_eps: float = 1e-8,
         demo_pref_pairs_per_iteration: int = 64,
@@ -114,6 +116,18 @@ class HybridAlgorithm(DemoAlgorithm):
             raise ValueError("train_comparison_frac must be in (0, 1).")
         if demo_weight < 0:
             raise ValueError("demo_weight must be non-negative.")
+        demo_weight_schedule = demo_weight_schedule or {}
+        demo_weight_schedule_enabled = bool(demo_weight_schedule.get("enabled", False))
+        demo_weight_schedule_type = demo_weight_schedule.get("type", "constant")
+        demo_weight_schedule_final = float(demo_weight_schedule.get("final", demo_weight))
+        if demo_weight_schedule_enabled:
+            if demo_weight_schedule_type not in VALID_DEMO_WEIGHT_SCHEDULES:
+                raise ValueError(
+                    "demo_weight_schedule.type must be one of "
+                    f"{VALID_DEMO_WEIGHT_SCHEDULES}, got {demo_weight_schedule_type!r}."
+                )
+            if demo_weight_schedule_final < 0:
+                raise ValueError("demo_weight_schedule.final must be non-negative.")
         if max_balance_scale <= 0 or balance_eps <= 0:
             raise ValueError("max_balance_scale and balance_eps must be positive.")
         if pref_temperature <= 0:
@@ -172,6 +186,11 @@ class HybridAlgorithm(DemoAlgorithm):
         self.conflict_mode = conflict_mode
         self.conflict_threshold = float(conflict_threshold)
         self.demo_weight = float(demo_weight)
+        self.demo_weight_schedule_enabled = demo_weight_schedule_enabled
+        self.demo_weight_schedule_type = str(demo_weight_schedule_type)
+        self.demo_weight_schedule_final = demo_weight_schedule_final
+        self.current_demo_weight = self.demo_weight
+        self._demo_weight_schedule_progress = 0.0
         self.max_balance_scale = float(max_balance_scale)
         self.balance_eps = float(balance_eps)
         self.demo_pref_pairs_per_iteration = int(demo_pref_pairs_per_iteration)
@@ -217,8 +236,10 @@ class HybridAlgorithm(DemoAlgorithm):
         n_iterations = int(total_timesteps / timesteps_per_iteration)
         query_budget = self.total_queries if total_queries is None else total_queries
         schedule = self.build_query_schedule(n_iterations, query_budget)
+        self._n_training_iterations = n_iterations
 
         if self.initial_agent_timesteps > 0:
+            self._update_demo_weight_for_iteration(0, n_iterations)
             print(f"- Collecting {self.initial_agent_timesteps} bootstrap transitions")
             self.trajectories = self.sample_rollout(self.initial_agent_timesteps)
             bootstrap_queries = self.initial_queries
@@ -234,6 +255,7 @@ class HybridAlgorithm(DemoAlgorithm):
 
         for iteration, num_queries in enumerate(schedule):
             self.iteration = iteration
+            self._update_demo_weight_for_iteration(iteration, n_iterations)
             t_iter = time.perf_counter()
             print(f"\nIteration {iteration}/{n_iterations - 1}")
 
@@ -353,10 +375,17 @@ class HybridAlgorithm(DemoAlgorithm):
         only the preference loss trains (pref-only arm).
         """
         has_prefs = len(self.dataset_train) > 0
-        if not has_prefs and self.demo_weight == 0.0:
+        demo_weight = self.current_demo_weight
+        if not has_prefs and demo_weight == 0.0:
             return
 
         self._maxent_corrected_steps = []
+        self.logger.record("reward/demo_weight", demo_weight, exclude="stdout")
+        self.logger.record(
+            "reward/demo_weight_schedule_progress",
+            self._demo_weight_schedule_progress,
+            exclude="stdout",
+        )
         t0 = time.perf_counter()
 
         def member_step(member, optimizer):
@@ -369,7 +398,7 @@ class HybridAlgorithm(DemoAlgorithm):
                     if boot_dataset is not None
                     else None
                 )
-                demo_loss = self._reward_loss(member) if self.demo_weight > 0.0 else None
+                demo_loss = self._reward_loss(member) if demo_weight > 0.0 else None
                 stats.append(self._reward_step(member, optimizer, pref_loss, demo_loss))
             return stats
 
@@ -382,6 +411,28 @@ class HybridAlgorithm(DemoAlgorithm):
         self._log_hybrid_step_stats(all_stats)
         self.logger.record("reward/weight_norm", self._param_norm(self.reward_model), exclude="stdout")
         self.logger.record("time/train_reward_model", t_train)
+
+    def _update_demo_weight_for_iteration(self, iteration: int, n_iterations: int) -> None:
+        progress = iteration / max(n_iterations - 1, 1)
+        self._demo_weight_schedule_progress = float(progress)
+        self.current_demo_weight = self._demo_weight_at_progress(progress)
+
+    def _demo_weight_at_progress(self, progress: float) -> float:
+        if not self.demo_weight_schedule_enabled:
+            return self.demo_weight
+        progress = min(max(float(progress), 0.0), 1.0)
+        start = self.demo_weight
+        end = self.demo_weight_schedule_final
+        if self.demo_weight_schedule_type == "constant":
+            return start
+        if self.demo_weight_schedule_type == "linear":
+            return start + (end - start) * progress
+        if self.demo_weight_schedule_type == "cosine":
+            alpha = 0.5 * (1.0 - math.cos(math.pi * progress))
+            return start + (end - start) * alpha
+        raise RuntimeError(
+            f"Unexpected demo_weight_schedule.type: {self.demo_weight_schedule_type!r}."
+        )
 
     def _train_reward_model_pure_preferences(self) -> None:
         """Single BT objective on mixed oracle + expert-vs-agent batches."""
@@ -436,7 +487,7 @@ class HybridAlgorithm(DemoAlgorithm):
         """One optimizer step from the preference and/or demo losses.
 
         With both losses present, the two gradients are computed separately,
-        the demo gradient is norm-balanced to ``demo_weight`` times the
+        the demo gradient is norm-balanced to the current scheduled demo weight times the
         preference gradient, ``conflict_mode`` resolves opposing directions,
         and the composed gradient (an exact per-parameter linear combination:
         ``a * g_pref + b * g_demo``) is written back before ``step()``.
@@ -480,7 +531,7 @@ class HybridAlgorithm(DemoAlgorithm):
         cosine = dot / denom if denom > 0 else float("nan")
 
         scale = min(
-            self.demo_weight * pref_norm / (demo_norm + self.balance_eps),
+            self.current_demo_weight * pref_norm / (demo_norm + self.balance_eps),
             self.max_balance_scale,
         )
         a, b = 1.0, scale
@@ -601,6 +652,10 @@ class HybridAlgorithm(DemoAlgorithm):
                 "demo_mode": self.demo_mode,
                 "conflict_mode": self.conflict_mode,
                 "demo_weight": self.demo_weight,
+                "current_demo_weight": self.current_demo_weight,
+                "demo_weight_schedule_enabled": self.demo_weight_schedule_enabled,
+                "demo_weight_schedule_type": self.demo_weight_schedule_type,
+                "demo_weight_schedule_final": self.demo_weight_schedule_final,
                 "preference_fragment_length": self.preference_fragment_length,
                 "dataset_train": self.dataset_train,
                 "dataset_val": self.dataset_val,
