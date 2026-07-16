@@ -41,7 +41,7 @@ def _hybrid(rng, **overrides):
 
 
 # ---------------------------------------------------------------------------
-# Conflict-resolution math on hand-built gradients
+# Norm-balanced fusion math on hand-built gradients
 # ---------------------------------------------------------------------------
 
 class _TwoParam(th.nn.Module):
@@ -57,40 +57,36 @@ class _StepShim:
     _flatten = staticmethod(HybridAlgorithm._flatten)
     _grad_norm = staticmethod(RewardTrainingMixin._grad_norm)
 
-    def __init__(self, conflict_mode, demo_weight=1.0, conflict_threshold=0.0,
-                 max_balance_scale=100.0):
-        self.conflict_mode = conflict_mode
+    def __init__(self, demo_weight=1.0, max_balance_scale=100.0):
         self.demo_weight = demo_weight
-        self.conflict_threshold = conflict_threshold
         self.max_balance_scale = max_balance_scale
         self.balance_eps = 1e-12
 
 
-def _run_step(mode, g_pref, g_demo, **shim_kwargs):
+def _run_step(g_pref, g_demo, **shim_kwargs):
     """Apply _reward_step with losses whose gradients are exactly g_pref/g_demo."""
     member = _TwoParam()
     optimizer = th.optim.SGD(member.parameters(), lr=0.0)
     pref_loss = (th.tensor(g_pref) * member.w).sum()
     demo_loss = (th.tensor(g_demo) * member.w).sum()
-    shim = _StepShim(mode, **shim_kwargs)
+    shim = _StepShim(**shim_kwargs)
     stats = shim._reward_step(member, optimizer, pref_loss, demo_loss)
     return member.w.grad.detach().numpy(), stats
 
 
-def test_none_equals_norm_balanced_sum():
+def test_norm_balanced_sum():
     g_p, g_d = [1.0, 0.0], [-0.5, 0.5]
-    grad, stats = _run_step("none", g_p, g_d)
+    grad, stats = _run_step(g_p, g_d)
     scale = np.linalg.norm(g_p) / np.linalg.norm(g_d)  # demo_weight=1
     expected = np.array(g_p) + scale * np.array(g_d)
     assert np.allclose(grad, expected, atol=1e-6)
-    assert stats["resolved"] == 0.0
     assert stats["scale"] == pytest.approx(scale, rel=1e-6)
 
 
-def test_none_matches_combined_backward():
-    """Per-parameter composition == backward of pref + scale*demo (the v0 path)."""
+def test_matches_combined_backward():
+    """Per-parameter composition == backward of pref + scale*demo."""
     g_p, g_d = [0.3, -0.7], [0.9, 0.4]
-    grad, stats = _run_step("none", g_p, g_d)
+    grad, stats = _run_step(g_p, g_d)
 
     member = _TwoParam()
     combined = (th.tensor(g_p) * member.w).sum() + stats["scale"] * (th.tensor(g_d) * member.w).sum()
@@ -98,65 +94,17 @@ def test_none_matches_combined_backward():
     assert np.allclose(grad, member.w.grad.numpy(), atol=1e-6)
 
 
-def test_no_resolution_when_gradients_agree():
-    g_p, g_d = [1.0, 0.0], [1.0, 0.1]  # cos > 0
-    for mode in ("gate", "project", "pcgrad"):
-        grad, stats = _run_step(mode, g_p, g_d)
-        scale = stats["scale"]
-        expected = np.array(g_p) + scale * np.array(g_d)
-        assert np.allclose(grad, expected, atol=1e-6), mode
-        assert stats["resolved"] == 0.0, mode
-
-
-def test_gate_drops_demo_on_conflict():
-    grad, stats = _run_step("gate", [1.0, 0.0], [-1.0, 0.0])
-    assert np.allclose(grad, [1.0, 0.0], atol=1e-6)
-    assert stats["resolved"] == 1.0 and stats["kept"] == 0.0
-
-
-def test_project_removes_only_conflicting_component():
-    # g_demo = [-1, 1]/sqrt(2)-ish: component along g_pref is negative, the
-    # orthogonal component must survive with the balancing scale applied.
-    g_p, g_d = [1.0, 0.0], [-1.0, 1.0]
-    grad, stats = _run_step("project", g_p, g_d)
-    scale = stats["scale"]  # = 1/sqrt(2)
-    # Projected demo = scale * ([-1,1] - (-1)*[1,0]) = scale * [0, 1]
-    expected = np.array([1.0, 0.0]) + scale * np.array([0.0, 1.0])
-    assert np.allclose(grad, expected, atol=1e-6)
-    assert stats["resolved"] == 1.0
-    # |cos| = 1/sqrt(2) -> kept = sqrt(1 - 1/2)
-    assert stats["kept"] == pytest.approx(np.sqrt(0.5), rel=1e-6)
-
-
-def test_pcgrad_mutual_projection():
-    g_p, g_d = [1.0, 0.0], [-1.0, 1.0]
-    grad, stats = _run_step("pcgrad", g_p, g_d)
-    scale = stats["scale"]
-    gp, gd = np.array(g_p), np.array(g_d)
-    gds = scale * gd
-    dot_s = float(gp @ gds)
-    gp_proj = gp - dot_s / (gds @ gds) * gds
-    gd_proj = gds - dot_s / (gp @ gp) * gp
-    assert np.allclose(grad, gp_proj + gd_proj, atol=1e-6)
-    assert stats["resolved"] == 1.0
-
-
-def test_fully_opposed_pcgrad_cancels_everything():
-    grad, _ = _run_step("pcgrad", [1.0, 0.0], [-1.0, 0.0])
-    assert np.allclose(grad, [0.0, 0.0], atol=1e-6)
-
-
 def test_balance_scale_uses_demo_weight_and_clamp():
-    _, stats = _run_step("none", [2.0, 0.0], [0.5, 0.0], demo_weight=3.0)
+    _, stats = _run_step([2.0, 0.0], [0.5, 0.0], demo_weight=3.0)
     assert stats["scale"] == pytest.approx(3.0 * 2.0 / 0.5, rel=1e-6)
-    _, stats = _run_step("none", [2.0, 0.0], [0.001, 0.0], max_balance_scale=10.0)
+    _, stats = _run_step([2.0, 0.0], [0.001, 0.0], max_balance_scale=10.0)
     assert stats["scale"] == 10.0
 
 
 def test_pref_only_and_demo_only_steps():
     member = _TwoParam()
     optimizer = th.optim.SGD(member.parameters(), lr=0.0)
-    shim = _StepShim("none")
+    shim = _StepShim()
     stats = shim._reward_step(member, optimizer, (th.tensor([1.0, 2.0]) * member.w).sum(), None)
     assert np.allclose(member.w.grad.numpy(), [1.0, 2.0])
     assert np.isnan(stats["demo_loss"])
@@ -176,7 +124,7 @@ def test_pref_temperature_decoupled_from_demo_temperature(rng):
 
 
 @pytest.mark.parametrize("bad", [
-    dict(demo_mode="nope"), dict(conflict_mode="nope"),
+    dict(demo_mode="nope"),
     dict(pref_temperature=0.0), dict(demo_pref_batch_fraction=1.5),
 ])
 def test_invalid_kwargs_raise(rng, bad):
@@ -207,9 +155,8 @@ def test_demo_preference_pairs_expert_first_with_hard_labels(rng):
 # End-to-end smoke per mode
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("conflict_mode", ["gate", "project", "pcgrad"])
-def test_hybrid_gcl_conflict_modes_train(rng, conflict_mode):
-    algo = _hybrid(rng, conflict_mode=conflict_mode)
+def test_hybrid_gcl_trains(rng):
+    algo = _hybrid(rng)
     agent = algo.train(
         total_timesteps=64, timesteps_per_iteration=32, log_interval=100, scatter_interval=0
     )

@@ -5,12 +5,11 @@ Two integration mechanisms for the demonstration signal (``demo_mode``):
 * ``"gcl"`` — the demo IRL loss (MaxEnt/GCL family, from ``DemoAlgorithm``) is
   combined with the Bradley-Terry preference loss on one shared reward net.
   The demo gradient is norm-balanced against the preference gradient
-  (``demo_weight`` = desired demo/preference gradient-strength ratio) and can
-  additionally be conflict-resolved per gradient step (``conflict_mode``).
+  (``demo_weight`` = desired demo/preference gradient-strength ratio).
 * ``"preferences"`` — demonstrations enter as preference pairs (expert
   fragment preferred over agent fragment, Ibarz et al. 2018): a single
   Bradley-Terry objective on mixed batches, no scale conflict by
-  construction. Baseline for the conflict-aware fusion.
+  construction.
 
 Health metrics: with soft oracle labels at high ``pref_temperature`` the BT
 loss sits at its ln(2) cross-entropy floor even when learning succeeds —
@@ -19,7 +18,6 @@ instead. Keep ``l2_rew`` at 1e-4: Adam weight decay at 1e-2 overwhelms the BT
 gradient and collapses the reward net (diagnosed 2026-07-05).
 """
 
-import math
 import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -42,25 +40,15 @@ from human_feedback_rl.common.losses import (
 from human_feedback_rl.common.types import Preference, Trajectory
 
 VALID_DEMO_MODES = ("gcl", "preferences")
-VALID_CONFLICT_MODES = ("none", "gate", "project", "pcgrad")
-VALID_DEMO_WEIGHT_SCHEDULES = ("constant", "linear", "cosine")
 
 
 class HybridAlgorithm(DemoAlgorithm):
     """Trains one reward model from preferences and demonstrations.
 
     See the module docstring for the two ``demo_mode`` mechanisms. In
-    ``"gcl"`` mode, ``conflict_mode`` selects how conflicting gradients are
-    resolved at each reward-model step (conflict = cosine between the
-    preference and the demo gradient below ``conflict_threshold``):
-
-    * ``"none"``    — norm-balanced sum (v0 baseline), no resolution.
-    * ``"gate"``    — drop the demo contribution for this step
-                      (Du et al. 2018, gradient-similarity gating).
-    * ``"project"`` — remove from the demo gradient only its component
-                      against the preference gradient; the preference
-                      gradient is never altered (preference-priority).
-    * ``"pcgrad"``  — mutual projection of both gradients (Yu et al. 2020).
+    ``"gcl"`` mode the two losses are combined with a norm-balanced sum:
+    the demo gradient is rescaled so its norm is ``demo_weight`` times the
+    preference gradient's norm before the two are added.
     """
 
     def __init__(
@@ -87,10 +75,7 @@ class HybridAlgorithm(DemoAlgorithm):
         initial_queries: int = 0,
         query_schedule: Union[str, Callable[[float], float]] = "constant",
         demo_mode: str = "gcl",
-        conflict_mode: str = "none",
-        conflict_threshold: float = 0.0,
         demo_weight: float = 1.0,
-        demo_weight_schedule: Optional[dict] = None,
         max_balance_scale: float = 100.0,
         balance_eps: float = 1e-8,
         demo_pref_pairs_per_iteration: int = 64,
@@ -116,28 +101,12 @@ class HybridAlgorithm(DemoAlgorithm):
             raise ValueError("train_comparison_frac must be in (0, 1).")
         if demo_weight < 0:
             raise ValueError("demo_weight must be non-negative.")
-        demo_weight_schedule = demo_weight_schedule or {}
-        demo_weight_schedule_enabled = bool(demo_weight_schedule.get("enabled", False))
-        demo_weight_schedule_type = demo_weight_schedule.get("type", "constant")
-        demo_weight_schedule_final = float(demo_weight_schedule.get("final", demo_weight))
-        if demo_weight_schedule_enabled:
-            if demo_weight_schedule_type not in VALID_DEMO_WEIGHT_SCHEDULES:
-                raise ValueError(
-                    "demo_weight_schedule.type must be one of "
-                    f"{VALID_DEMO_WEIGHT_SCHEDULES}, got {demo_weight_schedule_type!r}."
-                )
-            if demo_weight_schedule_final < 0:
-                raise ValueError("demo_weight_schedule.final must be non-negative.")
         if max_balance_scale <= 0 or balance_eps <= 0:
             raise ValueError("max_balance_scale and balance_eps must be positive.")
         if pref_temperature <= 0:
             raise ValueError("pref_temperature must be positive.")
         if demo_mode not in VALID_DEMO_MODES:
             raise ValueError(f"demo_mode must be one of {VALID_DEMO_MODES}, got {demo_mode!r}.")
-        if conflict_mode not in VALID_CONFLICT_MODES:
-            raise ValueError(
-                f"conflict_mode must be one of {VALID_CONFLICT_MODES}, got {conflict_mode!r}."
-            )
         if demo_pref_pairs_per_iteration < 0:
             raise ValueError("demo_pref_pairs_per_iteration must be non-negative.")
         if not 0 <= demo_pref_batch_fraction <= 1:
@@ -183,14 +152,7 @@ class HybridAlgorithm(DemoAlgorithm):
             self.query_schedule = query_schedule
 
         self.demo_mode = demo_mode
-        self.conflict_mode = conflict_mode
-        self.conflict_threshold = float(conflict_threshold)
         self.demo_weight = float(demo_weight)
-        self.demo_weight_schedule_enabled = demo_weight_schedule_enabled
-        self.demo_weight_schedule_type = str(demo_weight_schedule_type)
-        self.demo_weight_schedule_final = demo_weight_schedule_final
-        self.current_demo_weight = self.demo_weight
-        self._demo_weight_schedule_progress = 0.0
         self.max_balance_scale = float(max_balance_scale)
         self.balance_eps = float(balance_eps)
         self.demo_pref_pairs_per_iteration = int(demo_pref_pairs_per_iteration)
@@ -239,7 +201,6 @@ class HybridAlgorithm(DemoAlgorithm):
         self._n_training_iterations = n_iterations
 
         if self.initial_agent_timesteps > 0:
-            self._update_demo_weight_for_iteration(0, n_iterations)
             print(f"- Collecting {self.initial_agent_timesteps} bootstrap transitions")
             self.trajectories = self.sample_rollout(self.initial_agent_timesteps)
             bootstrap_queries = self.initial_queries
@@ -255,7 +216,6 @@ class HybridAlgorithm(DemoAlgorithm):
 
         for iteration, num_queries in enumerate(schedule):
             self.iteration = iteration
-            self._update_demo_weight_for_iteration(iteration, n_iterations)
             t_iter = time.perf_counter()
             print(f"\nIteration {iteration}/{n_iterations - 1}")
 
@@ -368,24 +328,19 @@ class HybridAlgorithm(DemoAlgorithm):
             self._train_reward_model_gcl()
 
     def _train_reward_model_gcl(self) -> None:
-        """BT + GCL on the shared net with balancing and conflict resolution.
+        """BT + GCL on the shared net with norm-balanced gradient fusion.
 
         Degenerate cases stay well-defined: with an empty preference dataset
         only the demo loss trains (demo-only arm); with ``demo_weight == 0``
         only the preference loss trains (pref-only arm).
         """
         has_prefs = len(self.dataset_train) > 0
-        demo_weight = self.current_demo_weight
+        demo_weight = self.demo_weight
         if not has_prefs and demo_weight == 0.0:
             return
 
         self._maxent_corrected_steps = []
         self.logger.record("reward/demo_weight", demo_weight, exclude="stdout")
-        self.logger.record(
-            "reward/demo_weight_schedule_progress",
-            self._demo_weight_schedule_progress,
-            exclude="stdout",
-        )
         t0 = time.perf_counter()
 
         def member_step(member, optimizer):
@@ -411,28 +366,6 @@ class HybridAlgorithm(DemoAlgorithm):
         self._log_hybrid_step_stats(all_stats)
         self.logger.record("reward/weight_norm", self._param_norm(self.reward_model), exclude="stdout")
         self.logger.record("time/train_reward_model", t_train)
-
-    def _update_demo_weight_for_iteration(self, iteration: int, n_iterations: int) -> None:
-        progress = iteration / max(n_iterations - 1, 1)
-        self._demo_weight_schedule_progress = float(progress)
-        self.current_demo_weight = self._demo_weight_at_progress(progress)
-
-    def _demo_weight_at_progress(self, progress: float) -> float:
-        if not self.demo_weight_schedule_enabled:
-            return self.demo_weight
-        progress = min(max(float(progress), 0.0), 1.0)
-        start = self.demo_weight
-        end = self.demo_weight_schedule_final
-        if self.demo_weight_schedule_type == "constant":
-            return start
-        if self.demo_weight_schedule_type == "linear":
-            return start + (end - start) * progress
-        if self.demo_weight_schedule_type == "cosine":
-            alpha = 0.5 * (1.0 - math.cos(math.pi * progress))
-            return start + (end - start) * alpha
-        raise RuntimeError(
-            f"Unexpected demo_weight_schedule.type: {self.demo_weight_schedule_type!r}."
-        )
 
     def _train_reward_model_pure_preferences(self) -> None:
         """Single BT objective on mixed oracle + expert-vs-agent batches."""
@@ -480,22 +413,22 @@ class HybridAlgorithm(DemoAlgorithm):
         self.logger.record("time/train_reward_model", t_train)
 
     # ------------------------------------------------------------------
-    # Balanced, conflict-aware gradient step
+    # Balanced gradient step
     # ------------------------------------------------------------------
 
     def _reward_step(self, member, optimizer, pref_loss, demo_loss) -> Dict[str, float]:
         """One optimizer step from the preference and/or demo losses.
 
         With both losses present, the two gradients are computed separately,
-        the demo gradient is norm-balanced to the current scheduled demo weight times the
-        preference gradient, ``conflict_mode`` resolves opposing directions,
-        and the composed gradient (an exact per-parameter linear combination:
-        ``a * g_pref + b * g_demo``) is written back before ``step()``.
+        the demo gradient is norm-balanced to ``demo_weight`` times the
+        preference gradient, and the composed gradient (an exact per-parameter
+        linear combination ``g_pref + scale * g_demo``) is written back before
+        ``step()``.
         """
         nan = float("nan")
         stats = {
             "pref_loss": nan, "demo_loss": nan, "scale": nan, "pref_norm": nan,
-            "demo_norm": nan, "cosine": nan, "resolved": nan, "kept": nan, "grad_norm": nan,
+            "demo_norm": nan, "grad_norm": nan,
         }
 
         if pref_loss is None and demo_loss is None:
@@ -526,29 +459,11 @@ class HybridAlgorithm(DemoAlgorithm):
         flat_demo = self._flatten(g_demo, params)
         pref_norm = float(flat_pref.norm())
         demo_norm = float(flat_demo.norm())
-        dot = float(th.dot(flat_pref, flat_demo))
-        denom = pref_norm * demo_norm
-        cosine = dot / denom if denom > 0 else float("nan")
 
         scale = min(
-            self.current_demo_weight * pref_norm / (demo_norm + self.balance_eps),
+            self.demo_weight * pref_norm / (demo_norm + self.balance_eps),
             self.max_balance_scale,
         )
-        a, b = 1.0, scale
-        resolved, kept = False, 1.0
-        in_conflict = math.isfinite(cosine) and cosine < self.conflict_threshold
-
-        if in_conflict and self.conflict_mode != "none":
-            resolved = True
-            kept = math.sqrt(max(0.0, 1.0 - cosine * cosine))
-            if self.conflict_mode == "gate":
-                b, kept = 0.0, 0.0
-            elif self.conflict_mode == "project":
-                # scale*g_demo minus its component along g_pref.
-                a = 1.0 - scale * dot / (pref_norm**2 + self.balance_eps)
-            elif self.conflict_mode == "pcgrad":
-                a = 1.0 - scale * dot / (pref_norm**2 + self.balance_eps)
-                b = scale - dot / (demo_norm**2 + self.balance_eps)
 
         for p, gp, gd in zip(params, g_pref, g_demo):
             if gp is None and gd is None:
@@ -556,9 +471,9 @@ class HybridAlgorithm(DemoAlgorithm):
                 continue
             grad = th.zeros_like(p)
             if gp is not None:
-                grad += a * gp
+                grad += gp
             if gd is not None:
-                grad += b * gd
+                grad += scale * gd
             p.grad = grad
 
         grad_norm = self._grad_norm(member)
@@ -567,8 +482,7 @@ class HybridAlgorithm(DemoAlgorithm):
         stats.update(
             pref_loss=float(pref_loss.detach()),
             demo_loss=float(demo_loss.detach()),
-            scale=scale, pref_norm=pref_norm, demo_norm=demo_norm, cosine=cosine,
-            resolved=float(resolved), kept=kept, grad_norm=grad_norm,
+            scale=scale, pref_norm=pref_norm, demo_norm=demo_norm, grad_norm=grad_norm,
         )
         return stats
 
@@ -592,9 +506,6 @@ class HybridAlgorithm(DemoAlgorithm):
             "reward/hybrid_demo_scale": "scale",
             "reward/grad_norm_pref": "pref_norm",
             "reward/grad_norm_demo": "demo_norm",
-            "reward/grad_cos_pref_demo": "cosine",
-            "reward/conflict_resolved_frac": "resolved",
-            "reward/demo_grad_kept_ratio": "kept",
             "reward/grad_norm": "grad_norm",
         }
         for log_key, stat_key in pairs.items():
@@ -602,13 +513,6 @@ class HybridAlgorithm(DemoAlgorithm):
             if value is not None:
                 self.logger.record(log_key, value, exclude="stdout")
 
-        cosines = np.asarray([s["cosine"] for s in all_stats], dtype=float)
-        finite_cos = cosines[np.isfinite(cosines)]
-        if finite_cos.size:
-            self.logger.record("reward/grad_cos_pref_demo_min", float(finite_cos.min()), exclude="stdout")
-            self.logger.record(
-                "reward/grad_cos_pref_demo_neg_frac", float((finite_cos < 0).mean()), exclude="stdout"
-            )
         norms = {k: nanmean(k2) for k, k2 in (("pref", "pref_norm"), ("demo", "demo_norm"))}
         if norms["pref"] is not None and norms["demo"] is not None:
             self.logger.record(
@@ -650,12 +554,7 @@ class HybridAlgorithm(DemoAlgorithm):
             {
                 "iteration": iteration,
                 "demo_mode": self.demo_mode,
-                "conflict_mode": self.conflict_mode,
                 "demo_weight": self.demo_weight,
-                "current_demo_weight": self.current_demo_weight,
-                "demo_weight_schedule_enabled": self.demo_weight_schedule_enabled,
-                "demo_weight_schedule_type": self.demo_weight_schedule_type,
-                "demo_weight_schedule_final": self.demo_weight_schedule_final,
                 "preference_fragment_length": self.preference_fragment_length,
                 "dataset_train": self.dataset_train,
                 "dataset_val": self.dataset_val,

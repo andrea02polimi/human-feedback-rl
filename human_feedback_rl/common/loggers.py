@@ -1,4 +1,7 @@
+import json
+import os
 import sys
+import time
 
 import wandb
 from stable_baselines3.common.logger import HumanOutputFormat, KVWriter
@@ -185,6 +188,42 @@ class WandbWriter(KVWriter):
 
     def close(self) -> None:
         wandb.finish()
+
+
+# ── JSONL writer ──────────────────────────────────────────────────────────────
+
+DEFAULT_JSONL_KEYS = (
+    "iterations",
+    "rollout/mean_true_reward",
+    "agent/rewards/ep_fast_return",
+)
+
+
+class JsonlWriter(KVWriter):
+    """Appends the selected metrics of each dump as one JSON line to a file.
+
+    Lets an external monitor (e.g. an Optuna worker polling a training
+    subprocess) follow per-iteration progress without going through W&B.
+    Each line is flushed and fsynced so it is visible to the reader as soon
+    as it is written.
+    """
+
+    def __init__(self, path, keys=DEFAULT_JSONL_KEYS) -> None:
+        self.path = str(path)
+        self.keys = tuple(keys)
+
+    def write(self, key_values: dict, key_excluded: dict, step: int = 0) -> None:
+        record = {k: key_values[k] for k in self.keys if k in key_values}
+        if not record:
+            return
+        record["time"] = time.time()
+        with open(self.path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    def close(self) -> None:
+        pass
 
 
 # ── prefix wrapper ────────────────────────────────────────────────────────────

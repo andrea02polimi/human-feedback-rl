@@ -56,3 +56,30 @@ def test_exclude_format_logger_merges_excludes():
     _, key_excluded = writer.writes[0]
     assert set(np.atleast_1d(key_excluded["k"])) == {"stdout"}
     assert set(key_excluded["j"]) == {"wandb", "stdout"}
+
+
+def test_jsonl_writer_appends_selected_keys_per_dump(tmp_path):
+    import json
+
+    from human_feedback_rl.common.loggers import JsonlWriter
+
+    path = tmp_path / "metrics.jsonl"
+    logger = Logger(folder=None, output_formats=[JsonlWriter(path)])
+
+    logger.record("iterations", 0)
+    logger.record("rollout/mean_true_reward", -1.5)
+    logger.record("reward/loss", 0.7)  # not in the key set: must be filtered out
+    logger.dump()
+    logger.record("iterations", 1)
+    logger.record("rollout/mean_true_reward", -0.5)
+    logger.dump()
+    logger.record("reward/loss", 0.6)  # dump with no selected keys: no line
+    logger.dump()
+
+    lines = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(lines) == 2
+    assert lines[0]["iterations"] == 0
+    assert lines[0]["rollout/mean_true_reward"] == -1.5
+    assert "reward/loss" not in lines[0]
+    assert lines[1]["iterations"] == 1
+    assert all("time" in line for line in lines)
