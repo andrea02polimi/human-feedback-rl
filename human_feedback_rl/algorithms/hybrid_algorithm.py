@@ -1,11 +1,17 @@
 """Hybrid reward learning from demonstrations and preferences.
 
+The single reward-learning algorithm of the package: with both feedback
+sources active it is the hybrid method; with ``demo_weight=0`` it degenerates
+to the preference-only baseline, with ``total_queries=0`` to the
+demonstration-only baseline.
+
 Two integration mechanisms for the demonstration signal (``demo_mode``):
 
-* ``"gcl"`` — the demo IRL loss (MaxEnt/GCL family, from ``DemoAlgorithm``) is
-  combined with the Bradley-Terry preference loss on one shared reward net.
-  The demo gradient is norm-balanced against the preference gradient
-  (``demo_weight`` = desired demo/preference gradient-strength ratio).
+* ``"gcl"`` — the demo IRL loss (``demo_1`` difference-of-means or ``demo_2``
+  MaxEnt surrogate) is combined with the Bradley-Terry preference loss on one
+  shared reward net. The demo gradient is norm-balanced against the
+  preference gradient (``demo_weight`` = desired demo/preference
+  gradient-strength ratio).
 * ``"preferences"`` — demonstrations enter as preference pairs (expert
   fragment preferred over agent fragment, Ibarz et al. 2018): a single
   Bradley-Terry objective on mixed batches, no scale conflict by
@@ -14,8 +20,8 @@ Two integration mechanisms for the demonstration signal (``demo_mode``):
 Health metrics: with soft oracle labels at high ``pref_temperature`` the BT
 loss sits at its ln(2) cross-entropy floor even when learning succeeds —
 watch ``reward/acc_pref_val`` and ``reward_val/.../pred_true/pearson_*``
-instead. Keep ``l2_rew`` at 1e-4: Adam weight decay at 1e-2 overwhelms the BT
-gradient and collapses the reward net (diagnosed 2026-07-05).
+instead. Adam weight decay at 1e-2 overwhelms the BT gradient and collapses
+the reward net (diagnosed 2026-07-05).
 """
 
 import os
@@ -25,8 +31,17 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import numpy as np
 import torch as th
 
-from human_feedback_rl.algorithms.demo_algorithm import DemoAlgorithm
-from human_feedback_rl.common.base_reward_learning_algorithm import QUERY_SCHEDULES
+from human_feedback_rl.algorithms.demo.imitation_metrics import ImitationMetricsMixin
+from human_feedback_rl.algorithms.demo.losses import (
+    VALID_LOSSES,
+    RewardLossMixin,
+)
+from human_feedback_rl.algorithms.demo.reward_diagnostics import RewardDiagnosticsMixin
+from human_feedback_rl.algorithms.demo.reward_training import RewardTrainingMixin
+from human_feedback_rl.common.base_reward_learning_algorithm import (
+    QUERY_SCHEDULES,
+    BaseRewardLearningAlgorithm,
+)
 from human_feedback_rl.common.batching import fragment_avg_rewards
 from human_feedback_rl.common.datasets import PreferenceBatch, PreferenceDataset
 from human_feedback_rl.common.fragmenters import make_pair_fragmenter
@@ -37,35 +52,43 @@ from human_feedback_rl.common.losses import (
     preference_labels_tensor,
     preference_nll,
 )
+from human_feedback_rl.common.reward_nets import make_reward_ensemble
 from human_feedback_rl.common.types import Preference, Trajectory
 
 VALID_DEMO_MODES = ("gcl", "preferences")
 
 
-class HybridAlgorithm(DemoAlgorithm):
-    """Trains one reward model from preferences and demonstrations.
+class HybridAlgorithm(
+    RewardLossMixin,
+    RewardTrainingMixin,
+    ImitationMetricsMixin,
+    RewardDiagnosticsMixin,
+    BaseRewardLearningAlgorithm,
+):
+    """Trains one reward model from preferences and/or demonstrations.
 
-    See the module docstring for the two ``demo_mode`` mechanisms. In
-    ``"gcl"`` mode the two losses are combined with a norm-balanced sum:
-    the demo gradient is rescaled so its norm is ``demo_weight`` times the
-    preference gradient's norm before the two are added.
+    See the module docstring for the two ``demo_mode`` mechanisms and the
+    degenerate single-source baselines. In ``"gcl"`` mode the two losses are
+    combined with a norm-balanced sum: the demo gradient is rescaled so its
+    norm is ``demo_weight`` times the preference gradient's norm before the
+    two are added.
     """
+
+    VALID_LOSSES = VALID_LOSSES
 
     def __init__(
         self,
         env,
         agent,
         expert_trajectories: List[Trajectory],
-        loss_type: str = "maxent_2",
+        loss_type: str = "demo_2",
         lr_rew: float = 0.001,
         gradient_steps_rew: int = 10,
         batch_size_expert: int = 32,
         batch_size_model: int = 64,
         batch_size_pref: int = 32,
         l2_rew: float = 0.0001,
-        temperature: float = 1.0,
         pref_temperature: float = 20.0,
-        fragment_length: Optional[int] = None,
         preference_fragment_length: int = 1,
         fragmenter_type: str = "random",
         labels_type: str = "binary",
@@ -93,6 +116,14 @@ class HybridAlgorithm(DemoAlgorithm):
         normalize_agent_reward: bool = True,
         agent_log_timestep_interval: Optional[int] = None,
     ):
+        if not expert_trajectories:
+            raise ValueError("expert_trajectories must be a non-empty list of Trajectory objects.")
+        if loss_type not in self.VALID_LOSSES:
+            raise ValueError(f"loss_type must be one of {self.VALID_LOSSES}, got {loss_type!r}.")
+        if gradient_steps_rew <= 0:
+            raise ValueError("gradient_steps_rew must be positive.")
+        if batch_size_expert <= 0 or batch_size_model <= 0:
+            raise ValueError("Reward-model batch sizes must be positive.")
         if batch_size_pref <= 0:
             raise ValueError("batch_size_pref must be positive.")
         if preference_fragment_length <= 0:
@@ -112,31 +143,45 @@ class HybridAlgorithm(DemoAlgorithm):
         if not 0 <= demo_pref_batch_fraction <= 1:
             raise ValueError("demo_pref_batch_fraction must be in [0, 1].")
 
+        reward_model = make_reward_ensemble(env, **(reward_model_kwargs or {}))
+
         super().__init__(
             env=env,
             agent=agent,
-            expert_trajectories=expert_trajectories,
-            loss_type=loss_type,
-            lr_rew=lr_rew,
-            gradient_steps_rew=gradient_steps_rew,
-            batch_size_expert=batch_size_expert,
-            batch_size_model=batch_size_model,
-            l2_rew=l2_rew,
-            temperature=temperature,
-            fragment_length=fragment_length,
-            initial_agent_timesteps=initial_agent_timesteps,
+            reward_model=reward_model,
             exploration_frac=exploration_frac,
             exploration_eps=exploration_eps,
-            reward_model_kwargs=reward_model_kwargs,
             rng=rng,
             log_folder=log_folder,
             output_formats=output_formats,
             debug_dataset=debug_dataset,
-            rollout_env=rollout_env,
-            relabel_rewards=relabel_rewards,
-            normalize_agent_reward=normalize_agent_reward,
+            sampling_venv=rollout_env,
             agent_log_timestep_interval=agent_log_timestep_interval,
         )
+
+        self.expert_trajectories = list(expert_trajectories)
+        self.loss_type = loss_type
+        self.gradient_steps_rew = gradient_steps_rew
+        self.batch_size_expert = batch_size_expert
+        self.batch_size_model = batch_size_model
+        self.initial_agent_timesteps = initial_agent_timesteps
+        self.relabel_rewards = relabel_rewards
+        self.normalize_agent_reward = normalize_agent_reward
+        self._debug_rng = np.random.default_rng(0)
+        self._debug_trajectories = self._split_into_trajectories(self.debug_dataset)
+
+        replay_buffer = getattr(agent, "replay_buffer", None)
+        if replay_buffer is not None:
+            if hasattr(replay_buffer, "set_reward_model"):
+                replay_buffer.set_reward_model(self.reward_model)
+                replay_buffer.set_relabel_rewards(relabel_rewards)
+            elif relabel_rewards:
+                raise ValueError("relabel_rewards=True requires RewardRelabelReplayBuffer.")
+
+        self.optimizers = [
+            th.optim.Adam(member.parameters(), lr=lr_rew, weight_decay=l2_rew)
+            for member in self.reward_model.members
+        ]
 
         self.batch_size_pref = batch_size_pref
         self.preference_fragment_length = int(preference_fragment_length)
@@ -339,7 +384,6 @@ class HybridAlgorithm(DemoAlgorithm):
         if not has_prefs and demo_weight == 0.0:
             return
 
-        self._maxent_corrected_steps = []
         self.logger.record("reward/demo_weight", demo_weight, exclude="stdout")
         t0 = time.perf_counter()
 
@@ -361,7 +405,6 @@ class HybridAlgorithm(DemoAlgorithm):
         t_train = time.perf_counter() - t0
 
         self._log_reward_loss_diagnostics()
-        self._log_maxent_corrected_step_diagnostics()
         self._log_preference_diagnostics()
         self._log_hybrid_step_stats(all_stats)
         self.logger.record("reward/weight_norm", self._param_norm(self.reward_model), exclude="stdout")
@@ -548,8 +591,33 @@ class HybridAlgorithm(DemoAlgorithm):
             )
             self.logger.record("reward/acc_demo_pref_val", demo_acc, exclude="stdout")
 
+    def _refresh_replay_relabel_cache(self) -> None:
+        """Relabel the replay buffer once per iteration (the model is frozen during learn).
+
+        Must run after ``_update_agent_reward_normalization``: cached rewards
+        use the final normalization statistics for this iteration.
+        """
+        if not self.relabel_rewards:
+            return
+        replay_buffer = getattr(self.agent, "replay_buffer", None)
+        if replay_buffer is not None and hasattr(replay_buffer, "refresh_relabel_cache"):
+            replay_buffer.refresh_relabel_cache()
+
     def _save_checkpoint_extras(self, ckpt_path: str, iteration: int) -> None:
-        super()._save_checkpoint_extras(ckpt_path, iteration)
+        """Persist reward-training state, the replay buffer and the datasets."""
+        th.save(
+            {
+                "iteration": iteration,
+                "loss_type": self.loss_type,
+                "relabel_rewards": self.relabel_rewards,
+                "normalize_agent_reward": self.normalize_agent_reward,
+                "optimizers": [optimizer.state_dict() for optimizer in self.optimizers],
+            },
+            os.path.join(ckpt_path, "reward_training.pt"),
+        )
+        agent = self.trajectory_generator.agent
+        if hasattr(agent, "save_replay_buffer"):
+            agent.save_replay_buffer(os.path.join(ckpt_path, "replay_buffer.pkl"))
         th.save(
             {
                 "iteration": iteration,

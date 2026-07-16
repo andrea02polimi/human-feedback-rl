@@ -1,13 +1,11 @@
 """Optimization and agent-facing normalization of the learned reward."""
 
-import time
-
 import numpy as np
 import torch as th
 
 
 class RewardTrainingMixin:
-    """Reward-model optimization methods used by ``DemoAlgorithm``."""
+    """Reward-model optimization helpers used by ``HybridAlgorithm``."""
 
     @staticmethod
     def _grad_norm(module) -> float:
@@ -17,48 +15,6 @@ class RewardTrainingMixin:
         if not squared_norms:
             return 0.0
         return float(th.sqrt(th.stack(squared_norms).sum()))
-
-    def _train_reward_model(self) -> None:
-        if not self.trajectories:
-            return
-
-        self._maxent_corrected_steps = []
-        t0 = time.perf_counter()
-
-        def member_step(member, optimizer):
-            member.train()
-            norms = []
-            for _ in range(self.gradient_steps_rew):
-                loss = self._reward_loss(member)
-                if not th.isfinite(loss):
-                    raise FloatingPointError(
-                        f"Non-finite reward loss for loss_type={self.loss_type}: {loss.item()}"
-                    )
-                optimizer.zero_grad()
-                loss.backward()
-                grad_norm = self._grad_norm(member)
-                if not np.isfinite(grad_norm):
-                    raise FloatingPointError(
-                        f"Non-finite reward gradient norm for loss_type={self.loss_type}."
-                    )
-                norms.append(grad_norm)
-                optimizer.step()
-            return norms
-
-        all_norms = [norm for norms in self.train_reward_members(member_step) for norm in norms]
-
-        t_train = time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        self._log_reward_loss_diagnostics()
-        self._log_maxent_corrected_step_diagnostics()
-        self.logger.record("reward/grad_norm", float(np.mean(all_norms)), exclude="stdout")
-        self.logger.record("reward/grad_norm_max", float(np.max(all_norms)), exclude="stdout")
-        self.logger.record(
-            "reward/weight_norm", self._param_norm(self.reward_model), exclude="stdout"
-        )
-        self.logger.record("time/train_reward_model", t_train)
-        self.logger.record_sum("time/loggings", time.perf_counter() - t0)
 
     @staticmethod
     def _param_norm(module) -> float:

@@ -24,7 +24,7 @@ def _hybrid(rng, **overrides):
     env = FakeVecEnv(num_envs=2, episode_len=10)
     kwargs = dict(
         expert_trajectories=make_trajectories(rng, [10, 10, 10]),
-        loss_type="maxent_2",
+        loss_type="demo_2",
         gradient_steps_rew=2,
         batch_size_expert=2,
         batch_size_model=2,
@@ -117,10 +117,9 @@ def test_pref_only_and_demo_only_steps():
 # Constructor semantics
 # ---------------------------------------------------------------------------
 
-def test_pref_temperature_decoupled_from_demo_temperature(rng):
-    algo = _hybrid(rng, temperature=1.0, pref_temperature=20.0)
+def test_pref_temperature_reaches_the_gatherer(rng):
+    algo = _hybrid(rng, pref_temperature=20.0)
     assert algo.preference_gatherer.temperature == 20.0
-    assert algo.temperature == 1.0
 
 
 @pytest.mark.parametrize("bad", [

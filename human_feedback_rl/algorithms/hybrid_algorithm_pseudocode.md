@@ -1,8 +1,11 @@
 # HybridAlgorithm — pseudocodice
 
-Apprendimento di UNA reward net da dimostrazioni + preferenze.
-Estende `DemoAlgorithm`. Due meccanismi (`demo_mode`):
-  - `"gcl"`         : loss IRL/GCL sulle demo  +  loss Bradley-Terry sulle preferenze,
+Apprendimento di UNA reward net da dimostrazioni + preferenze. È l'unico
+algoritmo del package: con `demo_weight=0` degenera nel baseline solo-preferenze,
+con `total_queries=0` nel baseline solo-dimostrazioni.
+Due meccanismi (`demo_mode`):
+  - `"gcl"`         : loss demo (`demo_1` differenza di medie | `demo_2` surrogato
+                      MaxEnt) + loss Bradley-Terry sulle preferenze,
                       fuse sulla STESSA rete con bilanciamento di norma dei gradienti.
   - `"preferences"` : le demo diventano coppie di preferenza (expert ≻ agent),
                       unico obiettivo BT su batch misti (nessun conflitto di scala).

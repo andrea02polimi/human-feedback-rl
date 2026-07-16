@@ -2,7 +2,6 @@
 
 import numpy as np
 import torch as th
-import torch.nn.functional as F
 import wandb
 from scipy.stats import pearsonr, spearmanr
 
@@ -11,7 +10,7 @@ from human_feedback_rl.common.types import Trajectory
 
 
 class RewardDiagnosticsMixin:
-    """Non-training reward diagnostics used by ``DemoAlgorithm``."""
+    """Non-training reward diagnostics used by ``HybridAlgorithm``."""
 
     def _diagnostic_returns(self, member):
         expert_trajs = self._even_subset(self.expert_trajectories, self.batch_size_expert)
@@ -55,72 +54,30 @@ class RewardDiagnosticsMixin:
             self.logger.record("reward/return_min", float(all_returns.min()), exclude="stdout")
             self.logger.record("reward/return_max", float(all_returns.max()), exclude="stdout")
 
-            if self.loss_type in ("demo", "demo_loss"):
+            if self.loss_type == "demo_1":
                 loss = expert_term + model_mean
                 self.logger.record("reward/loss", float(loss), exclude="stdout")
-                self.logger.record("reward/demo_margin", float(margin), exclude="stdout")
-                self.logger.record("reward/demo_scale_std", float(all_returns.std(unbiased=False)), exclude="stdout")
-                self.logger.record("reward/demo_scale_abs", float(abs_mean), exclude="stdout")
+                self.logger.record("reward/demo_1_margin", float(margin), exclude="stdout")
+                self.logger.record("reward/demo_1_scale_std", float(all_returns.std(unbiased=False)), exclude="stdout")
+                self.logger.record("reward/demo_1_scale_abs", float(abs_mean), exclude="stdout")
                 self.reward_model.train()
                 return
 
-            if self.loss_type == "demo_corrected":
-                demo_margin = self._demo_corrected_margins(
-                    expert_returns, model_returns, expert_trajs, model_trajs
-                )
-                loss = F.softplus(-demo_margin / self.temperature).mean()
-                self.logger.record("reward/loss", float(loss), exclude="stdout")
-                self.logger.record("reward/demo_corrected_margin", float(demo_margin.mean()), exclude="stdout")
-                self.logger.record("reward/demo_corrected_scale_std", float(all_returns.std(unbiased=False)), exclude="stdout")
-                self.reward_model.train()
-                return
-
-            if self.loss_type == "maxent_2":
-                partition = th.logsumexp(all_returns, dim=0) - np.log(len(all_returns))
-                weights = th.softmax(all_returns, dim=0)
-                expert_mass = weights[:len(expert_returns)].sum()
-                model_mass = weights[len(expert_returns):].sum()
-                top1_weight, top1_idx = weights.max(dim=0)
-                ess = 1.0 / weights.pow(2).sum()
-                self.logger.record("reward/loss", float(expert_term + partition), exclude="stdout")
-                self.logger.record("reward/maxent2_partition_all", float(partition), exclude="stdout")
-                self.logger.record("reward/maxent2_expert_softmax_mass", float(expert_mass), exclude="stdout")
-                self.logger.record("reward/maxent2_model_softmax_mass", float(model_mass), exclude="stdout")
-                self.logger.record("reward/maxent2_top1_softmax_weight", float(top1_weight), exclude="stdout")
-                self.logger.record("reward/maxent2_top1_is_expert", float((top1_idx < len(expert_returns)).item()), exclude="stdout")
-                self.logger.record("reward/maxent2_effective_sample_size", float(ess), exclude="stdout")
-                self._log_ess_fraction("reward/maxent2", ess, len(weights))
-                self.reward_model.train()
-                return
-
-            log_q = None
-            partition_logits = model_returns
-            log_prefix = "reward/maxent"
-            loss_expert_term = expert_term
-            if self.loss_type == "maxent_corrected":
-                # Mirror the fragment-level partition used by the loss so the
-                # logged partition/ESS/loss match what training actually optimises.
-                frag_expert_returns = self._fragment_returns(self.reward_model, expert_trajs)
-                frag_model_returns = self._fragment_returns(self.reward_model, model_trajs)
-                log_q = self._fragment_log_probs(model_trajs)
-                partition_logits = frag_model_returns / self.temperature - log_q
-                log_prefix = "reward/maxent_corrected"
-                loss_expert_term = -frag_expert_returns.mean() / self.temperature
-
-            partition = th.logsumexp(partition_logits, dim=0) - np.log(len(partition_logits))
-            weights = th.softmax(partition_logits, dim=0)
-            top_values = th.topk(weights, k=min(5, len(weights))).values
+            # demo_2: expert+model partition estimate.
+            partition = th.logsumexp(all_returns, dim=0) - np.log(len(all_returns))
+            weights = th.softmax(all_returns, dim=0)
+            expert_mass = weights[:len(expert_returns)].sum()
+            model_mass = weights[len(expert_returns):].sum()
+            top1_weight, top1_idx = weights.max(dim=0)
             ess = 1.0 / weights.pow(2).sum()
-            loss = loss_expert_term + partition
-
-            self.logger.record("reward/loss", float(loss), exclude="stdout")
-            self.logger.record(f"{log_prefix}_partition_model", float(partition), exclude="stdout")
-            self.logger.record(f"{log_prefix}_top1_softmax_weight", float(weights.max()), exclude="stdout")
-            self.logger.record(f"{log_prefix}_top5_softmax_mass", float(top_values.sum()), exclude="stdout")
-            self.logger.record(f"{log_prefix}_effective_sample_size", float(ess), exclude="stdout")
-            self._log_ess_fraction(log_prefix, ess, len(weights))
-            if log_q is not None:
-                self.logger.record(f"{log_prefix}_log_q_mean", float(log_q.mean()), exclude="stdout")
+            self.logger.record("reward/loss", float(expert_term + partition), exclude="stdout")
+            self.logger.record("reward/demo_2_partition_all", float(partition), exclude="stdout")
+            self.logger.record("reward/demo_2_expert_softmax_mass", float(expert_mass), exclude="stdout")
+            self.logger.record("reward/demo_2_model_softmax_mass", float(model_mass), exclude="stdout")
+            self.logger.record("reward/demo_2_top1_softmax_weight", float(top1_weight), exclude="stdout")
+            self.logger.record("reward/demo_2_top1_is_expert", float((top1_idx < len(expert_returns)).item()), exclude="stdout")
+            self.logger.record("reward/demo_2_effective_sample_size", float(ess), exclude="stdout")
+            self._log_ess_fraction("reward/demo_2", ess, len(weights))
         self.reward_model.train()
 
     def _log_ess_fraction(self, log_prefix: str, ess: th.Tensor, n_items: int) -> None:
@@ -381,45 +338,6 @@ class RewardDiagnosticsMixin:
             }, commit=True)
         finally:
             plt.close(fig)
-
-    def _log_maxent_corrected_step_diagnostics(self) -> None:
-        """Log the per-gradient-step ESS/variance decomposition (averaged).
-
-        Faithful to the gradient actually applied (the loss stashes one entry per
-        step on its own random sample), unlike ``_log_reward_loss_diagnostics``
-        which recomputes on a separate deterministic subset.
-        """
-        steps = getattr(self, "_maxent_corrected_steps", None)
-        if not steps:
-            return
-        prefix = "reward/maxent_corrected_grad"
-        for key in steps[0]:
-            mean_value = float(np.mean([step[key] for step in steps]))
-            self.logger.record(f"{prefix}/{key}", mean_value, exclude="stdout")
-        # Worst-case across gradient steps: a mean hides degenerate updates
-        # (e.g. ess [1, 1, 1, 100] looks tolerable on average). Use the fraction
-        # for the worst-case since the number of fragments (N) varies per batch,
-        # so absolute ESS is not comparable across steps.
-        ess = [step["ess"] for step in steps]
-        ess_fraction = [step["ess_fraction"] for step in steps]
-        self.logger.record(f"{prefix}/ess_min", float(np.min(ess)), exclude="stdout")
-        self.logger.record(f"{prefix}/ess_median", float(np.median(ess)), exclude="stdout")
-        self.logger.record(
-            f"{prefix}/ess_fraction_min", float(np.min(ess_fraction)), exclude="stdout"
-        )
-        self.logger.record(
-            f"{prefix}/ess_fraction_median", float(np.median(ess_fraction)), exclude="stdout"
-        )
-        self.logger.record(
-            f"{prefix}/top1_softmax_weight_max",
-            float(np.max([step["top1_softmax_weight"] for step in steps])),
-            exclude="stdout",
-        )
-        self.logger.record(
-            f"{prefix}/logit_var_max",
-            float(np.max([step["logit_var"] for step in steps])),
-            exclude="stdout",
-        )
 
     def _log_outcome_returns(self) -> None:
         """Log the discounted return under the *current* reward, by terminal outcome.

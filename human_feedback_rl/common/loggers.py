@@ -29,7 +29,7 @@ ITERATION_METRIC_PREFIXES = (
 
 # Keep the automatically generated workspace deliberately small. All other
 # values are still written to W&B history and can be added to custom panels.
-# A maxent_2 run logs 16 common metrics plus its two loss-specific diagnostics:
+# A demo_2 run logs 16 common metrics plus its two loss-specific diagnostics:
 # 18 automatic plots, which can be grouped into nine custom workspace panels.
 VISIBLE_METRICS = (
     # Policy outcome and environment performance.
@@ -53,20 +53,12 @@ VISIBLE_METRICS = (
     "reward_val/debug_dataset/post_update/spearman_returns",
     "reward_val/current_rollout/post_update/gap_arrived_collided",
     "reward_val/debug_dataset/post_update/gap_arrived_collided",
-    # Historical MaxEnt loss diagnostics.
-    "reward/maxent_effective_sample_fraction",
-    "reward/maxent_top1_softmax_weight",
-    "reward/maxent2_effective_sample_fraction",
-    "reward/maxent2_expert_softmax_mass",
-    # Corrected MaxEnt loss diagnostics.
-    "reward/maxent_corrected_effective_sample_fraction",
-    "reward/maxent_corrected_top1_softmax_weight",
-    # Demo loss diagnostics. Only the pair matching the configured loss is
+    # Demo loss diagnostics. Only the set matching the configured loss is
     # emitted, so unused definitions do not create empty panels.
-    "reward/demo_margin",
-    "reward/demo_scale_std",
-    "reward/demo_corrected_margin",
-    "reward/demo_corrected_scale_std",
+    "reward/demo_1_margin",
+    "reward/demo_1_scale_std",
+    "reward/demo_2_effective_sample_fraction",
+    "reward/demo_2_expert_softmax_mass",
     # Hybrid preference + demonstration reward learning.
     "reward/hybrid_pref_loss",
     "reward/hybrid_demo_loss",
