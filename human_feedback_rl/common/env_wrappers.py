@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Callable, List, Optional
+from typing import Callable, List
 
 from stable_baselines3.common.vec_env import VecEnvWrapper, VecEnv
 

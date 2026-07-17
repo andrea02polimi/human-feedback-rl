@@ -6,7 +6,7 @@ from human_feedback_rl.common.env_wrappers import (
     EnvRewardWrapper,
     PolicyExplorationWrapper,
 )
-from human_feedback_rl.common.status import STATUS_ARRIVED, STATUS_RUNNING
+from human_feedback_rl.common.status import STATUS_RUNNING
 
 from conftest import ACT_DIM, ConstantRewardNet, FakeVecEnv
 

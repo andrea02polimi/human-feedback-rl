@@ -6,7 +6,6 @@ from .loggers import NullLogger
 from .env_wrappers import EnvRewardWrapper, EnvBufferingWrapper, PolicyExplorationWrapper
 from . import types
 import numpy as np
-import time
 from typing import List, Any, Sequence, Optional
 from .custom_logging_callback import CustomLoggingCallback, FixedIntervalDumpCallback
 import torch as th
@@ -100,8 +99,7 @@ class TrajectoryGeneratorFromAgent:
 
 
     def sample(self, agent_steps, exploration_steps = 0) -> Sequence[types.Trajectory]:
-        """Collect at least ``steps`` transitions and log rollout metrics."""
-        t0 = time.perf_counter()
+        """Collect at least ``agent_steps`` transitions and log rollout metrics."""
         agent_trajs  = self.buffering_wrapper.pop_finished_trajectories()
         avail_steps  = sum(len(traj) for traj in agent_trajs)
 

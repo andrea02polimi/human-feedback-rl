@@ -15,7 +15,10 @@ Two integration mechanisms for the demonstration signal (``demo_mode``):
 * ``"preferences"`` — demonstrations enter as preference pairs (expert
   fragment preferred over agent fragment, Ibarz et al. 2018): a single
   Bradley-Terry objective on mixed batches, no scale conflict by
-  construction.
+  construction. This mode doubles as the LITERATURE HYBRID BASELINE
+  ("demonstrations as implicit preferences") for the thesis comparison —
+  it is fully implemented and tested; to run it as an experiment arm see
+  the ``ibarz`` placeholder in ``scripts/tune_hybrid_sac.py``.
 
 Health metrics: with soft oracle labels at high ``pref_temperature`` the BT
 loss sits at its ln(2) cross-entropy floor even when learning succeeds —
@@ -198,6 +201,19 @@ class HybridAlgorithm(
 
         self.demo_mode = demo_mode
         self.demo_weight = float(demo_weight)
+        # --- EXTENSION PLACEHOLDER: learned demo_weight via Adam ------------
+        # Planned (phase 5, first tested on hybrid + soft preferences): make
+        # the demo/preference balance a learnable parameter instead of a fixed
+        # hyperparameter. Sketch (disabled until implemented):
+        #   self.log_demo_weight = th.nn.Parameter(
+        #       th.tensor(math.log(self.demo_weight)))       # log-space -> w>0
+        #   self.demo_weight_optimizer = th.optim.Adam(
+        #       [self.log_demo_weight], lr=demo_weight_lr)   # new kwarg
+        # The weight used in ``_reward_step`` then becomes
+        # ``exp(self.log_demo_weight)`` and is updated once per reward-model
+        # step (see the twin placeholder in ``_reward_step``). With the
+        # feature off, behaviour must stay identical to the constant weight.
+        # Design notes: docs/extensions-roadmap.md.
         self.max_balance_scale = float(max_balance_scale)
         self.balance_eps = float(balance_eps)
         self.demo_pref_pairs_per_iteration = int(demo_pref_pairs_per_iteration)
@@ -507,6 +523,16 @@ class HybridAlgorithm(
             self.demo_weight * pref_norm / (demo_norm + self.balance_eps),
             self.max_balance_scale,
         )
+        # --- EXTENSION PLACEHOLDER: learned demo_weight via Adam ------------
+        # With the learnable weight enabled (see __init__), this becomes:
+        #   demo_weight = float(th.exp(self.log_demo_weight))
+        #   scale = min(demo_weight * pref_norm / (demo_norm + eps), max_scale)
+        # and, after ``optimizer.step()`` below, the weight takes its own Adam
+        # step on a validation signal — e.g. the Bradley-Terry loss of the
+        # updated member on a held-out preference batch
+        # (``self._preference_loss(member, self.dataset_val...)``), with the
+        # gradient wrt log_demo_weight obtained by differentiating through the
+        # mixing coefficient (unrolled one-step or finite differences).
 
         for p, gp, gd in zip(params, g_pref, g_demo):
             if gp is None and gd is None:

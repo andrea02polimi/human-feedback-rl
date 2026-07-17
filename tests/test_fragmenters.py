@@ -1,5 +1,3 @@
-import numpy as np
-import torch as th
 
 from human_feedback_rl.common.fragmenters import (
     HighVariancePairFragmenter,

@@ -7,7 +7,7 @@ from gymnasium import spaces
 from stable_baselines3.common.vec_env import VecEnv
 
 from human_feedback_rl.common.reward_nets import RewardNet, make_reward_ensemble
-from human_feedback_rl.common.status import STATUS_NAMES, STATUS_DIM, ego_status_to_onehot
+from human_feedback_rl.common.status import ego_status_to_onehot
 from human_feedback_rl.common.types import Trajectory, Transition
 
 OBS_DIM = 4

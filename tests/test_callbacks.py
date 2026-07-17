@@ -1,4 +1,3 @@
-import numpy as np
 import pytest
 from stable_baselines3 import SAC
 from stable_baselines3.common.logger import KVWriter

@@ -5,12 +5,11 @@ import pytest
 import torch as th
 from stable_baselines3 import SAC
 
-from human_feedback_rl.algorithms import DaggerAlgorithm, HybridAlgorithm
-from human_feedback_rl.common import BCPolicy
+from human_feedback_rl.algorithms import HybridAlgorithm
 from human_feedback_rl.common.replay_buffers import RewardRelabelReplayBuffer
 from human_feedback_rl.common.reward_nets import make_reward_ensemble
 
-from conftest import ACT_DIM, FakeVecEnv, make_trajectories
+from conftest import FakeVecEnv, make_trajectories
 
 RM_KWARGS = dict(n_ensembles=2, net_arch=[8])
 
@@ -80,32 +79,3 @@ def test_hybrid_checkpoint_roundtrip(tmp_path, rng):
     fresh.load_state_dict(state_dict)
     for key, value in fresh.state_dict().items():
         assert th.equal(value, state_dict[key]), key
-
-
-class _ScriptedExpert:
-    """Deterministic expert: action = clipped linear function of the observation."""
-
-    def predict(self, obs):
-        obs = np.atleast_2d(obs)
-        return np.clip(0.5 * obs[:, :ACT_DIM], -1.0, 1.0).astype(np.float32)
-
-
-def test_dagger_algorithm_trains():
-    env = FakeVecEnv(num_envs=1, episode_len=8)
-    agent = BCPolicy(
-        env.observation_space, env.action_space, lambda _: 1e-3, net_arch=[16]
-    )
-    algo = DaggerAlgorithm(
-        env,
-        agent,
-        expert=_ScriptedExpert(),
-        bc_epochs=1,
-        n_eval_episodes=1,
-        n_expert_rollout_episodes=1,
-        rng=np.random.default_rng(0),
-        output_formats=[],
-    )
-    trained = algo.train(n_rounds=2, num_episodes=1)
-    assert trained is agent
-    assert len(algo.dataset) == 16  # 2 rounds x 1 episode x 8 steps
-    assert len(algo.dataset_expert) == 8

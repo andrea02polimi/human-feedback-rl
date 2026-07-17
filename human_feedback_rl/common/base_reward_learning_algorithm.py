@@ -1,15 +1,15 @@
-"""
-Shared base for reward-learning algorithms (preference-based and demo-based).
+"""Shared base for reward-learning algorithms.
 
-Owns everything both algorithm families need: the learned reward model, the
+Owns what any reward-learning loop needs: the learned reward model, the
 trajectory generator (rollouts + agent updates on predicted rewards), rollout
-and validation logging, query scheduling, and checkpointing. Each concrete
-algorithm implements its own ``train()`` loop on top of these utilities.
+and validation logging, query scheduling, and checkpointing. The concrete
+algorithm (:class:`~human_feedback_rl.algorithms.HybridAlgorithm`) implements
+its ``train()`` loop on top of these utilities.
 """
 
 import os
 import time
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import torch as th
@@ -68,13 +68,8 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         env,
         agent,
         reward_model: RewardNet,
-        train_comparison_frac: float = 0.7,
-        fragment_length: int = 1,
-        initial_queries: int = 0,
         exploration_frac: float = 0.0,
         exploration_eps: float = 0.5,
-        query_schedule: Union[str, Callable[[float], float]] = "constant",
-        temperature: float = 1,
         rng: Optional[np.random.Generator] = None,
         log_folder: Optional[str] = None,
         output_formats: Optional[List] = None,
@@ -84,17 +79,16 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
     ):
         super().__init__(env, agent, rng, log_folder=log_folder, output_formats=output_formats)
 
-        self.fragment_length          = fragment_length
-        self.initial_queries          = initial_queries
-        self.train_comparison_frac    = train_comparison_frac
-        self.exploration_frac         = exploration_frac
-        self.temperature              = temperature
-        self.iteration                = 0
-        self.trajectories             = []
-        self.debug_dataset            = debug_dataset or {}
+        self.exploration_frac = exploration_frac
+        self.iteration = 0
+        self.trajectories: List[Trajectory] = []
+        self.debug_dataset = debug_dataset or {}
 
-        self.query_schedule      = QUERY_SCHEDULES[query_schedule]
-        self.query_schedule_name = query_schedule
+        # Query-scheduling state; the subclass assigns its configured values
+        # (``build_query_schedule`` reads them).
+        self.initial_queries = 0
+        self.query_schedule: Callable[[float], float] = QUERY_SCHEDULES["constant"]
+        self.query_schedule_name: str = "constant"
 
         self.reward_model = reward_model
 
@@ -190,8 +184,6 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         match_std: bool = False,
     ) -> np.ndarray:
         """Shift/scale pred_rewards to align with true_rewards statistics on running steps."""
-        pred_rewards = pred_rewards * self.temperature
-
         norm_mask = np.ones(len(pred_rewards), dtype=bool)
         if norm_on_running:
             norm_mask = status[:, self.STATUS_RUNNING] == 1
