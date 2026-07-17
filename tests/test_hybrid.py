@@ -4,7 +4,7 @@ import torch as th
 from stable_baselines3 import SAC
 
 from human_feedback_rl.algorithms import HybridAlgorithm
-from human_feedback_rl.algorithms.demo.reward_training import RewardTrainingMixin
+from human_feedback_rl.algorithms.hybrid.reward_training import RewardTrainingMixin
 from human_feedback_rl.common.replay_buffers import RewardRelabelReplayBuffer
 
 from conftest import FakeVecEnv, make_trajectories

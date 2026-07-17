@@ -34,13 +34,13 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import numpy as np
 import torch as th
 
-from human_feedback_rl.algorithms.demo.imitation_metrics import ImitationMetricsMixin
-from human_feedback_rl.algorithms.demo.losses import (
+from human_feedback_rl.algorithms.hybrid.imitation_metrics import ImitationMetricsMixin
+from human_feedback_rl.algorithms.hybrid.demonstration_losses import (
     VALID_LOSSES,
     RewardLossMixin,
 )
-from human_feedback_rl.algorithms.demo.reward_diagnostics import RewardDiagnosticsMixin
-from human_feedback_rl.algorithms.demo.reward_training import RewardTrainingMixin
+from human_feedback_rl.algorithms.hybrid.reward_diagnostics import RewardDiagnosticsMixin
+from human_feedback_rl.algorithms.hybrid.reward_training import RewardTrainingMixin
 from human_feedback_rl.common.base_reward_learning_algorithm import (
     QUERY_SCHEDULES,
     BaseRewardLearningAlgorithm,
@@ -49,7 +49,7 @@ from human_feedback_rl.common.batching import fragment_avg_rewards
 from human_feedback_rl.common.datasets import PreferenceBatch, PreferenceDataset
 from human_feedback_rl.common.fragmenters import make_pair_fragmenter
 from human_feedback_rl.common.gatherers import PreferenceGathererFromReward
-from human_feedback_rl.common.losses import (
+from human_feedback_rl.common.preference_losses import (
     bradley_terry_probs,
     evaluate_preference_batch,
     preference_labels_tensor,

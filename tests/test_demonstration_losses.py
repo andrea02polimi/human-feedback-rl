@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch as th
 
-from human_feedback_rl.algorithms.demo.losses import (
+from human_feedback_rl.algorithms.hybrid.demonstration_losses import (
     RewardLossMixin,
     VALID_LOSSES,
     demo_1_loss,

@@ -3,7 +3,7 @@ import math
 import pytest
 import torch as th
 
-from human_feedback_rl.common.losses import (
+from human_feedback_rl.common.preference_losses import (
     bradley_terry_probs,
     preference_accuracy,
     preference_nll,
