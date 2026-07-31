@@ -140,11 +140,22 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         exact = weights / weights.sum() * remaining
 
         # Largest-remainder rounding: floor everything, then hand the leftover
-        # queries to the iterations with the largest fractional parts.
+        # queries to the iterations with the largest fractional parts.  With a
+        # constant schedule all fractional parts are tied, so spread those
+        # top-ups uniformly over time instead of relying on np.argsort's
+        # arbitrary tie order (which can cluster sparse queries at the end).
         shares = np.floor(exact).astype(int)
         leftover = remaining - int(shares.sum())
         if leftover > 0:
-            top_up = np.argsort(exact - shares)[::-1][:leftover]
+            if self.query_schedule_name == "constant":
+                # For k=1..leftover, ceil(k*n/leftover)-1 gives unique,
+                # evenly spaced zero-based indices and always includes the
+                # final iteration.  Integer arithmetic avoids float drift.
+                top_up = (
+                    np.arange(1, leftover + 1) * n_iterations - 1
+                ) // leftover
+            else:
+                top_up = np.argsort(exact - shares)[::-1][:leftover]
             shares[top_up] += 1
 
         shares[0] += self.initial_queries

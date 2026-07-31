@@ -25,6 +25,16 @@ loss sits at its ln(2) cross-entropy floor even when learning succeeds —
 watch ``reward/acc_pref_val`` and ``reward_val/.../pred_true/pearson_*``
 instead. Adam weight decay at 1e-2 overwhelms the BT gradient and collapses
 the reward net (diagnosed 2026-07-05).
+
+Gradient diagnostics (``"gcl"`` mode only, one point per iteration under
+``reward/grad_*``): variance, mean squared norm, squared norm of the mean and
+their ratio, for the preference and demonstration channels SEPARATELY and for
+the composed gradient (``_total``), plus the cosine between the two channels
+and a direction-only variance (``grad_dir_var_*``). The same quantities are
+also estimated from Adam-style moving averages whose state spans the whole
+run (``reward/grad_adam_*`` with the reward optimizer's own betas,
+``reward/grad_adam_eq_*`` with a single beta). See
+:mod:`human_feedback_rl.algorithms.hybrid.gradient_statistics`.
 """
 
 import os
@@ -38,6 +48,11 @@ from human_feedback_rl.algorithms.hybrid.imitation_metrics import ImitationMetri
 from human_feedback_rl.algorithms.hybrid.demonstration_losses import (
     VALID_LOSSES,
     RewardLossMixin,
+)
+from human_feedback_rl.algorithms.hybrid.gradient_statistics import (
+    AdamGradientStats,
+    HybridGradientStats,
+    average_metrics,
 )
 from human_feedback_rl.algorithms.hybrid.reward_diagnostics import RewardDiagnosticsMixin
 from human_feedback_rl.algorithms.hybrid.reward_training import RewardTrainingMixin
@@ -106,6 +121,8 @@ class HybridAlgorithm(
         balance_eps: float = 1e-8,
         demo_pref_pairs_per_iteration: int = 64,
         demo_pref_batch_fraction: float = 0.5,
+        grad_diagnostics_interval: int = 1,
+        grad_diagnostics_eq_beta: float = 0.99,
         initial_agent_timesteps: int = 0,
         exploration_frac: float = 0.0,
         exploration_eps: float = 0.5,
@@ -145,6 +162,10 @@ class HybridAlgorithm(
             raise ValueError("demo_pref_pairs_per_iteration must be non-negative.")
         if not 0 <= demo_pref_batch_fraction <= 1:
             raise ValueError("demo_pref_batch_fraction must be in [0, 1].")
+        if grad_diagnostics_interval < 0:
+            raise ValueError("grad_diagnostics_interval must be non-negative.")
+        if not 0 <= grad_diagnostics_eq_beta < 1:
+            raise ValueError("grad_diagnostics_eq_beta must be in [0, 1).")
 
         reward_model = make_reward_ensemble(env, **(reward_model_kwargs or {}))
 
@@ -218,6 +239,18 @@ class HybridAlgorithm(
         self.balance_eps = float(balance_eps)
         self.demo_pref_pairs_per_iteration = int(demo_pref_pairs_per_iteration)
         self.demo_pref_batch_fraction = float(demo_pref_batch_fraction)
+        # Gradient diagnostics (variance, squared norms, channel angle) are
+        # accumulated from gradients the step already computes, so measuring
+        # every step is affordable; the knob exists to thin them out on very
+        # large reward nets, and 0 turns them off. Note that thinning also
+        # thins what the Adam-style estimator sees, so its step counter stops
+        # matching the optimizer's.
+        self.grad_diagnostics_interval = int(grad_diagnostics_interval)
+        self.grad_diagnostics_eq_beta = float(grad_diagnostics_eq_beta)
+        # Adam-style estimates persist for the whole run, one per ensemble
+        # member, keyed by member identity: resetting them each iteration
+        # would leave the moving averages permanently in their warm-up.
+        self._adam_grad_stats: Dict[int, AdamGradientStats] = {}
 
         self.fragmenter = make_pair_fragmenter(
             fragmenter_type, rng=self.rng, logger=self.logger, reward_ensemble=self.reward_model
@@ -403,18 +436,40 @@ class HybridAlgorithm(
         self.logger.record("reward/demo_weight", demo_weight, exclude="stdout")
         t0 = time.perf_counter()
 
+        # One accumulator per ensemble member: the variance reported is the
+        # spread of a single member's gradients over the iteration, never the
+        # disagreement between members.
+        grad_stats_per_member: List[HybridGradientStats] = []
+
         def member_step(member, optimizer):
             member.train()
             boot_dataset = self.dataset_train.bootstrap() if has_prefs else None
+            interval = self.grad_diagnostics_interval
+            grad_stats = (
+                HybridGradientStats(adam=self._member_adam_grad_stats(member, optimizer))
+                if interval > 0
+                else None
+            )
+            if grad_stats is not None:
+                grad_stats_per_member.append(grad_stats)
             stats = []
-            for _ in range(self.gradient_steps_rew):
+            for step in range(self.gradient_steps_rew):
                 pref_loss = (
                     self._preference_loss(member, boot_dataset.sample(self.batch_size_pref))
                     if boot_dataset is not None
                     else None
                 )
                 demo_loss = self._reward_loss(member) if demo_weight > 0.0 else None
-                stats.append(self._reward_step(member, optimizer, pref_loss, demo_loss))
+                measuring = (
+                    grad_stats
+                    if grad_stats is not None and step % interval == 0
+                    else None
+                )
+                stats.append(
+                    self._reward_step(
+                        member, optimizer, pref_loss, demo_loss, grad_stats=measuring
+                    )
+                )
             return stats
 
         all_stats = [s for stats in self.train_reward_members(member_step) for s in stats]
@@ -423,6 +478,7 @@ class HybridAlgorithm(
         self._log_reward_loss_diagnostics()
         self._log_preference_diagnostics()
         self._log_hybrid_step_stats(all_stats)
+        self._log_hybrid_grad_stats(grad_stats_per_member)
         self.logger.record("reward/weight_norm", self._param_norm(self.reward_model), exclude="stdout")
         self.logger.record("time/train_reward_model", t_train)
 
@@ -475,7 +531,9 @@ class HybridAlgorithm(
     # Balanced gradient step
     # ------------------------------------------------------------------
 
-    def _reward_step(self, member, optimizer, pref_loss, demo_loss) -> Dict[str, float]:
+    def _reward_step(
+        self, member, optimizer, pref_loss, demo_loss, grad_stats=None
+    ) -> Dict[str, float]:
         """One optimizer step from the preference and/or demo losses.
 
         With both losses present, the two gradients are computed separately,
@@ -483,6 +541,11 @@ class HybridAlgorithm(
         preference gradient, and the composed gradient (an exact per-parameter
         linear combination ``g_pref + scale * g_demo``) is written back before
         ``step()``.
+
+        ``grad_stats``, when given, records this step's gradients as they come
+        out of ``backward()`` — before the norm balancing — so the reported
+        norms and angle describe the two feedback signals themselves rather
+        than the rescaling the algorithm applies to them.
         """
         nan = float("nan")
         stats = {
@@ -493,20 +556,29 @@ class HybridAlgorithm(
         if pref_loss is None and demo_loss is None:
             return stats
 
+        params = list(member.parameters())
+
         if demo_loss is None:  # pref-only arm
             optimizer.zero_grad()
             pref_loss.backward()
             stats.update(pref_loss=float(pref_loss.detach()), grad_norm=self._grad_norm(member))
+            if grad_stats is not None:
+                # With one loss the applied gradient IS that channel, so the
+                # "total" curves stay defined and comparable across arms.
+                flat = self._flatten_grads(params)
+                grad_stats.update(g_pref=flat, g_total=flat)
             optimizer.step()
             return stats
         if pref_loss is None:  # demo-only arm
             optimizer.zero_grad()
             demo_loss.backward()
             stats.update(demo_loss=float(demo_loss.detach()), grad_norm=self._grad_norm(member))
+            if grad_stats is not None:
+                flat = self._flatten_grads(params)
+                grad_stats.update(g_demo=flat, g_total=flat)
             optimizer.step()
             return stats
 
-        params = list(member.parameters())
         optimizer.zero_grad()
         pref_loss.backward()
         g_pref = [None if p.grad is None else p.grad.detach().clone() for p in params]
@@ -546,6 +618,14 @@ class HybridAlgorithm(
             p.grad = grad
 
         grad_norm = self._grad_norm(member)
+        if grad_stats is not None:
+            # Raw channels plus the composed gradient now sitting on .grad,
+            # recorded together so all three describe the same step.
+            grad_stats.update(
+                g_pref=flat_pref,
+                g_demo=flat_demo,
+                g_total=self._flatten_grads(params),
+            )
         optimizer.step()
 
         stats.update(
@@ -562,6 +642,11 @@ class HybridAlgorithm(
             for g, p in zip(grads, params)
         ]
         return th.cat(parts) if parts else th.zeros(0)
+
+    @classmethod
+    def _flatten_grads(cls, params) -> th.Tensor:
+        """Flatten the gradients currently sitting on ``params``."""
+        return cls._flatten([p.grad for p in params], params)
 
     def _log_hybrid_step_stats(self, all_stats: List[Dict[str, float]]) -> None:
         def nanmean(key):
@@ -592,6 +677,38 @@ class HybridAlgorithm(
         grad_norms = [s["grad_norm"] for s in all_stats if np.isfinite(s["grad_norm"])]
         if grad_norms:
             self.logger.record("reward/grad_norm_max", float(np.max(grad_norms)), exclude="stdout")
+
+    def _member_adam_grad_stats(self, member, optimizer) -> AdamGradientStats:
+        """Run-long Adam-style estimator for ``member``, created on first use.
+
+        The betas are read from the optimizer actually training this member,
+        so ``grad_adam_*`` describes that optimizer rather than a nominal one.
+        """
+        key = id(member)
+        if key not in self._adam_grad_stats:
+            betas = optimizer.param_groups[0].get("betas", (0.9, 0.999))
+            self._adam_grad_stats[key] = AdamGradientStats(
+                betas=betas, eq_beta=self.grad_diagnostics_eq_beta
+            )
+        return self._adam_grad_stats[key]
+
+    def _log_hybrid_grad_stats(self, grad_stats_per_member: List[HybridGradientStats]) -> None:
+        """Log this iteration's gradient variance, squared norms and channel angle.
+
+        One value per metric per iteration: the statistics are taken over the
+        member's gradient steps within the iteration, then averaged over the
+        ensemble members.
+        """
+        per_member = [stats.metrics() for stats in grad_stats_per_member if stats.count]
+        if not per_member:
+            return
+        for key, value in average_metrics(per_member).items():
+            self.logger.record(f"reward/{key}", value, exclude="stdout")
+        self.logger.record(
+            "reward/grad_diagnostics_samples",
+            float(np.mean([stats.count for stats in grad_stats_per_member])),
+            exclude="stdout",
+        )
 
     # ------------------------------------------------------------------
     # Preference loss / diagnostics

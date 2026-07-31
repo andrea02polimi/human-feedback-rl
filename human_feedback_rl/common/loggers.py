@@ -29,8 +29,8 @@ ITERATION_METRIC_PREFIXES = (
 
 # Keep the automatically generated workspace deliberately small. All other
 # values are still written to W&B history and can be added to custom panels.
-# A demo_2 run logs 16 common metrics plus its two loss-specific diagnostics:
-# 18 automatic plots, which can be grouped into nine custom workspace panels.
+# A demo_2 run logs 16 common metrics, its two loss-specific diagnostics and
+# the nineteen gradient-conflict curves: 37 automatic plots.
 VISIBLE_METRICS = (
     # Policy outcome and environment performance.
     "agent/event_rate/successes",
@@ -65,6 +65,34 @@ VISIBLE_METRICS = (
     "reward/hybrid_demo_scale",
     "reward/grad_norm_demo_pref_ratio",
     "reward/acc_pref_val",
+    # Gradient-conflict diagnostics: how noisy each channel is and whether the
+    # demonstration and preference gradients agree.
+    "reward/grad_var_pref",
+    "reward/grad_var_demo",
+    "reward/grad_sq_norm_pref",
+    "reward/grad_sq_norm_demo",
+    "reward/grad_var_ratio_pref",
+    "reward/grad_var_ratio_demo",
+    # Same ratio against E[||g||^2] instead of ||mean g||^2: bounded by
+    # T/(T-1), reads directly as the noise share of the gradient's energy.
+    "reward/grad_noise_fraction_pref",
+    "reward/grad_noise_fraction_demo",
+    "reward/grad_cosine",
+    # Direction-only variance, and the channel angle with every step weighted
+    # equally rather than by its gradient magnitude.
+    "reward/grad_dir_var_pref",
+    "reward/grad_dir_var_demo",
+    "reward/grad_dir_cosine_of_means",
+    # The composed gradient the optimizer actually receives.
+    "reward/grad_var_ratio_total",
+    "reward/grad_dir_var_total",
+    # Same variance read off Adam's moving averages, whose state spans the
+    # run. The grad_adam_eq_* twin stays in history without its own panel.
+    "reward/grad_adam_var_pref",
+    "reward/grad_adam_var_demo",
+    "reward/grad_adam_var_ratio_pref",
+    "reward/grad_adam_var_ratio_demo",
+    "reward/grad_adam_var_ratio_total",
 )
 VISIBLE_METRIC_SET = frozenset(VISIBLE_METRICS)
 

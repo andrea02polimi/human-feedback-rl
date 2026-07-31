@@ -6,6 +6,8 @@
   agent-facing reward normalization).
 * ``reward_diagnostics`` — validation, ranking and replay-buffer diagnostics.
 * ``imitation_metrics`` — agent-vs-expert imitation error logging.
+* ``gradient_statistics`` — per-iteration variance, squared norms and angle
+  of the preference and demonstration gradient channels.
 
 The preference side (Bradley-Terry losses, fragmenters, synthetic oracle)
 lives in :mod:`human_feedback_rl.common`.
