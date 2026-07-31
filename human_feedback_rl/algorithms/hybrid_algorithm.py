@@ -37,6 +37,7 @@ run (``reward/grad_adam_*`` with the reward optimizer's own betas,
 :mod:`human_feedback_rl.algorithms.hybrid.gradient_statistics`.
 """
 
+import math
 import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -74,6 +75,7 @@ from human_feedback_rl.common.reward_nets import make_reward_ensemble
 from human_feedback_rl.common.types import Preference, Trajectory
 
 VALID_DEMO_MODES = ("gcl", "preferences")
+VALID_GRADIENT_FUSIONS = ("norm_balanced", "demo_anchor_reliability")
 
 
 class HybridAlgorithm(
@@ -119,6 +121,9 @@ class HybridAlgorithm(
         demo_weight: float = 1.0,
         max_balance_scale: float = 100.0,
         balance_eps: float = 1e-8,
+        gradient_fusion: str = "norm_balanced",
+        reliability_ema_beta: float = 0.9,
+        reliability_lambda_max: float = 1.0,
         demo_pref_pairs_per_iteration: int = 64,
         demo_pref_batch_fraction: float = 0.5,
         grad_diagnostics_interval: int = 1,
@@ -154,6 +159,19 @@ class HybridAlgorithm(
             raise ValueError("demo_weight must be non-negative.")
         if max_balance_scale <= 0 or balance_eps <= 0:
             raise ValueError("max_balance_scale and balance_eps must be positive.")
+        if gradient_fusion not in VALID_GRADIENT_FUSIONS:
+            raise ValueError(
+                f"gradient_fusion must be one of {VALID_GRADIENT_FUSIONS}, "
+                f"got {gradient_fusion!r}."
+            )
+        if not 0 <= reliability_ema_beta < 1:
+            raise ValueError("reliability_ema_beta must be in [0, 1).")
+        if not 0 < reliability_lambda_max <= 1:
+            raise ValueError("reliability_lambda_max must be in (0, 1].")
+        if gradient_fusion == "demo_anchor_reliability" and grad_diagnostics_interval <= 0:
+            raise ValueError(
+                "demo_anchor_reliability requires grad_diagnostics_interval > 0."
+            )
         if pref_temperature <= 0:
             raise ValueError("pref_temperature must be positive.")
         if demo_mode not in VALID_DEMO_MODES:
@@ -237,6 +255,12 @@ class HybridAlgorithm(
         # Design notes: docs/extensions-roadmap.md.
         self.max_balance_scale = float(max_balance_scale)
         self.balance_eps = float(balance_eps)
+        self.gradient_fusion = gradient_fusion
+        self.reliability_ema_beta = float(reliability_ema_beta)
+        self.reliability_lambda_max = float(reliability_lambda_max)
+        # Per-member state built only from a completed reward-training call.
+        # The next call consumes it, so a minibatch never sets its own weight.
+        self._reliability_state: Dict[int, Dict[str, float]] = {}
         self.demo_pref_pairs_per_iteration = int(demo_pref_pairs_per_iteration)
         self.demo_pref_batch_fraction = float(demo_pref_batch_fraction)
         # Gradient diagnostics (variance, squared norms, channel angle) are
@@ -470,6 +494,8 @@ class HybridAlgorithm(
                         member, optimizer, pref_loss, demo_loss, grad_stats=measuring
                     )
                 )
+            if grad_stats is not None:
+                self._update_reliability_state(member, grad_stats, stats)
             return stats
 
         all_stats = [s for stats in self.train_reward_members(member_step) for s in stats]
@@ -528,19 +554,106 @@ class HybridAlgorithm(
         self.logger.record("time/train_reward_model", t_train)
 
     # ------------------------------------------------------------------
-    # Balanced gradient step
+    # Gradient fusion
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ema(previous: Optional[float], current: float, beta: float) -> float:
+        if previous is None or not math.isfinite(previous):
+            return current
+        return beta * previous + (1.0 - beta) * current
+
+    def _update_reliability_state(
+        self,
+        member,
+        grad_stats: HybridGradientStats,
+        step_stats: List[Dict[str, float]],
+    ) -> None:
+        """Update per-member EMAs after a complete reward-training call.
+
+        Reliability is the ratio between the channels' scale-invariant noise
+        ratios. Norm EMAs determine only their relative contribution. Invalid
+        observations are ignored, preserving the last valid causal state.
+        """
+        if self.gradient_fusion != "demo_anchor_reliability":
+            return
+
+        pref_norms = [s["pref_norm"] for s in step_stats if math.isfinite(s["pref_norm"])]
+        demo_norms = [s["demo_norm"] for s in step_stats if math.isfinite(s["demo_norm"])]
+        current = {
+            "pref_norm": float(np.mean(pref_norms)) if pref_norms else math.nan,
+            "demo_norm": float(np.mean(demo_norms)) if demo_norms else math.nan,
+            "pref_var_ratio": grad_stats.pref.var_ratio,
+            "demo_var_ratio": grad_stats.demo.var_ratio,
+        }
+        if not all(math.isfinite(value) and value >= 0 for value in current.values()):
+            return
+        if current["pref_norm"] <= 0 or current["demo_norm"] <= 0:
+            return
+
+        key = id(member)
+        previous = self._reliability_state.get(key, {})
+        beta = self.reliability_ema_beta
+        self._reliability_state[key] = {
+            name: self._ema(previous.get(name), value, beta)
+            for name, value in current.items()
+        }
+
+    def _demo_anchor_coefficients(self, member, pref_norm: float) -> Dict[str, float]:
+        """Return the causal reliability weight and preference scale.
+
+        ``g_demo`` remains untouched. Until a valid previous-iteration state
+        exists (or when the current preference gradient vanishes), the exact
+        fallback is demo-only.
+        """
+        fallback = {
+            "pref_scale": 0.0,
+            "reliability_lambda": 0.0,
+            "reliability_fallback": 1.0,
+            "ema_norm_pref": math.nan,
+            "ema_norm_demo": math.nan,
+            "ema_var_ratio_pref": math.nan,
+            "ema_var_ratio_demo": math.nan,
+        }
+        state = self._reliability_state.get(id(member))
+        if state is None or not math.isfinite(pref_norm) or pref_norm <= 0:
+            return fallback
+        if not all(math.isfinite(value) and value >= 0 for value in state.values()):
+            return fallback
+        if state["pref_norm"] <= 0 or state["demo_norm"] <= 0:
+            return fallback
+
+        reliability = math.sqrt(
+            (state["demo_var_ratio"] + self.balance_eps)
+            / (state["pref_var_ratio"] + self.balance_eps)
+        )
+        reliability = min(max(reliability, 0.0), self.reliability_lambda_max)
+        pref_scale = min(
+            reliability * state["demo_norm"] / (state["pref_norm"] + self.balance_eps),
+            self.max_balance_scale,
+        )
+        if not math.isfinite(pref_scale):
+            return fallback
+        return {
+            "pref_scale": pref_scale,
+            "reliability_lambda": reliability,
+            "reliability_fallback": 0.0,
+            "ema_norm_pref": state["pref_norm"],
+            "ema_norm_demo": state["demo_norm"],
+            "ema_var_ratio_pref": state["pref_var_ratio"],
+            "ema_var_ratio_demo": state["demo_var_ratio"],
+        }
 
     def _reward_step(
         self, member, optimizer, pref_loss, demo_loss, grad_stats=None
     ) -> Dict[str, float]:
         """One optimizer step from the preference and/or demo losses.
 
-        With both losses present, the two gradients are computed separately,
-        the demo gradient is norm-balanced to ``demo_weight`` times the
-        preference gradient, and the composed gradient (an exact per-parameter
-        linear combination ``g_pref + scale * g_demo``) is written back before
-        ``step()``.
+        With both losses present, the two gradients are computed separately.
+        ``norm_balanced`` preserves the historical ``g_pref + scale*g_demo``
+        rule. ``demo_anchor_reliability`` instead applies
+        ``g_demo + lambda*EMA(||g_demo||)/EMA(||g_pref||)*g_pref`` using only
+        statistics from the previous completed reward-training call.
 
         ``grad_stats``, when given, records this step's gradients as they come
         out of ``backward()`` — before the norm balancing — so the reported
@@ -550,7 +663,11 @@ class HybridAlgorithm(
         nan = float("nan")
         stats = {
             "pref_loss": nan, "demo_loss": nan, "scale": nan, "pref_norm": nan,
-            "demo_norm": nan, "grad_norm": nan,
+            "demo_norm": nan, "grad_norm": nan, "demo_scale": nan,
+            "pref_scale": nan, "reliability_lambda": nan,
+            "reliability_fallback": nan, "ema_norm_pref": nan,
+            "ema_norm_demo": nan, "ema_var_ratio_pref": nan,
+            "ema_var_ratio_demo": nan,
         }
 
         if pref_loss is None and demo_loss is None:
@@ -591,10 +708,25 @@ class HybridAlgorithm(
         pref_norm = float(flat_pref.norm())
         demo_norm = float(flat_demo.norm())
 
-        scale = min(
-            self.demo_weight * pref_norm / (demo_norm + self.balance_eps),
-            self.max_balance_scale,
-        )
+        if self.gradient_fusion == "norm_balanced":
+            scale = min(
+                self.demo_weight * pref_norm / (demo_norm + self.balance_eps),
+                self.max_balance_scale,
+            )
+            coefficients = {
+                "pref_scale": 1.0,
+                "demo_scale": scale,
+                "reliability_lambda": math.nan,
+                "reliability_fallback": 0.0,
+                "ema_norm_pref": math.nan,
+                "ema_norm_demo": math.nan,
+                "ema_var_ratio_pref": math.nan,
+                "ema_var_ratio_demo": math.nan,
+            }
+        else:
+            reliability = self._demo_anchor_coefficients(member, pref_norm)
+            coefficients = {"demo_scale": 1.0, **reliability}
+            scale = math.nan
         # --- EXTENSION PLACEHOLDER: learned demo_weight via Adam ------------
         # With the learnable weight enabled (see __init__), this becomes:
         #   demo_weight = float(th.exp(self.log_demo_weight))
@@ -612,9 +744,9 @@ class HybridAlgorithm(
                 continue
             grad = th.zeros_like(p)
             if gp is not None:
-                grad += gp
+                grad += coefficients["pref_scale"] * gp
             if gd is not None:
-                grad += scale * gd
+                grad += coefficients["demo_scale"] * gd
             p.grad = grad
 
         grad_norm = self._grad_norm(member)
@@ -632,6 +764,7 @@ class HybridAlgorithm(
             pref_loss=float(pref_loss.detach()),
             demo_loss=float(demo_loss.detach()),
             scale=scale, pref_norm=pref_norm, demo_norm=demo_norm, grad_norm=grad_norm,
+            **coefficients,
         )
         return stats
 
@@ -657,7 +790,14 @@ class HybridAlgorithm(
         pairs = {
             "reward/hybrid_pref_loss": "pref_loss",
             "reward/hybrid_demo_loss": "demo_loss",
-            "reward/hybrid_demo_scale": "scale",
+            "reward/hybrid_demo_scale": "demo_scale",
+            "reward/hybrid_pref_scale": "pref_scale",
+            "reward/hybrid_reliability_lambda": "reliability_lambda",
+            "reward/hybrid_reliability_fallback_rate": "reliability_fallback",
+            "reward/hybrid_ema_norm_pref": "ema_norm_pref",
+            "reward/hybrid_ema_norm_demo": "ema_norm_demo",
+            "reward/hybrid_ema_var_ratio_pref": "ema_var_ratio_pref",
+            "reward/hybrid_ema_var_ratio_demo": "ema_var_ratio_demo",
             "reward/grad_norm_pref": "pref_norm",
             "reward/grad_norm_demo": "demo_norm",
             "reward/grad_norm": "grad_norm",

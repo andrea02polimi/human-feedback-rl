@@ -55,14 +55,25 @@ class _StepShim:
     """Carries only what _reward_step needs."""
 
     _reward_step = HybridAlgorithm._reward_step
+    _demo_anchor_coefficients = HybridAlgorithm._demo_anchor_coefficients
     _flatten = staticmethod(HybridAlgorithm._flatten)
     _flatten_grads = HybridAlgorithm._flatten_grads
     _grad_norm = staticmethod(RewardTrainingMixin._grad_norm)
 
-    def __init__(self, demo_weight=1.0, max_balance_scale=100.0):
+    def __init__(
+        self,
+        demo_weight=1.0,
+        max_balance_scale=100.0,
+        gradient_fusion="norm_balanced",
+        reliability_lambda_max=1.0,
+        reliability_state=None,
+    ):
         self.demo_weight = demo_weight
         self.max_balance_scale = max_balance_scale
         self.balance_eps = 1e-12
+        self.gradient_fusion = gradient_fusion
+        self.reliability_lambda_max = reliability_lambda_max
+        self._reliability_state = reliability_state or {}
 
 
 def _run_step(g_pref, g_demo, grad_stats=None, **shim_kwargs):
@@ -101,6 +112,79 @@ def test_balance_scale_uses_demo_weight_and_clamp():
     assert stats["scale"] == pytest.approx(3.0 * 2.0 / 0.5, rel=1e-6)
     _, stats = _run_step([2.0, 0.0], [0.001, 0.0], max_balance_scale=10.0)
     assert stats["scale"] == 10.0
+
+
+def test_demo_anchor_warmup_is_exact_demo_only():
+    g_p, g_d = [7.0, -2.0], [0.5, 1.5]
+    grad, stats = _run_step(g_p, g_d, gradient_fusion="demo_anchor_reliability")
+    assert np.allclose(grad, g_d)
+    assert stats["pref_scale"] == 0.0
+    assert stats["reliability_lambda"] == 0.0
+    assert stats["reliability_fallback"] == 1.0
+
+
+def test_demo_anchor_reliability_math_leaves_demo_unscaled():
+    member = _TwoParam()
+    optimizer = th.optim.SGD(member.parameters(), lr=0.0)
+    state = {
+        id(member): {
+            "pref_norm": 4.0,
+            "demo_norm": 2.0,
+            "pref_var_ratio": 16.0,
+            "demo_var_ratio": 4.0,
+        }
+    }
+    shim = _StepShim(
+        gradient_fusion="demo_anchor_reliability", reliability_state=state
+    )
+    g_p, g_d = np.array([4.0, 0.0]), np.array([0.0, 2.0])
+    stats = shim._reward_step(
+        member,
+        optimizer,
+        (th.tensor(g_p) * member.w).sum(),
+        (th.tensor(g_d) * member.w).sum(),
+    )
+    # lambda=sqrt(4/16)=0.5 and EMA norm ratio=2/4, so pref_scale=0.25.
+    assert stats["reliability_lambda"] == pytest.approx(0.5)
+    assert stats["pref_scale"] == pytest.approx(0.25)
+    assert stats["demo_scale"] == 1.0
+    assert np.allclose(member.w.grad.numpy(), g_d + 0.25 * g_p)
+
+
+def test_demo_anchor_noisy_preference_is_downweighted():
+    member = _TwoParam()
+    state = {
+        id(member): {
+            "pref_norm": 1.0,
+            "demo_norm": 1.0,
+            "pref_var_ratio": 100.0,
+            "demo_var_ratio": 1.0,
+        }
+    }
+    shim = _StepShim(
+        gradient_fusion="demo_anchor_reliability", reliability_state=state
+    )
+    coefficients = shim._demo_anchor_coefficients(member, pref_norm=1.0)
+    assert coefficients["reliability_lambda"] == pytest.approx(0.1)
+    assert coefficients["pref_scale"] == pytest.approx(0.1)
+
+
+def test_demo_anchor_zero_preference_gradient_falls_back_to_demo():
+    member = _TwoParam()
+    state = {
+        id(member): {
+            "pref_norm": 1.0,
+            "demo_norm": 1.0,
+            "pref_var_ratio": 1.0,
+            "demo_var_ratio": 1.0,
+        }
+    }
+    shim = _StepShim(
+        gradient_fusion="demo_anchor_reliability", reliability_state=state
+    )
+    coefficients = shim._demo_anchor_coefficients(member, pref_norm=0.0)
+    assert coefficients["pref_scale"] == 0.0
+    assert coefficients["reliability_fallback"] == 1.0
 
 
 def test_pref_only_and_demo_only_steps():
@@ -187,6 +271,24 @@ def test_hybrid_iteration_logs_every_requested_curve(rng):
     # Variance over the gradient steps of the iteration, one point per
     # iteration: 4 steps means 4 samples per member.
     assert recorded["reward/grad_diagnostics_samples"] == pytest.approx(4.0)
+
+
+def test_demo_anchor_uses_previous_call_state_and_logs_coefficients(rng):
+    algo = _hybrid(
+        rng,
+        gradient_steps_rew=4,
+        gradient_fusion="demo_anchor_reliability",
+        reliability_ema_beta=0.9,
+    )
+    first = _train_reward_model_once(algo)
+    assert first["reward/hybrid_reliability_fallback_rate"] == 1.0
+    assert len(algo._reliability_state) == len(algo.reward_model.members)
+
+    second = _train_reward_model_once(algo)
+    assert second["reward/hybrid_reliability_fallback_rate"] == 0.0
+    assert 0.0 <= second["reward/hybrid_reliability_lambda"] <= 1.0
+    assert second["reward/hybrid_demo_scale"] == 1.0
+    assert np.isfinite(second["reward/hybrid_pref_scale"])
 
 
 def test_grad_diagnostics_interval_subsamples_the_steps(rng):
@@ -316,6 +418,8 @@ def test_pref_temperature_reaches_the_gatherer(rng):
 @pytest.mark.parametrize("bad", [
     dict(demo_mode="nope"),
     dict(pref_temperature=0.0), dict(demo_pref_batch_fraction=1.5),
+    dict(gradient_fusion="nope"), dict(reliability_ema_beta=1.0),
+    dict(reliability_lambda_max=1.1),
 ])
 def test_invalid_kwargs_raise(rng, bad):
     with pytest.raises(ValueError):
