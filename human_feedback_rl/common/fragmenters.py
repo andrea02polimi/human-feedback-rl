@@ -12,6 +12,15 @@ def make_pair_fragmenter(kind: str, rng, logger, reward_ensemble=None, oversampl
     if kind == "active":
         if reward_ensemble is None:
             raise ValueError('fragmenter "active" requires a reward_ensemble.')
+        # Con un membro solo il punteggio di acquisizione (disaccordo fra
+        # membri) e' identicamente zero: "active" degenererebbe in silenzio in
+        # uno casuale, e i risultati sarebbero attribuiti alla strategia
+        # sbagliata. Meglio fallire subito.
+        if len(getattr(reward_ensemble, "members", []) or []) < 2:
+            raise ValueError(
+                'fragmenter "active" needs at least 2 ensemble members; '
+                "with one member the acquisition score is identically zero."
+            )
         return HighVariancePairFragmenter(
             rng=rng, logger=logger, reward_ensemble=reward_ensemble, oversample=oversample
         )

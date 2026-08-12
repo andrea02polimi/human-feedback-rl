@@ -57,21 +57,78 @@ class _StepShim:
     _flatten = staticmethod(HybridAlgorithm._flatten)
     _grad_norm = staticmethod(RewardTrainingMixin._grad_norm)
 
-    def __init__(self, demo_weight=1.0, max_balance_scale=100.0):
+    _set_flat_grad = staticmethod(HybridAlgorithm._set_flat_grad)
+    _alpha_weight = HybridAlgorithm._alpha_weight
+
+    def __init__(self, demo_weight=1.0, max_balance_scale=100.0,
+                 gcl_fusion="norm_balance"):
         self.demo_weight = demo_weight
         self.max_balance_scale = max_balance_scale
         self.balance_eps = 1e-12
+        self.gcl_fusion = gcl_fusion
+        self.alpha_eps = 1e-8
+        self._alpha_current = {}
 
 
-def _run_step(g_pref, g_demo, **shim_kwargs):
+def _run_step(g_pref, g_demo, alpha=None, **shim_kwargs):
     """Apply _reward_step with losses whose gradients are exactly g_pref/g_demo."""
     member = _TwoParam()
     optimizer = th.optim.SGD(member.parameters(), lr=0.0)
     pref_loss = (th.tensor(g_pref) * member.w).sum()
     demo_loss = (th.tensor(g_demo) * member.w).sum()
     shim = _StepShim(**shim_kwargs)
-    stats = shim._reward_step(member, optimizer, pref_loss, demo_loss)
+    stats = shim._reward_step(member, optimizer, pref_loss, demo_loss, alpha=alpha)
     return member.w.grad.detach().numpy(), stats
+
+
+# ---------------------------------------------------------------------------
+# Fusione prova 1: direzioni unitarie pesate da alpha, un solo Adam
+# ---------------------------------------------------------------------------
+
+def _unit(v):
+    v = np.asarray(v, dtype=float)
+    return v / np.linalg.norm(v)
+
+
+@pytest.mark.parametrize("alpha", [0.0, 0.25, 0.5, 0.75, 1.0])
+def test_prova1_combina_direzioni_unitarie_con_alpha(alpha):
+    """g_fin = (1-a) * g_p/||g_p|| + a * g_d/||g_d||, passato a UN solo optimizer."""
+    g_pref, g_demo = [3.0, 4.0], [0.0, 2.0]      # norme 5 e 2
+    grad, stats = _run_step(g_pref, g_demo, alpha=alpha,
+                            gcl_fusion="alpha_norm_single_adam")
+    atteso = (1 - alpha) * _unit(g_pref) + alpha * _unit(g_demo)
+    assert np.allclose(grad, atteso, atol=1e-6)
+    assert stats["alpha"] == pytest.approx(alpha)
+
+
+def test_prova1_con_alpha_uno_resta_solo_la_direzione_delle_dimostrazioni():
+    """Il fallback sotto la soglia deve ridursi al canale dimostrazioni."""
+    grad, _ = _run_step([3.0, 4.0], [0.0, 2.0], alpha=1.0,
+                        gcl_fusion="alpha_norm_single_adam")
+    assert np.allclose(grad, _unit([0.0, 2.0]), atol=1e-6)
+
+
+def test_prova1_butta_via_le_norme_dei_due_canali():
+    """Scalare un canale non cambia l'update: sopravvive solo la direzione."""
+    a, _ = _run_step([3.0, 4.0], [0.0, 2.0], alpha=0.5,
+                     gcl_fusion="alpha_norm_single_adam")
+    b, _ = _run_step([300.0, 400.0], [0.0, 0.02], alpha=0.5,
+                     gcl_fusion="alpha_norm_single_adam")
+    assert np.allclose(a, b, atol=1e-6)
+
+
+def test_prova1_alpha_viene_clampato_in_zero_uno():
+    grad, stats = _run_step([1.0, 0.0], [0.0, 1.0], alpha=5.0,
+                            gcl_fusion="alpha_norm_single_adam")
+    assert stats["alpha"] == pytest.approx(1.0)
+    assert np.allclose(grad, [0.0, 1.0], atol=1e-6)
+
+
+def test_la_fusione_storica_resta_il_default():
+    """Chi non chiede la prova 1 deve avere il comportamento di prima."""
+    grad, stats = _run_step([1.0, 0.0], [0.0, 1.0])
+    assert np.isnan(stats["alpha"])
+    assert np.allclose(grad, [1.0, 1.0], atol=1e-6)   # somma bilanciata di norma
 
 
 def test_norm_balanced_sum():
@@ -140,8 +197,7 @@ def test_demo_preference_pairs_expert_first_with_hard_labels(rng):
     algo.trajectories = make_trajectories(np.random.default_rng(5), [10, 10])
     algo._collect_demo_preference_pairs(12)
 
-    n = len(algo.dataset_demo_prefs_train) + len(algo.dataset_demo_prefs_val)
-    assert n == 12
+    assert len(algo.dataset_demo_prefs_train) == 12
     expert_transitions = {id(t) for traj in algo.expert_trajectories for t in traj}
     batch = algo.dataset_demo_prefs_train.get_all()
     for pair, pref in zip(batch.fragment_pairs, batch.preferences):
@@ -188,3 +244,105 @@ def test_hybrid_pref_only_arm_trains(rng):
         total_timesteps=64, timesteps_per_iteration=32, log_interval=100, scatter_interval=0
     )
     assert len(algo.dataset_train) > 0
+
+
+# ---------------------------------------------------------------------------
+# alpha dentro un'iterazione vera
+# ---------------------------------------------------------------------------
+
+def _train_once(algo, n_queries=8):
+    algo.trajectories = algo.sample_rollout(64)
+    algo._collect_feedback(n_queries)
+    algo._train_reward_model()
+
+
+def test_l_iterazione_pubblica_le_quantita_che_formano_alpha(rng):
+    """Contratto di logging: senza queste chiavi il sanity check e' invisibile."""
+    algo = _hybrid(rng, gcl_fusion="alpha_norm_single_adam", total_queries=12,
+                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    _train_once(algo, n_queries=12)
+    scritte = {k for k, _ in algo.logger.name_to_value.items()}
+    attese = {
+        "alpha/V_pref", "alpha/S_pref", "alpha/cv2_pref",
+        "alpha/gradmean_norm_sq_pref", "alpha/n_pref", "alpha/batch_pref",
+        "alpha/V_demo", "alpha/S_demo", "alpha/cv2_demo",
+        "alpha/gradmean_norm_sq_demo", "alpha/n_demo", "alpha/batch_demo",
+        "reward/hybrid_alpha", "reward/hybrid_alpha_active",
+    }
+    assert attese <= scritte, sorted(attese - scritte)
+
+
+def test_le_identita_fra_le_quantita_loggate_tengono(rng):
+    """S = V/B e CV^2 = S/||gbar||^2, come misurate e pubblicate."""
+    algo = _hybrid(rng, gcl_fusion="alpha_norm_single_adam", total_queries=12,
+                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    _train_once(algo, n_queries=12)
+    v = algo.logger.name_to_value
+    for canale in ("pref", "demo"):
+        assert v[f"alpha/S_{canale}"] == pytest.approx(
+            v[f"alpha/V_{canale}"] / v[f"alpha/batch_{canale}"], rel=1e-6)
+        assert v[f"alpha/cv2_{canale}"] == pytest.approx(
+            v[f"alpha/S_{canale}"] / v[f"alpha/gradmean_norm_sq_{canale}"], rel=1e-6)
+
+
+def test_sotto_la_soglia_alpha_e_uno_e_non_risulta_attivo(rng):
+    """Con pochi confronti il peso e' fissato, e il log lo dichiara."""
+    algo = _hybrid(rng, gcl_fusion="alpha_norm_single_adam", total_queries=2,
+                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    _train_once(algo, n_queries=2)
+    assert algo._alpha_is_active() is False
+    assert algo.logger.name_to_value["reward/hybrid_alpha"] == pytest.approx(1.0)
+    assert algo.logger.name_to_value["reward/hybrid_alpha_active"] == pytest.approx(0.0)
+
+
+def test_alpha_weight_e_sola_lettura(rng):
+    """_alpha_weight legge la stima corrente; produrla spetta a _estimate_alpha."""
+    algo = _hybrid(rng, gcl_fusion="alpha_norm_single_adam",
+                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    member = algo.reward_model.members[0]
+    assert algo._alpha_weight(member) == 1.0        # nessuna stima ancora
+    _train_once(algo, n_queries=12)
+    assert 0.0 <= algo._alpha_weight(member) <= 1.0
+
+
+def test_la_stima_non_consuma_l_rng_del_training(rng):
+    """Estrarre il rollout per la stima non deve spostare le estrazioni di training."""
+    algo = _hybrid(rng, gcl_fusion="alpha_norm_single_adam", total_queries=12,
+                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    algo.trajectories = algo.sample_rollout(64)
+    algo._collect_feedback(12)
+    prima = algo.rng.bit_generator.state
+    algo._estimate_alpha()
+    assert algo.rng.bit_generator.state == prima
+
+
+def test_la_fusione_storica_non_stima_alpha(rng):
+    """norm_balance non usa alpha: non deve nemmeno pagarne il costo."""
+    algo = _hybrid(rng, gcl_fusion="norm_balance", total_queries=12,
+                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    _train_once(algo, n_queries=12)
+    assert algo._alpha_current == {}
+    assert "alpha/S_demo" not in algo.logger.name_to_value
+
+
+def test_demo_1_non_e_supportato_dalla_stima(rng):
+    """La decomposizione implementata e' quella di demo_2: meglio fallire chiaro."""
+    algo = _hybrid(rng, gcl_fusion="alpha_norm_single_adam", loss_type="demo_1",
+                   total_queries=12, reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    algo.trajectories = algo.sample_rollout(64)
+    algo._collect_feedback(12)
+    with pytest.raises(NotImplementedError):
+        algo._estimate_alpha()
+
+
+def test_label_smoothing_solo_per_le_etichette_bernoulliane(rng):
+    algo_b = _hybrid(rng, labels_type="binary_bernoulli", label_smoothing=0.1)
+    algo_s = _hybrid(rng, labels_type="soft", label_smoothing=0.1)
+    hard = th.tensor([[1.0, 0.0], [0.0, 1.0]])
+    assert th.allclose(algo_b._smoothed_labels(hard), th.tensor([[0.95, 0.05], [0.05, 0.95]]))
+    assert th.allclose(algo_s._smoothed_labels(hard), hard)
+
+
+def test_gcl_fusion_sconosciuta_viene_rifiutata(rng):
+    with pytest.raises(ValueError, match="gcl_fusion"):
+        _hybrid(rng, gcl_fusion="non_esiste")

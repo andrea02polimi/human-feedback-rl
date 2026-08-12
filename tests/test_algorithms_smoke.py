@@ -48,7 +48,7 @@ def test_hybrid_algorithm_trains(rng):
         total_timesteps=64, timesteps_per_iteration=32, log_interval=100, scatter_interval=0
     )
     assert agent is algo.agent
-    assert len(algo.dataset_train) > 0 and len(algo.dataset_val) > 0
+    assert len(algo.dataset_train) > 0
     assert algo.reward_model.normalization_std > 0
 
 

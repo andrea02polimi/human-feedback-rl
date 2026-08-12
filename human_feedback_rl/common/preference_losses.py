@@ -20,6 +20,17 @@ def bradley_terry_probs(r1: th.Tensor, r2: th.Tensor) -> th.Tensor:
     return th.stack([prob1, 1 - prob1], dim=1)
 
 
+def preference_nll_per_sample(probs: th.Tensor, labels: th.Tensor) -> th.Tensor:
+    """Per-comparison negative log-likelihood, shape (N,).
+
+    Split out of :func:`preference_nll` so the per-sample gradients used by the
+    reliability estimate come from the SAME expression as the training loss.
+    Deriving the coefficient by hand would drift the moment the loss changes,
+    and would ignore the ``clamp`` below.
+    """
+    return -(labels * probs.clamp(min=_LOG_EPS).log()).sum(dim=1)
+
+
 def preference_nll(probs: th.Tensor, labels: th.Tensor) -> th.Tensor:
     """Soft cross-entropy between predicted probabilities and preference labels.
 
@@ -29,7 +40,7 @@ def preference_nll(probs: th.Tensor, labels: th.Tensor) -> th.Tensor:
     Returns:
         Scalar mean negative log-likelihood.
     """
-    return -(labels * probs.clamp(min=_LOG_EPS).log()).sum(dim=1).mean()
+    return preference_nll_per_sample(probs, labels).mean()
 
 
 def preference_accuracy(probs: th.Tensor, labels: th.Tensor) -> th.Tensor:

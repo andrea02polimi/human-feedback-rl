@@ -289,10 +289,10 @@ class RewardDiagnosticsMixin:
         # scale, fitted on RUNNING steps only (terminal rewards stay the signal we
         # want to reconstruct). One shift/scale shared by every trajectory, so the
         # cross-trajectory ranking is untouched and only the x-axis units change.
-        # Temperature is applied exactly once per prediction: here on the steps
-        # the affine is fitted on, and below on the raw per-trajectory sums the
-        # affine is applied to — both sites see the same scaled quantity.
-        pred_steps = np.concatenate(pred_step_lists) * float(self.temperature)
+        # Nessuna temperatura: non e' un attributo dell'algoritmo (vive nel
+        # gatherer) e l'affine la cancellerebbe comunque, essendo fittata
+        # sulle stesse predizioni a cui verrebbe applicata.
+        pred_steps = np.concatenate(pred_step_lists)
         true_steps = np.concatenate(true_step_lists)
         running = np.concatenate(running_lists)
         ref = running if running.any() else np.ones(len(pred_steps), dtype=bool)
@@ -303,7 +303,7 @@ class RewardDiagnosticsMixin:
         shift = true_mean - scale * pred_mean
 
         pred_returns = np.asarray([
-            scale * (float(self.temperature) * p.sum()) + shift * n
+            scale * p.sum() + shift * n
             for p, n in zip(pred_step_lists, traj_lengths)
         ])
 

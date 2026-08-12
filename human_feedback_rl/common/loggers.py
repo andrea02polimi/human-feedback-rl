@@ -17,6 +17,7 @@ def make_human_output_format(stream=sys.stdout) -> HumanOutputFormat:
 
 
 ITERATION_METRIC_PREFIXES = (
+    "alpha/",
     "imitation/",
     "reward/",
     "reward_val/",
