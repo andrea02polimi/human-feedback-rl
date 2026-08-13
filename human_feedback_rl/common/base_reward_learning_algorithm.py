@@ -128,8 +128,20 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
     def build_query_schedule(self, n_iterations: int, total_queries: int) -> List[int]:
         """Return one query count per iteration following the configured schedule.
 
-        The list has exactly ``n_iterations`` entries summing to ``total_queries``
-        (largest-remainder rounding); ``initial_queries`` are added to iteration 0.
+        The list has exactly ``n_iterations`` entries summing to ``total_queries``;
+        ``initial_queries`` are added to iteration 0.
+
+        Rounding is applied to the CUMULATIVE exact allocation, not to each
+        iteration on its own. The difference matters whenever the budget is
+        smaller than the number of iterations. With per-iteration
+        largest-remainder rounding, a constant schedule with 9 queries over 100
+        iterations gives every iteration an exact share of 0.09, so every share
+        floors to zero and all 9 leftovers are tied; the tie-break then handed
+        them to the LAST nine iterations, and the run collected no feedback at
+        all until iteration 91. Rounding the running total instead spreads them
+        evenly -- one roughly every eleven iterations -- which is what a
+        "constant" schedule is supposed to mean. Non-constant schedules keep
+        their shape: the cumulative curve still follows ``query_schedule``.
         """
         if n_iterations <= 0:
             return []
@@ -139,13 +151,10 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         weights = np.array([self.query_schedule(t) for t in t_vec])
         exact = weights / weights.sum() * remaining
 
-        # Largest-remainder rounding: floor everything, then hand the leftover
-        # queries to the iterations with the largest fractional parts.
-        shares = np.floor(exact).astype(int)
-        leftover = remaining - int(shares.sum())
-        if leftover > 0:
-            top_up = np.argsort(exact - shares)[::-1][:leftover]
-            shares[top_up] += 1
+        # floor(x + 0.5) rather than np.round: np.round is banker's rounding and
+        # would send an exact .5 crossing to the even side, which drifts.
+        cumulative = np.floor(np.cumsum(exact) + 0.5).astype(int)
+        shares = np.diff(np.concatenate([[0], cumulative]))
 
         shares[0] += self.initial_queries
         return shares.tolist()
