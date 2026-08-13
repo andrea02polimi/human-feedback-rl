@@ -140,12 +140,36 @@ class EnvBufferingWrapper(VecEnvWrapper):
         return trajectories
 
     def reset(self, **kwargs):
-        if (
-            self._initialized
-            and self.error_on_premature_reset
-            and len(self._finished_trajectories) > 0
-        ):
-            raise RuntimeError("reset() called before the buffered trajectories were read.")
+        """Riparte da capo, verificando che non ci sia nulla da perdere.
+
+        Due cose andrebbero perse in silenzio, e la guardia copre entrambe:
+
+        * traiettorie CONCLUSE non ancora lette da ``pop_finished_trajectories``;
+        * un episodio IN CORSO, la cui parte gia' raccolta vive in
+          ``_partial_trajectories``.
+
+        Il secondo caso e' quello dell'ambiente condiviso: SAC lascia quasi
+        sempre un episodio a meta', e chi legge il buffer ha appena svuotato le
+        concluse, quindi una guardia sulle sole concluse non scatterebbe mai
+        proprio quando servirebbe. Il percorso normale non resetta piu' a
+        episodio aperto (``rollout_agent`` prosegue da ``start_obs``); questa
+        e' la rete che impedisce a un percorso futuro di reintrodurre la
+        perdita senza accorgersene.
+        """
+        if self._initialized and self.error_on_premature_reset:
+            if len(self._finished_trajectories) > 0:
+                raise RuntimeError(
+                    "reset() called before the buffered trajectories were read."
+                )
+            aperti = [i for i, t in enumerate(self._partial_trajectories) if len(t) > 0]
+            if aperti:
+                lunghezze = [len(self._partial_trajectories[i]) for i in aperti]
+                raise RuntimeError(
+                    "reset() called while episodes are still in progress in envs "
+                    f"{aperti} ({lunghezze} transitions would be discarded). "
+                    "Continue the rollout from the current observation instead "
+                    "(rollout_agent(..., start_obs=...))."
+                )
 
         self._initialized = True
         self._saved_actions = None
