@@ -13,6 +13,9 @@ class _ScheduleOnly:
 
     def __init__(self, schedule_name, initial_queries=0):
         self.query_schedule = QUERY_SCHEDULES[schedule_name]
+        # il nome, non solo la funzione: build_query_schedule tratta "constant"
+        # a parte, perche' li' i resti frazionari sono tutti pari
+        self.query_schedule_name = schedule_name
         self.initial_queries = initial_queries
 
 
@@ -41,56 +44,63 @@ def test_decaying_schedules_front_load_queries():
 
 
 # --- distribuzione quando il budget e' piu' piccolo del numero di iterazioni ---
-# E' il regime dei budget bassi della tesi: 9 query su 100 iterazioni. Qui
-# l'arrotondamento per-iterazione falliva in silenzio: ogni quota esatta valeva
-# 0.09, tutte floor a zero e tutti i resti pari, e il tie-break consegnava le 9
-# query alle ULTIME nove iterazioni. La run restava senza feedback fino alla 91.
+# Regime dei budget bassi della tesi: 9 query su 100 iterazioni. Ogni quota
+# esatta vale 0.09, tutte floor a zero e tutti i resti pari; ordinare i resti
+# significa ordinare pareggi, e un argsort stabile consegna l'intero budget alle
+# ULTIME iterazioni. Le posizioni attese sono quelle delle run di riferimento:
+# 11, 22, ..., 99.
 
 
-def _collected(schedule, initial):
-    """Preferenze disponibili dopo ogni iterazione, come le vede il loop."""
-    schedule = list(schedule)
-    schedule[0] = max(schedule[0] - initial, 0)   # il loop sottrae il bootstrap
-    total, out = initial, []
-    for v in schedule:
-        total += v
-        out.append(total)
-    return schedule, out
+def _positions(total, initial, n_iterations=100, name="constant"):
+    algo = _ScheduleOnly(name, initial_queries=initial)
+    schedule = algo.build_query_schedule(n_iterations, total)
+    schedule[0] = max(schedule[0] - initial, 0)      # il loop sottrae il bootstrap
+    return schedule, [i for i, v in enumerate(schedule) if v]
 
 
-def test_budget_piccolo_si_distribuisce_su_tutta_la_corsa():
-    schedule = _ScheduleOnly("constant", initial_queries=1).build_query_schedule(100, 10)
-    schedule, _ = _collected(schedule, 1)
-    posizioni = [i for i, v in enumerate(schedule) if v]
-    assert len(posizioni) == 9
-    assert posizioni[0] < 10, f"prima query troppo tardi: {posizioni}"
-    assert posizioni[-1] > 80, f"ultima query troppo presto: {posizioni}"
-    salti = [b - a for a, b in zip(posizioni, posizioni[1:])]
-    assert max(salti) <= 22, f"buco troppo lungo fra le query: {salti}"
+def test_budget_piccolo_cade_su_indici_equispaziati():
+    schedule, posizioni = _positions(10, 1)
+    assert posizioni == [11, 22, 33, 44, 55, 66, 77, 88, 99]
+    assert sum(schedule) + 1 == 10
 
 
-def test_la_quinta_preferenza_arriva_entro_meta_corsa():
-    """Sotto 5 confronti alpha resta fissato a 1: deve sbloccarsi presto."""
-    schedule = _ScheduleOnly("constant", initial_queries=1).build_query_schedule(100, 10)
-    _, cumulate = _collected(schedule, 1)
-    prima = next(i for i, tot in enumerate(cumulate) if tot >= 5)
-    assert prima < 50, f"la 5a preferenza arriva all'iterazione {prima}"
+def test_la_quinta_preferenza_arriva_a_meta_corsa():
+    """Soglia di alpha: sotto 5 confronti resta fissato a 1, deve sbloccarsi presto."""
+    schedule, _ = _positions(10, 1)
+    totale = 1
+    for i, v in enumerate(schedule):
+        totale += v
+        if totale >= 5:
+            assert i == 44
+            break
+    else:
+        raise AssertionError("mai raggiunte 5 preferenze")
 
 
 @pytest.mark.parametrize("total,initial", [(10, 1), (100, 10), (1000, 100), (37, 3), (7, 0)])
 def test_la_somma_resta_esatta_coi_budget_della_tesi(total, initial):
-    schedule = _ScheduleOnly("constant", initial_queries=initial).build_query_schedule(100, total)
+    algo = _ScheduleOnly("constant", initial_queries=initial)
+    schedule = algo.build_query_schedule(100, total)
     assert sum(schedule) == total
     assert min(schedule) >= 0
 
 
+def test_l_ultima_query_non_supera_l_ultima_iterazione():
+    """La formula intera deve atterrare esattamente su n-1, non oltre."""
+    for total in (2, 9, 31, 77):
+        _, posizioni = _positions(total, 0)
+        assert max(posizioni) <= 99
+
+
 def test_lo_schedule_decrescente_resta_decrescente():
-    """La correzione non deve appiattire gli schedule non costanti."""
-    schedule = _ScheduleOnly("hyperbolic").build_query_schedule(100, 500)
+    """Il caso speciale vale solo per constant: gli altri tengono i resti."""
+    algo = _ScheduleOnly("hyperbolic")
+    schedule = algo.build_query_schedule(100, 500)
     assert sum(schedule[:25]) > sum(schedule[75:])
+    assert sum(schedule) == 500
 
 
 def test_budget_nullo_da_uno_schedule_vuoto_di_query():
     """Il braccio solo-dimostrazioni: nessuna query, nessuna eccezione."""
-    schedule = _ScheduleOnly("constant", initial_queries=0).build_query_schedule(100, 0)
-    assert schedule == [0] * 100
+    algo = _ScheduleOnly("constant", initial_queries=0)
+    assert algo.build_query_schedule(100, 0) == [0] * 100
