@@ -63,9 +63,19 @@ class RandomFragmenter:
                 fragments.append(Fragment(traj[:]))
             return fragments
 
-        num_unique = sum(
-            max(len(traj) - fragment_length + 1, 1) for traj in trajectories
+        # Un frammento contiguo di lunghezza L dentro una traiettoria lunga T
+        # puo' iniziare in max(T - L + 1, 1) posizioni. Lo stesso conteggio
+        # serve due volte -- per l'avviso e per i pesi di campionamento -- e va
+        # calcolato UNA sola volta. Quando erano due espressioni diverse i pesi
+        # usavano len(traj) // L + 1, che con L=1 vale T+1 invece di T: le
+        # traiettorie corte (cioe' gli episodi finiti in collisione) venivano
+        # sovracampionate, e la distorsione cresceva con L -- a L=10 arrivava
+        # al 26% fra la traiettoria piu' corta e la piu' lunga.
+        per_traiettoria = np.array(
+            [max(len(traj) - fragment_length + 1, 1) for traj in trajectories],
+            dtype=float,
         )
+        num_unique = int(per_traiettoria.sum())
         if num_fragments > num_unique:
             self.logger.warn(
                 f"Requested {num_fragments} fragments but only "
@@ -73,11 +83,14 @@ class RandomFragmenter:
                 "Some fragments will be sampled more than once.",
             )
 
-        weights = [len(traj) // fragment_length + 1 for traj in trajectories]
+        # Pesare per il numero di frammenti distinti, e poi estrarre lo start
+        # uniformemente dentro la traiettoria, rende equiprobabile ogni
+        # frammento del pool.
+        weights = per_traiettoria / per_traiettoria.sum()
 
         fragments = []
         for _ in range(num_fragments):
-            traj = trajectories[self.rng.choice(len(trajectories), p=np.array(weights) / sum(weights))]
+            traj = trajectories[self.rng.choice(len(trajectories), p=weights)]
 
             n = len(traj)
             if n >= fragment_length:
