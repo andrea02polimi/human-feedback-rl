@@ -428,3 +428,36 @@ def test_gli_stream_restano_riproducibili_dal_seed():
     assert a._rng_query.integers(0, 2**62) == b._rng_query.integers(0, 2**62)
     assert a._rng_oracle.integers(0, 2**62) == b._rng_oracle.integers(0, 2**62)
 
+# --- contatore delle duplicazioni fra confronti -----------------------------
+
+
+def test_il_contatore_delle_duplicazioni_parte_a_zero_e_viene_loggato(rng):
+    algo = _hybrid(rng, total_queries=8, initial_queries=2,
+                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    _train_once(algo, n_queries=4)
+    for chiave in ("dataset/dup_pairs", "dataset/dup_self_pairs",
+                   "dataset/dup_fragments"):
+        assert chiave in algo.logger.name_to_value, chiave
+
+
+def test_una_coppia_ripetuta_viene_contata(rng):
+    """Se lo stesso confronto rientra, il contatore lo vede."""
+    algo = _hybrid(rng, total_queries=8, initial_queries=2,
+                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    _train_once(algo, n_queries=4)
+    pairs = algo.dataset_train.get_all().fragment_pairs
+    prima = algo._dup_pairs
+    algo._count_duplicate_comparisons([pairs[0]])       # la stessa coppia, di nuovo
+    assert algo._dup_pairs == prima + 1
+
+
+def test_un_frammento_confrontato_con_se_stesso_viene_contato(rng):
+    from human_feedback_rl.common.types import FragmentPair
+    algo = _hybrid(rng, total_queries=8, initial_queries=2,
+                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    _train_once(algo, n_queries=4)
+    frag = algo.dataset_train.get_all().fragment_pairs[0].frag1
+    prima = algo._dup_self_pairs
+    algo._count_duplicate_comparisons([FragmentPair(frag1=frag, frag2=frag)])
+    assert algo._dup_self_pairs == prima + 1
+

@@ -241,6 +241,14 @@ class HybridAlgorithm(
         # deve consumare lo stato di quello usato dal training.
         self._grad_probe_rng = np.random.default_rng(12345)
         self._rng_query, self._rng_oracle, self._rng_train = self._split_rng()
+        # Contatori diagnostici delle duplicazioni fra confronti (vedi
+        # _count_duplicate_comparisons): la soglia conta elementi, non
+        # confronti distinti, e questo dice di quanto le due cose divergono.
+        self._seen_pairs = set()
+        self._seen_fragments = set()
+        self._dup_pairs = 0
+        self._dup_self_pairs = 0
+        self._dup_fragments = 0
         self.demo_pref_pairs_per_iteration = int(demo_pref_pairs_per_iteration)
         self.demo_pref_batch_fraction = float(demo_pref_batch_fraction)
 
@@ -393,6 +401,52 @@ class HybridAlgorithm(
         preferences = self.preference_gatherer(fragments)
         self.dataset_train.push(fragments, preferences)
         self.logger.record("dataset/n_train", len(self.dataset_train), exclude="stdout")
+        self._count_duplicate_comparisons(fragments)
+
+    def _count_duplicate_comparisons(self, pairs) -> None:
+        """Misura quanto la soglia sui confronti sovrastima quelli distinti.
+
+        Il fragmenter estrae con rimpiazzo e non deduplica, quindi ``n_pref``
+        conta elementi memorizzati, non confronti distinti. In teoria una
+        coppia puo' ripetersi, un frammento puo' finire in due confronti, o una
+        coppia puo' confrontare un frammento con se stesso.
+
+        In pratica dovrebbe non accadere quasi mai: query fatte in iterazioni
+        diverse pescano da pool DISGIUNTI, perche' ``pop_finished_trajectories``
+        svuota il buffer, quindi solo le query della stessa iterazione possono
+        collidere. Il conto atteso e' sotto 0.01 per run a B=10 e B=100, e
+        circa 1.8 a B=1000. Questo contatore serve a sostituire quella stima
+        con una misura, senza toccare il campionamento.
+
+        La firma e' sul CONTENUTO e non su ``id()``: gli oggetti Transition
+        restano vivi finche' il dataset li referenzia, ma un'identita' riusata
+        darebbe un falso positivo silenzioso.
+        """
+        def firma(frag):
+            return tuple(
+                (t.observation.tobytes(), np.asarray(t.action).tobytes(),
+                 float(t.true_reward))
+                for t in frag
+            )
+
+        for pair in pairs:
+            f1, f2 = firma(pair.frag1), firma(pair.frag2)
+            if f1 == f2:
+                self._dup_self_pairs += 1
+            coppia = (f1, f2) if f1 <= f2 else (f2, f1)
+            if coppia in self._seen_pairs:
+                self._dup_pairs += 1
+            else:
+                self._seen_pairs.add(coppia)
+            for f in (f1, f2):
+                if f in self._seen_fragments:
+                    self._dup_fragments += 1
+                else:
+                    self._seen_fragments.add(f)
+
+        self.logger.record("dataset/dup_pairs", self._dup_pairs, exclude="stdout")
+        self.logger.record("dataset/dup_self_pairs", self._dup_self_pairs, exclude="stdout")
+        self.logger.record("dataset/dup_fragments", self._dup_fragments, exclude="stdout")
 
     def _collect_demo_preference_pairs(self, num_pairs: int) -> None:
         """Expert fragment > agent fragment pairs (Ibarz et al. 2018).
