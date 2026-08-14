@@ -346,3 +346,41 @@ def test_label_smoothing_solo_per_le_etichette_bernoulliane(rng):
 def test_gcl_fusion_sconosciuta_viene_rifiutata(rng):
     with pytest.raises(ValueError, match="gcl_fusion"):
         _hybrid(rng, gcl_fusion="non_esiste")
+
+# --- il bootstrap serve all'ensemble, non al membro singolo -----------------
+# Un ricampionamento con rimpiazzo di n elementi su n ne contiene in media solo
+# il 63.2% distinti. Con piu' membri e' il prezzo della decorrelazione; con un
+# membro solo e' un terzo dei confronti buttato via a ogni iterazione, mentre
+# il canale dimostrazioni continua a vedere tutto il suo budget.
+
+
+def test_con_un_solo_membro_si_usa_tutto_il_dataset(rng):
+    algo = _hybrid(rng, total_queries=12,
+                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    _train_once(algo, n_queries=12)
+    vista = algo._training_view(algo.dataset_train)
+    assert vista is algo.dataset_train, "con un membro non si ricampiona"
+
+
+def test_con_piu_membri_ogni_membro_vede_un_ricampionamento(rng):
+    algo = _hybrid(rng, total_queries=12,
+                   reward_model_kwargs=dict(n_ensembles=2, net_arch=[8]))
+    _train_once(algo, n_queries=12)
+    a = algo._training_view(algo.dataset_train)
+    b = algo._training_view(algo.dataset_train)
+    assert a is not algo.dataset_train and len(a) == len(algo.dataset_train)
+    # due estrazioni indipendenti: e' cio' che decorrela i membri
+    assert [id(x) for x in a.get_all().fragment_pairs] != \
+           [id(x) for x in b.get_all().fragment_pairs]
+
+
+def test_il_membro_singolo_non_perde_confronti(rng):
+    """La proprieta' che conta: nessun confronto raccolto resta inutilizzato."""
+    algo = _hybrid(rng, total_queries=12,
+                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    _train_once(algo, n_queries=12)
+    vista = algo._training_view(algo.dataset_train)
+    distinti = {id(x) for x in vista.get_all().fragment_pairs}
+    tutti = {id(x) for x in algo.dataset_train.get_all().fragment_pairs}
+    assert distinti == tutti
+

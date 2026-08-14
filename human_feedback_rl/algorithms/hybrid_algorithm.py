@@ -399,6 +399,27 @@ class HybridAlgorithm(
         else:
             self._train_reward_model_gcl()
 
+    def _training_view(self, dataset):
+        """Il dataset da cui pescare i minibatch di questa iterazione.
+
+        Il bootstrap esiste per decorrelare i membri dell'ensemble: ognuno vede
+        un ricampionamento diverso. Con UN SOLO membro non c'e' nulla da
+        decorrelare, e un ricampionamento con rimpiazzo di n elementi su n ne
+        contiene in media solo il 63.2% distinti. Si butterebbe oltre un terzo
+        dei confronti raccolti a ogni iterazione senza alcun beneficio: a B=10
+        significa allenarsi su ~6 confronti invece di 10, mentre il canale
+        dimostrazioni vede sempre tutto il suo budget (``_sample_trajectories``
+        estrae SENZA rimpiazzo).
+
+        Toglierlo rende anche coerente la stima di alpha, che misura la
+        dispersione sul dataset INTERO mentre il gradiente veniva calcolato sul
+        bootstrap: alpha sottostimava il rumore del canale preferenze, quindi
+        dava alle preferenze piu' peso di quanto ne meritassero.
+        """
+        if len(self.reward_model.members) > 1:
+            return dataset.bootstrap()
+        return dataset
+
     def _train_reward_model_gcl(self) -> None:
         """BT + GCL on the shared net with norm-balanced gradient fusion.
 
@@ -418,7 +439,7 @@ class HybridAlgorithm(
 
         def member_step(member, optimizer):
             member.train()
-            boot_dataset = self.dataset_train.bootstrap() if has_prefs else None
+            boot_dataset = self._training_view(self.dataset_train) if has_prefs else None
             # Un alpha per membro per tutta l'iterazione, stimato sopra su
             # questi stessi parametri.
             alpha = self._alpha_weight(member)
@@ -461,8 +482,8 @@ class HybridAlgorithm(
 
         def member_step(member, optimizer):
             member.train()
-            boot_oracle = self.dataset_train.bootstrap() if n_oracle else None
-            boot_demo = self.dataset_demo_prefs_train.bootstrap() if n_demo else None
+            boot_oracle = self._training_view(self.dataset_train) if n_oracle else None
+            boot_demo = self._training_view(self.dataset_demo_prefs_train) if n_demo else None
             losses = []
             for _ in range(self.gradient_steps_rew):
                 parts = []
