@@ -145,7 +145,7 @@ def test_alpha_resta_fissato_a_uno_sotto_la_soglia_di_confronti(
     est = estimate_alpha(
         member, params, batch, preference_labels_tensor(batch.preferences),
         make_trajectories(rng, [5, 5]), make_trajectories(rng, [5, 5]),
-        batch_size_pref=8, batch_size_expert=8, min_unique_prefs=5, eps=1e-8,
+        batch_size_pref=8, batch_size_expert=8, min_prefs=5, eps=1e-8,
     )
     assert est.alpha == 1.0 and est.pinned is True
     assert est.pref is None and est.demo is None
@@ -158,7 +158,7 @@ def test_alpha_e_il_rapporto_fra_i_due_cv2(rng, tiny_reward_ensemble):
     est = estimate_alpha(
         member, params, batch, preference_labels_tensor(batch.preferences),
         make_trajectories(rng, [5, 5, 5]), make_trajectories(rng, [5, 5]),
-        batch_size_pref=4, batch_size_expert=2, min_unique_prefs=5, eps=1e-8,
+        batch_size_pref=4, batch_size_expert=2, min_prefs=5, eps=1e-8,
     )
     assert est.pinned is False
     assert 0.0 <= est.alpha <= 1.0
@@ -174,7 +174,7 @@ def test_il_minibatch_e_il_minimo_fra_batch_size_e_campioni(rng, tiny_reward_ens
     est = estimate_alpha(
         member, params, batch, preference_labels_tensor(batch.preferences),
         make_trajectories(rng, [5, 5, 5]), make_trajectories(rng, [5, 5]),
-        batch_size_pref=999, batch_size_expert=999, min_unique_prefs=5, eps=1e-8,
+        batch_size_pref=999, batch_size_expert=999, min_prefs=5, eps=1e-8,
     )
     assert est.pref.batch == 6 and est.pref.n == 6
     assert est.demo.batch == 3 and est.demo.n == 3

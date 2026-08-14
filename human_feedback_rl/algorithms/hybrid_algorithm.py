@@ -68,7 +68,7 @@ VALID_GCL_FUSIONS = ("norm_balance", "alpha_norm_single_adam")
 
 # Sotto questo numero di confronti distinti la dispersione delle preferenze non
 # e' stimabile: alpha resta fissato a 1 (tutto il peso alle dimostrazioni).
-ALPHA_MIN_UNIQUE_PREFS = 5
+ALPHA_MIN_PREFS = 5
 
 
 class HybridAlgorithm(
@@ -240,11 +240,13 @@ class HybridAlgorithm(
         # RNG separato per le diagnostiche: estrarre il rollout per la stima non
         # deve consumare lo stato di quello usato dal training.
         self._grad_probe_rng = np.random.default_rng(12345)
+        self._rng_query, self._rng_oracle, self._rng_train = self._split_rng()
         self.demo_pref_pairs_per_iteration = int(demo_pref_pairs_per_iteration)
         self.demo_pref_batch_fraction = float(demo_pref_batch_fraction)
 
         self.fragmenter = make_pair_fragmenter(
-            fragmenter_type, rng=self.rng, logger=self.logger, reward_ensemble=self.reward_model
+            fragmenter_type, rng=self._rng_query, logger=self.logger,
+            reward_ensemble=self.reward_model
         )
         # Oracle label softness is a property of the (synthetic) annotator,
         # NOT of the demo IRL loss: it gets its own temperature.
@@ -252,11 +254,38 @@ class HybridAlgorithm(
             logger=self.logger,
             labels_type=labels_type,
             temperature=pref_temperature,
-            rng=self.rng,
+            rng=self._rng_oracle,
         )
-        self.dataset_train = PreferenceDataset(queue_size=comparison_queue_size, rng=self.rng)
+        self.dataset_train = PreferenceDataset(
+            queue_size=comparison_queue_size, rng=self._rng_train)
         # Expert-vs-agent pairs (demo_mode="preferences" only).
-        self.dataset_demo_prefs_train = PreferenceDataset(queue_size=comparison_queue_size, rng=self.rng)
+        self.dataset_demo_prefs_train = PreferenceDataset(
+            queue_size=comparison_queue_size, rng=self._rng_train)
+
+    def _split_rng(self):
+        """Tre stream indipendenti, derivati dal seed master.
+
+        Con un solo RNG condiviso, ogni estrazione fatta dall'ottimizzazione
+        sposta lo stato di quello che sceglie i frammenti e che estrae le
+        etichette Bernoulli. Due run che differiscono SOLO per
+        ``gradient_steps_rew`` finivano cosi' per ricevere feedback diverso:
+        misurato su una run breve, 10 confronti su 12 cambiavano (i due
+        coincidenti erano quelli del bootstrap, estratti prima del primo passo
+        di gradiente). Un confronto fra iperparametri mescolava quindi la loro
+        qualita' con quale realizzazione di confronti era capitata -- e
+        ``gradient_steps_rew`` e' proprio uno dei parametri tarati.
+
+        Gli stream restano deterministici e riproducibili perche' nascono dal
+        ``SeedSequence`` del seed master: stesso ``run.seed``, stessi flussi.
+
+        * ``query``  -- scelta dei frammenti da confrontare
+        * ``oracle`` -- etichette dell'oracolo, estrazioni Bernoulli comprese
+        * ``train``  -- minibatch di preferenze e dimostrazioni, bootstrap
+        """
+        seed_seq = getattr(self.rng.bit_generator, "seed_seq", None)
+        if seed_seq is None:      # Generator costruito senza SeedSequence
+            seed_seq = np.random.SeedSequence(int(self.rng.integers(0, 2**63)))
+        return tuple(np.random.default_rng(s) for s in seed_seq.spawn(3))
 
     # ------------------------------------------------------------------
     # Training loop
@@ -692,7 +721,7 @@ class HybridAlgorithm(
                 model_trajs,
                 batch_size_pref=self.batch_size_pref,
                 batch_size_expert=self.batch_size_expert,
-                min_unique_prefs=ALPHA_MIN_UNIQUE_PREFS,
+                min_prefs=ALPHA_MIN_PREFS,
                 eps=self.alpha_eps,
             )
         self.logger.record("time/estimate_alpha", time.perf_counter() - t0)

@@ -384,3 +384,47 @@ def test_il_membro_singolo_non_perde_confronti(rng):
     tutti = {id(x) for x in algo.dataset_train.get_all().fragment_pairs}
     assert distinti == tutti
 
+# --- stream di RNG indipendenti --------------------------------------------
+# Con un unico RNG, ogni estrazione dell'ottimizzazione spostava lo stato di
+# quello che sceglie i frammenti e che estrae le etichette. Due run diverse
+# solo per gradient_steps_rew ricevevano cosi' feedback diverso, e il confronto
+# fra iperparametri misurava anche quale realizzazione era capitata.
+
+
+def _feedback_raccolto(gradient_steps_rew):
+    algo = _hybrid(np.random.default_rng(0), total_queries=8, initial_queries=2,
+                   gradient_steps_rew=gradient_steps_rew,
+                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    _train_once(algo, n_queries=4)
+    batch = algo.dataset_train.get_all()
+    frammenti = [round(float(fp.frag1[0].true_reward), 8) for fp in batch.fragment_pairs]
+    etichette = [(p.pref1, p.pref2) for p in batch.preferences]
+    return frammenti, etichette
+
+
+def test_gli_iperparametri_di_ottimizzazione_non_cambiano_il_feedback():
+    """La proprieta' che rende confrontabili due trial di tuning."""
+    a = _feedback_raccolto(2)
+    b = _feedback_raccolto(9)
+    assert a[0] == b[0], "i frammenti scelti dipendono da gradient_steps_rew"
+    assert a[1] == b[1], "le etichette dipendono da gradient_steps_rew"
+
+
+def test_gli_stream_sono_distinti_fra_loro():
+    algo = _hybrid(np.random.default_rng(0),
+                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    stream = [algo._rng_query, algo._rng_oracle, algo._rng_train, algo._grad_probe_rng]
+    assert len({id(r) for r in stream}) == 4
+    estratti = [r.integers(0, 2**62) for r in stream]
+    assert len(set(estratti)) == 4
+
+
+def test_gli_stream_restano_riproducibili_dal_seed():
+    """Indipendenti fra loro, ma deterministici dato run.seed."""
+    a = _hybrid(np.random.default_rng(3),
+                reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    b = _hybrid(np.random.default_rng(3),
+                reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    assert a._rng_query.integers(0, 2**62) == b._rng_query.integers(0, 2**62)
+    assert a._rng_oracle.integers(0, 2**62) == b._rng_oracle.integers(0, 2**62)
+

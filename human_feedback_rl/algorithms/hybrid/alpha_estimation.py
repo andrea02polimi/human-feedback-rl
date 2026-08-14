@@ -192,7 +192,7 @@ def estimate_alpha(
     model_trajs,
     batch_size_pref: int,
     batch_size_expert: int,
-    min_unique_prefs: int,
+    min_prefs: int,
     eps: float,
 ) -> AlphaEstimate:
     """Peso sulle dimostrazioni, stimato ai parametri correnti.
@@ -200,8 +200,13 @@ def estimate_alpha(
     Chiamata PRIMA dei passi di gradiente dell'iterazione, non dopo: il peso
     deve descrivere il punto in cui verra' applicato.
     """
+    # Confronti RACCOLTI, non necessariamente distinti: il fragmenter estrae
+    # con rimpiazzo e nulla vieta che una coppia si ripeta, o che un frammento
+    # venga confrontato con se stesso. Con L=1 e un pool di ~20.000 transizioni
+    # la probabilita' e' ~1/20.000 per coppia, quindi in pratica non accade;
+    # ma la soglia conta elementi, e il nome non deve promettere altro.
     n_pref = 0 if pref_batch is None else len(pref_batch.fragment_pairs)
-    if n_pref < min_unique_prefs:
+    if n_pref < min_prefs:
         # Sotto pochissimi confronti la dispersione delle preferenze non e'
         # stimabile e la stima sarebbe distorta verso il basso, cioe' verso il
         # canale meno affidabile. Tutto il peso alle dimostrazioni.

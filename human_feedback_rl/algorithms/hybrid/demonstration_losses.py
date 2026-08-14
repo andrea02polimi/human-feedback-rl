@@ -41,11 +41,11 @@ class RewardLossMixin:
     def _sample_trajectories(self):
         """Sample expert and model trajectory batches (no reward computation)."""
         n_e = min(self.batch_size_expert, len(self.expert_trajectories))
-        exp_idx = self.rng.choice(len(self.expert_trajectories), size=n_e, replace=False)
+        exp_idx = self._rng_train.choice(len(self.expert_trajectories), size=n_e, replace=False)
         expert_trajs = [self.expert_trajectories[i] for i in exp_idx]
 
         n_m = min(self.batch_size_model, len(self.trajectories))
-        model_idx = self.rng.choice(len(self.trajectories), size=n_m, replace=False)
+        model_idx = self._rng_train.choice(len(self.trajectories), size=n_m, replace=False)
         model_trajs = [self.trajectories[i] for i in model_idx]
         return expert_trajs, model_trajs
 

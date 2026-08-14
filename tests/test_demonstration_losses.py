@@ -38,7 +38,9 @@ class _Shim(RewardLossMixin):
         self.loss_type = loss_type
         self.batch_size_expert = len(expert_trajs)
         self.batch_size_model = len(model_trajs)
-        self.rng = np.random.default_rng(7)
+        # I minibatch di dimostrazioni pescano dallo stream di training, tenuto
+        # separato da quello che sceglie i frammenti e da quello dell'oracolo.
+        self._rng_train = np.random.default_rng(7)
         self.expert_trajectories = expert_trajs
         self.trajectories = model_trajs
 
