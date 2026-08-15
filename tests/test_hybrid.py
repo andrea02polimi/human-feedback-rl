@@ -461,3 +461,30 @@ def test_un_frammento_confrontato_con_se_stesso_viene_contato(rng):
     algo._count_duplicate_comparisons([FragmentPair(frag1=frag, frag2=frag)])
     assert algo._dup_self_pairs == prima + 1
 
+def test_il_bootstrap_si_puo_forzare_con_un_membro_solo(rng):
+    """Serve a riprodurre le run storiche: prima era incondizionato."""
+    algo = _hybrid(rng, total_queries=12, bootstrap_comparisons=True,
+                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    _train_once(algo, n_queries=12)
+    vista = algo._training_view(algo.dataset_train)
+    assert vista is not algo.dataset_train
+    assert len(vista) == len(algo.dataset_train)
+
+
+def test_il_bootstrap_si_puo_disattivare_con_piu_membri(rng):
+    algo = _hybrid(rng, total_queries=12, bootstrap_comparisons=False,
+                   reward_model_kwargs=dict(n_ensembles=2, net_arch=[8]))
+    _train_once(algo, n_queries=12)
+    assert algo._training_view(algo.dataset_train) is algo.dataset_train
+
+
+def test_senza_indicazione_decide_il_numero_di_membri(rng):
+    uno = _hybrid(rng, total_queries=12,
+                  reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
+    _train_once(uno, n_queries=12)
+    assert uno._training_view(uno.dataset_train) is uno.dataset_train
+    tre = _hybrid(rng, total_queries=12,
+                  reward_model_kwargs=dict(n_ensembles=3, net_arch=[8]))
+    _train_once(tre, n_queries=12)
+    assert tre._training_view(tre.dataset_train) is not tre.dataset_train
+

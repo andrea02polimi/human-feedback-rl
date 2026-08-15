@@ -116,6 +116,7 @@ class HybridAlgorithm(
         gcl_fusion: str = "norm_balance",
         alpha_eps: float = 1e-8,
         label_smoothing: float = 0.0,
+        bootstrap_comparisons: Optional[bool] = None,
         demo_pref_pairs_per_iteration: int = 64,
         demo_pref_batch_fraction: float = 0.5,
         initial_agent_timesteps: int = 0,
@@ -234,6 +235,11 @@ class HybridAlgorithm(
         self.gcl_fusion = gcl_fusion
         self.alpha_eps = float(alpha_eps)
         self.label_smoothing = float(label_smoothing)
+        # None = decide il numero di membri (il bootstrap serve a
+        # decorrelarli). True/False forzano, e servono a riprodurre una
+        # configurazione storica: prima il ricampionamento era
+        # incondizionato, quindi le run a un membro solo lo avevano.
+        self.bootstrap_comparisons = bootstrap_comparisons
         self.labels_type = labels_type
         # Stima di alpha dell'iterazione corrente, una per membro (id -> AlphaEstimate).
         self._alpha_current = {}
@@ -499,9 +505,11 @@ class HybridAlgorithm(
         bootstrap: alpha sottostimava il rumore del canale preferenze, quindi
         dava alle preferenze piu' peso di quanto ne meritassero.
         """
-        if len(self.reward_model.members) > 1:
-            return dataset.bootstrap()
-        return dataset
+        if self.bootstrap_comparisons is None:
+            usa = len(self.reward_model.members) > 1
+        else:
+            usa = bool(self.bootstrap_comparisons)
+        return dataset.bootstrap() if usa else dataset
 
     def _train_reward_model_gcl(self) -> None:
         """BT + GCL on the shared net with norm-balanced gradient fusion.
