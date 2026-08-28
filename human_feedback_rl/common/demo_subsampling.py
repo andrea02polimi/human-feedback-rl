@@ -1,20 +1,9 @@
 """Reproducible selection of the demonstration subsample.
 
-Every method that consumes demonstrations -- the demonstration-only baselines
-and the hybrid algorithm -- has to see the SAME demonstrations at the same
-budget. Otherwise a difference between methods could come from which
-trajectories happened to be drawn rather than from the method.
-
-Two properties give that guarantee:
-
-* the selection seed is a shared constant, **independent of the training
-  seed**: changing ``run.seed`` changes the network initialisation and the
-  rollout, not the set of demonstrations;
-* the WHOLE dataset is permuted and a prefix taken, so budgets are nested:
-  going from 10 to 100 adds 90 demonstrations without swapping the first 10.
-
-The fingerprints are there to check it afterwards: two runs at the same budget
-must write the same ``fingerprint``.
+Every method must see the same demonstrations at the same budget, or a
+difference between methods could come from which trajectories were drawn. The
+seed is a shared constant, independent of the training seed, and the whole
+dataset is permuted before a prefix is taken, so budgets are nested.
 """
 from __future__ import annotations
 

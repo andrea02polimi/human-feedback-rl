@@ -4,6 +4,7 @@ import torch as th
 from stable_baselines3 import SAC
 
 from human_feedback_rl.algorithms import HybridAlgorithm
+from human_feedback_rl.algorithms.hybrid.gradient_fusion import GradientFusionMixin
 from human_feedback_rl.algorithms.hybrid.reward_training import RewardTrainingMixin
 from human_feedback_rl.common.replay_buffers import RewardRelabelReplayBuffer
 
@@ -50,14 +51,10 @@ class _TwoParam(th.nn.Module):
         self.w = th.nn.Parameter(th.zeros(2))
 
 
-class _StepShim:
-    """Carries only what _reward_step needs."""
+class _StepShim(GradientFusionMixin):
+    """The fusion rules on hand-built gradients, without the rest of the algorithm."""
 
-    _reward_step = HybridAlgorithm._reward_step
-    _flatten = staticmethod(HybridAlgorithm._flatten)
     _grad_norm = staticmethod(RewardTrainingMixin._grad_norm)
-
-    _set_flat_grad = staticmethod(HybridAlgorithm._set_flat_grad)
     _alpha_weight = HybridAlgorithm._alpha_weight
 
     def __init__(self, demo_weight=1.0, max_balance_scale=100.0,

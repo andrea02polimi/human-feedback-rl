@@ -41,38 +41,51 @@ update:
 
 ## Package layout
 
-Algorithm-specific code lives in `algorithms/`, shared infrastructure in
-`common/`. The entry point, the Hydra configuration and the analysis live in
-the **parent repository**.
+Algorithm code lives in `algorithms/`, shared infrastructure in `common/`. The
+entry point, the Hydra configuration and the analysis live in the **parent
+repository**.
+
+`HybridAlgorithm` is assembled from mixins, one file each. The class itself
+keeps only what holds the run together: the constructor, the RNG streams and
+the training loop.
 
 ```
 human_feedback_rl/
 ├── algorithms/
-│   ├── hybrid_algorithm.py       # HybridAlgorithm — the training loop
+│   ├── hybrid_algorithm.py       # HybridAlgorithm: constructor and training loop
 │   ├── hybrid_algorithm_pseudocode.md
-│   └── hybrid/                   # its building blocks (mixins)
-│       ├── alpha_estimation.py      # the reliability weight
-│       ├── demonstration_losses.py  # demo_1 / demo_2 + sampling & dispatch
-│       ├── reward_training.py       # optimization helpers + reward normalization
-│       ├── reward_diagnostics.py    # validation/ranking/replay-staleness logging
-│       └── imitation_metrics.py     # agent-vs-expert RMSE and NLL
+│   └── hybrid/
+│       ├── feedback_collection.py   # asking the oracle, counting what comes back
+│       ├── reward_model_training.py # fitting the reward to the feedback so far
+│       ├── gradient_fusion.py       # two gradients into one optimizer step
+│       ├── reliability_weight.py    # estimating alpha once per iteration
+│       ├── alpha_estimation.py      # the maths behind alpha
+│       ├── demonstration_losses.py  # demo_1 / demo_2, and batch sampling
+│       ├── reward_training.py       # gradient norms, reward normalization
+│       ├── imitation_metrics.py     # agent-versus-expert error
+│       ├── reward_diagnostics.py    # composes the five files below
+│       ├── loss_diagnostics.py      #   the losses while they are optimised
+│       ├── reward_validation.py     #   ranking and outcome separation
+│       ├── return_scatter.py        #   predicted return against true return
+│       ├── outcome_returns.py       #   returns by how the episode ended
+│       └── replay_staleness.py      #   drift in the replay buffer
 └── common/
     ├── base_algorithm.py         # env + agent + logger + rng
-    ├── base_reward_learning_algorithm.py  # reward model, rollouts, validation,
+    ├── base_reward_learning_algorithm.py  # reward model, rollouts,
     │                             #   query schedule, checkpointing
     ├── status.py                 # single source of truth for the 7 ego statuses
     ├── types.py                  # Transition, Trajectory, FragmentPair, Preference
     ├── preference_losses.py      # Bradley-Terry probs / NLL / accuracy
     ├── reward_nets.py            # SumoRewardNet, RewardEnsemble, NormalizedRewardNet
     ├── fragmenters.py            # random / active (ensemble-disagreement) sampling
-    ├── gatherers.py              # synthetic preference oracle (binary/soft/bernoulli)
+    ├── gatherers.py              # synthetic preference oracle
     ├── datasets.py               # circular PreferenceDataset with bootstrap()
     ├── demo_subsampling.py       # same budget -> same demonstrations
-    ├── env_wrappers.py           # predicted-reward wrapper, trajectory buffering,
-    │                             #   epsilon-exploration policy wrapper
+    ├── env_wrappers.py           # predicted reward, trajectory buffering,
+    │                             #   epsilon-exploration policy
     ├── trajectory_generators.py  # rollout + SB3 training on predicted rewards
-    ├── replay_buffers.py         # reward relabelling + staleness diagnostics
-    ├── loggers.py                # SB3 logger extensions + W&B/JSONL wiring
+    ├── replay_buffers.py         # reward relabelling and staleness
+    ├── loggers.py                # SB3 logger extensions, W&B and JSONL
     ├── batching.py               # differentiable fragment reward sums
     └── custom_logging_callback.py
 ```

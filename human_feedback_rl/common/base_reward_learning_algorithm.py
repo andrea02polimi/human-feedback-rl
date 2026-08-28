@@ -13,7 +13,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import torch as th
-from scipy.stats import kendalltau
 
 from human_feedback_rl.common import status
 from human_feedback_rl.common.base_algorithm import BaseAlgorithm
@@ -126,21 +125,13 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         ]
 
     def build_query_schedule(self, n_iterations: int, total_queries: int) -> List[int]:
-        """Return one query count per iteration following the configured schedule.
+        """One query count per iteration, summing to total_queries.
 
-        The list has exactly ``n_iterations`` entries summing to ``total_queries``;
-        ``initial_queries`` are added to iteration 0.
-
-        Leftover queries need care when the budget is smaller than the number of
-        iterations. Every exact share then floors to zero and, under a constant
-        schedule, every fractional remainder is identical -- so ranking the
-        remainders is ranking ties, and a stable argsort hands the whole budget
-        to the LAST iterations. At B=10 that left a run with no feedback at all
-        until iteration 91 of 100. A constant schedule therefore spreads its
-        leftovers over evenly spaced indices, in integer arithmetic: with 9
-        queries over 100 iterations they land on 11, 22, ..., 99. Non-constant
-        schedules keep the largest-remainder rule, where the remainders do carry
-        information about the intended shape.
+        initial_queries are added to iteration 0. When the budget is smaller than the
+        number of iterations every share floors to zero and the remainders tie, so a
+        constant schedule spreads its leftovers over evenly spaced indices rather than
+        letting a stable sort push them all to the end. Other schedules keep the
+        largest-remainder rule.
         """
         if n_iterations <= 0:
             return []
@@ -174,72 +165,6 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
 
     def _save_checkpoint_extras(self, ckpt_path: str, iteration: int) -> None:
         """Hook: persist algorithm-specific state next to the standard checkpoint files."""
-
-    def _run_reward_inference(self, transitions):
-        """Run the reward model in eval mode; return arrays of true/pred rewards, status, done."""
-        self.reward_model.eval()
-        with th.no_grad():
-            true_rewards = np.array([t.true_reward  for t in transitions], dtype=np.float32)
-            obs          = np.array([t.observation  for t in transitions], dtype=np.float32)
-            acts         = np.array([t.action       for t in transitions], dtype=np.float32)
-            status       = np.array([t.next_status  for t in transitions], dtype=np.float32)
-            done         = np.array([float(t.done)  for t in transitions], dtype=np.float32)
-            pred_rewards = self.reward_model.predict(obs, acts, status, done)
-        self.reward_model.train()
-        return true_rewards, pred_rewards, status
-
-    def _normalize_predictions(
-        self,
-        pred_rewards: np.ndarray,
-        true_rewards: np.ndarray,
-        status: np.ndarray,
-        norm_on_running: bool = True,
-        match_mean: bool = True,
-        match_std: bool = False,
-    ) -> np.ndarray:
-        """Shift/scale pred_rewards to align with true_rewards statistics on running steps."""
-        norm_mask = np.ones(len(pred_rewards), dtype=bool)
-        if norm_on_running:
-            norm_mask = status[:, self.STATUS_RUNNING] == 1
-            if not norm_mask.any():
-                norm_mask = np.ones(len(pred_rewards), dtype=bool)
-
-        true_mean = np.mean(true_rewards[norm_mask])
-        pred_mean = np.mean(pred_rewards[norm_mask])
-
-        if match_mean and match_std:
-            true_std = np.std(true_rewards[norm_mask])
-            pred_std = np.std(pred_rewards[norm_mask])
-            return (pred_rewards - pred_mean) / max(pred_std, 1e-8) * true_std + true_mean
-        elif match_mean:
-            return pred_rewards - pred_mean + true_mean
-        return pred_rewards
-
-    def log_reward_model_validation(self, transitions, log_class: str) -> None:
-        """Log per-outcome MAE (and Kendall tau on running steps) of normalized predictions.
-
-        Outcomes absent from ``transitions`` are skipped rather than logged as NaN.
-        """
-        true_rewards, pred_rewards, status_onehot = self._run_reward_inference(transitions)
-        pred_rewards_norm = self._normalize_predictions(pred_rewards, true_rewards, status_onehot)
-
-        outcome_indices = {
-            "arrived": self.STATUS_ARRIVED,
-            "collided": self.STATUS_COLLIDED,
-            "offroad": self.STATUS_OFFROAD,
-            "timeout": self.STATUS_TIMEOUT,
-            "running": self.STATUS_RUNNING,
-        }
-        for name, idx in outcome_indices.items():
-            mask = status_onehot[:, idx] == 1
-            if mask.any():
-                mae = np.mean(np.abs(pred_rewards_norm[mask] - true_rewards[mask]))
-                self.logger.record(f"{log_class}/mae_{name}", mae)
-
-        running_mask = status_onehot[:, self.STATUS_RUNNING] == 1
-        if running_mask.sum() >= 2:
-            kt_running, _ = kendalltau(true_rewards[running_mask], pred_rewards_norm[running_mask])
-            self.logger.record(f"{log_class}/kendall_running", kt_running)
 
     def log_iteration(self, t0: float) -> None:
         """Log iteration-level scalars and flush the logger.

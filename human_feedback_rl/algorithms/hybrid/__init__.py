@@ -1,12 +1,12 @@
-"""Building blocks of :class:`~human_feedback_rl.algorithms.HybridAlgorithm`.
+"""The pieces HybridAlgorithm is assembled from, one concern per file.
 
-* ``demonstration_losses`` — the two demonstration IRL losses (demo_1, demo_2)
-  and the batch-sampling mixin that dispatches them.
-* ``reward_training`` — reward-model optimization helpers (gradient norms,
-  agent-facing reward normalization).
-* ``reward_diagnostics`` — validation, ranking and replay-buffer diagnostics.
-* ``imitation_metrics`` — agent-vs-expert imitation error logging.
-
-The preference side (Bradley-Terry losses, fragmenters, synthetic oracle)
-lives in :mod:`human_feedback_rl.common`.
+    feedback_collection     asking the oracle, counting what comes back
+    reward_model_training   fitting the reward to the feedback so far
+    gradient_fusion         two gradients into one optimizer step
+    reliability_weight      estimating alpha once per iteration
+    alpha_estimation        the maths behind alpha
+    demonstration_losses    the two demonstration IRL losses
+    reward_training         gradient norms, reward normalization
+    imitation_metrics       agent-versus-expert error
+    reward_diagnostics      what is only logged, in five files
 """

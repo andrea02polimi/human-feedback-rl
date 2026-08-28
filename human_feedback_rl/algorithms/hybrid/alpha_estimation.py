@@ -1,33 +1,14 @@
-"""Estimating alpha from the sampling variance of the two channels.
+"""The reliability weight, from the scatter of each channel's gradient.
 
-The weight ``alpha`` on the demonstrations has to say which of the two channels
-produces the less reliable gradient, where "reliable" means: if the algorithm
-were run again on a different draw of feedback, how much would the gradient
-change?
-
-It starts from the gradient induced by a **single sample**, measures how that
-scatters around the mean gradient, and only at the end divides by the size of
-the minibatch the optimizer actually uses.
-
-The two quantities play different roles and must not be confused:
-
-``N``
-    samples available in the channel. It estimates how much the data-generating
-    process scatters, and all of it should be used: more samples, better
-    estimate.
-``B``
-    minibatch size, ``min(batch_size, N)``. It sets how noisy the gradient that
-    is actually applied is, because the variance of a mean of ``B`` draws scales
-    as ``1/B``.
-
-So the asymmetry between the channels (256 preferences against 64
-demonstrations) **stays**, and should: the preference gradient really is
-averaged over four times as many samples, so it really is less noisy.
-
-Sanity check: at a small budget ``N`` and ``B`` are small and ``S`` comes out
-large; at a large budget ``S`` drops. Read it from ``alpha/S_pref`` and
-``alpha/S_demo``.
+alpha = CV2_pref / (CV2_pref + CV2_demo) is the weight on the demonstrations.
+Two sizes matter and are not the same: N, the samples a channel has, estimates
+how much the process scatters; B, the minibatch, divides it, because the
+applied gradient averages B draws.
 """
+
+#: Below this many comparisons the preference dispersion cannot be estimated,
+#: so alpha stays pinned to 1 and all the weight goes to the demonstrations.
+ALPHA_MIN_PREFS = 5
 
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
@@ -151,20 +132,11 @@ def preference_sample_gradients(member, batch, smooth_labels, params) -> th.Tens
 def demonstration_sample_gradients(
     member, expert_trajs, model_trajs, params
 ) -> th.Tensor:
-    """One gradient per demonstration, under ``demo_2``.
+    """One gradient per demonstration, under demo_2.
 
-    ``demo_2`` does not decompose: the partition term contains the experts too.
-    Sample i is defined as the loss that would be seen if the batch were that
-    one demonstration plus the whole frozen rollout,
-
-        L_i = -R_i^E + logsumexp({R_j^M} u {R_i^E}) - log(|M| + 1)
-
-    which is the closest thing to the real loss: the mean of the ``g_i`` equals
-    the full-batch gradient up to the non-linearity of the logsumexp.
-
-    The rollout is NOT feedback, so it is held fixed: its variability must not
-    enter the variance of the demonstration channel. It does enter the
-    gradients, because that is what the loss actually uses.
+    demo_2 does not decompose, because its partition term contains the experts too.
+    Sample i is the loss of that one demonstration against the frozen rollout. The
+    rollout is held fixed: it is not feedback.
     """
     with th.no_grad():
         r_e = fragment_sum_rewards(member, expert_trajs)

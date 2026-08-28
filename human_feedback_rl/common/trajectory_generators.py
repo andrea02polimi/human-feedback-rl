@@ -191,22 +191,12 @@ def rollout_agent(
     start_obs: Optional[np.ndarray] = None,
     start_episode_starts: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Collect at least ``steps`` transitions, closing the open episodes.
+    """Collect at least steps transitions, closing the open episodes.
 
-    ``start_obs`` is for the SHARED environment. There the env is the same one
-    SAC runs on, and ``agent.learn()`` almost always returns mid-episode: a
-    ``venv.reset()`` would truncate that episode, and the part already
-    collected -- which the wrapper holds in ``_partial_trajectories`` -- would
-    be thrown away silently. Resuming from the current observation lets the
-    episode finish on its own, so it enters the pool COMPLETE.
-
-    Keeping it as a truncated trajectory would be worse: ``demo_2`` aggregates
-    returns by SUM, so a shorter trajectory would have a lower return merely
-    for being shorter, and the partition -- where the experts already take
-    95-99% of the mass -- would degenerate further.
-
-    Without ``start_obs`` it resets as before: the dedicated-environment case,
-    and the bootstrap, when the agent has no state yet.
+    start_obs is for the shared environment, where agent.learn() returns
+    mid-episode and a reset would throw away what was already collected. Resuming
+    lets the episode finish whole, which matters because demo_2 sums returns and a
+    truncated trajectory would simply look worse.
     """
     if start_obs is None:
         obs = venv.reset()

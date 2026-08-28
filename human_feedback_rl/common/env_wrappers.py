@@ -140,21 +140,11 @@ class EnvBufferingWrapper(VecEnvWrapper):
         return trajectories
 
     def reset(self, **kwargs):
-        """Start over, after checking there is nothing to lose.
+        """Start over, refusing if there is anything left to lose.
 
-        Two things would be lost silently, and the guard covers both:
-
-        * FINISHED trajectories not yet read by ``pop_finished_trajectories``;
-        * an episode IN PROGRESS, whose collected part lives in
-          ``_partial_trajectories``.
-
-        The second case is the shared-environment one: SAC almost always leaves
-        an episode half done, and whoever reads the buffer has just emptied the
-        finished ones, so a guard on the finished alone would never fire
-        precisely when it is needed. The normal path no longer resets with an
-        episode open (``rollout_agent`` continues from ``start_obs``); this is
-        the net that stops a future path from reintroducing the loss without
-        noticing.
+        Two things would go silently: finished trajectories nobody has read, and an
+        episode still in progress. The second is the shared-environment case, where SAC
+        usually leaves an episode half done.
         """
         if self._initialized and self.error_on_premature_reset:
             if len(self._finished_trajectories) > 0:

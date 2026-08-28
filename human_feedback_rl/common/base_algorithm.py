@@ -17,25 +17,10 @@ from human_feedback_rl.common.loggers import Logger, WandbWriter, make_human_out
 
 
 class BaseAlgorithm(ABC):
-    """
-    General base for all human-feedback RL algorithms.
+    """Base for the algorithms: env, agent, logger and rng.
 
-    Provides:
-      * ``env``    – the (vectorised) training environment.
-      * ``agent``  – the policy being trained.
-      * ``logger`` – SB3 Logger wired to WandB and a human-readable sink.
-      * ``rng``    – shared NumPy random generator.
-
-    Logger configuration (two complementary mechanisms):
-      * ``log_folder``     – directory where SB3 Logger writes CSV/TensorBoard
-                             files.  ``None`` disables file logging (default).
-      * ``output_formats`` – explicit list of SB3 output-format objects.
-                             When provided, overrides ``_output_formats()``.
-                             When ``None``, ``_output_formats()`` is called
-                             (the class-level override hook).
-
-    Subclasses call ``super().__init__(env, agent, ...)`` and get all of the
-    above for free.
+    log_folder points the SB3 logger at a directory, or disables file logging when
+    None. output_formats overrides the formats chosen by _output_formats().
     """
 
     def __init__(

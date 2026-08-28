@@ -160,19 +160,6 @@ class RewardEnsemble(RewardNet):
             axis=1,
         )
 
-    @th.no_grad()
-    def predict_mean_std(
-        self,
-        state: np.ndarray,
-        action: np.ndarray,
-        next_status: Optional[np.ndarray] = None,
-        done: Optional[np.ndarray] = None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Mean and std of rewards across ensemble members."""
-        all_rewards = self.predict_all(state, action, next_status, done)
-        return all_rewards.mean(axis=1), all_rewards.std(axis=1)
-
-
 class NormalizedRewardNet(RewardNet):
     """Apply an agent-only affine transformation in ``predict``.
 

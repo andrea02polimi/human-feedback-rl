@@ -1,63 +1,50 @@
 """Hybrid reward learning from demonstrations and preferences.
 
-The single reward-learning algorithm of the package: with both feedback
-sources active it is the hybrid method; with ``demo_weight=0`` it degenerates
-to the preference-only baseline, with ``total_queries=0`` to the
-demonstration-only baseline.
+The only reward-learning algorithm here. With both channels it is the hybrid
+method; with demo_weight=0 it is the preference-only baseline, and with
+total_queries=0 the demonstration-only one.
 
-Two integration mechanisms for the demonstration signal (``demo_mode``):
+demo_mode chooses how demonstrations enter: gcl fuses an IRL loss with the
+Bradley-Terry loss on one net, preferences turns them into preference pairs
+(Ibarz et al. 2018).
 
-* ``"gcl"`` — the demo IRL loss (``demo_1`` difference-of-means or ``demo_2``
-  MaxEnt surrogate) is combined with the Bradley-Terry preference loss on one
-  shared reward net. The demo gradient is norm-balanced against the
-  preference gradient (``demo_weight`` = desired demo/preference
-  gradient-strength ratio).
-* ``"preferences"`` — demonstrations enter as preference pairs (expert
-  fragment preferred over agent fragment, Ibarz et al. 2018): a single
-  Bradley-Terry objective on mixed batches, no scale conflict by
-  construction. This is the literature hybrid baseline ("demonstrations as
-  implicit preferences"). It is implemented and covered by the tests, but it
-  is not one of the configured methods: reaching it takes ``demo_mode`` set
-  explicitly.
-
-Health metrics: with soft oracle labels at high ``pref_temperature`` the BT
-loss sits at its ln(2) cross-entropy floor even when learning succeeds --
-watch ``reward/acc_pref_train`` and ``reward_val/.../pred_true/pearson_*``
-instead. Adam weight decay at 1e-2 overwhelms the BT gradient and collapses
-the reward net.
+With soft labels at a high pref_temperature the BT loss sits at its ln(2) floor
+even when learning works. Read reward/acc_pref_train instead.
 """
 
 import os
 import time
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 
 import numpy as np
 import torch as th
 
-from human_feedback_rl.algorithms.hybrid.alpha_estimation import estimate_alpha
-from human_feedback_rl.algorithms.hybrid.imitation_metrics import ImitationMetricsMixin
 from human_feedback_rl.algorithms.hybrid.demonstration_losses import (
     VALID_LOSSES,
     RewardLossMixin,
 )
+from human_feedback_rl.algorithms.hybrid.feedback_collection import FeedbackCollectionMixin
+from human_feedback_rl.algorithms.hybrid.gradient_fusion import GradientFusionMixin
+from human_feedback_rl.algorithms.hybrid.imitation_metrics import ImitationMetricsMixin
+from human_feedback_rl.algorithms.hybrid.reliability_weight import ReliabilityWeightMixin
 from human_feedback_rl.algorithms.hybrid.reward_diagnostics import RewardDiagnosticsMixin
+from human_feedback_rl.algorithms.hybrid.reward_model_training import RewardModelTrainingMixin
 from human_feedback_rl.algorithms.hybrid.reward_training import RewardTrainingMixin
 from human_feedback_rl.common.base_reward_learning_algorithm import (
     QUERY_SCHEDULES,
     BaseRewardLearningAlgorithm,
 )
-from human_feedback_rl.common.batching import fragment_avg_rewards
-from human_feedback_rl.common.datasets import PreferenceBatch, PreferenceDataset
+from human_feedback_rl.common.datasets import PreferenceDataset
 from human_feedback_rl.common.fragmenters import make_pair_fragmenter
 from human_feedback_rl.common.gatherers import PreferenceGathererFromReward
-from human_feedback_rl.common.preference_losses import (
-    bradley_terry_probs,
-    evaluate_preference_batch,
-    preference_labels_tensor,
-    preference_nll,
-)
 from human_feedback_rl.common.reward_nets import make_reward_ensemble
-from human_feedback_rl.common.types import Preference, Trajectory
+from human_feedback_rl.common.types import Trajectory
+
+def _require(condition, message: str) -> None:
+    """Reject a hyperparameter combination the algorithm cannot honour."""
+    if not condition:
+        raise ValueError(message)
+
 
 VALID_DEMO_MODES = ("gcl", "preferences")
 
@@ -66,12 +53,12 @@ VALID_DEMO_MODES = ("gcl", "preferences")
 #   alpha_norm_single_adam  unit directions combined by alpha, a SINGLE Adam
 VALID_GCL_FUSIONS = ("norm_balance", "alpha_norm_single_adam")
 
-# Below this many comparisons the preference dispersion cannot be estimated:
-# alpha stays pinned to 1, that is, all the weight on the demonstrations.
-ALPHA_MIN_PREFS = 5
-
 
 class HybridAlgorithm(
+    FeedbackCollectionMixin,
+    RewardModelTrainingMixin,
+    GradientFusionMixin,
+    ReliabilityWeightMixin,
     RewardLossMixin,
     RewardTrainingMixin,
     ImitationMetricsMixin,
@@ -132,36 +119,30 @@ class HybridAlgorithm(
         normalize_agent_reward: bool = True,
         agent_log_timestep_interval: Optional[int] = None,
     ):
-        if not expert_trajectories:
-            raise ValueError("expert_trajectories must be a non-empty list of Trajectory objects.")
-        if loss_type not in self.VALID_LOSSES:
-            raise ValueError(f"loss_type must be one of {self.VALID_LOSSES}, got {loss_type!r}.")
-        if gradient_steps_rew <= 0:
-            raise ValueError("gradient_steps_rew must be positive.")
-        if batch_size_expert <= 0 or batch_size_model <= 0:
-            raise ValueError("Reward-model batch sizes must be positive.")
-        if batch_size_pref <= 0:
-            raise ValueError("batch_size_pref must be positive.")
-        if preference_fragment_length <= 0:
-            raise ValueError("preference_fragment_length must be positive.")
-        if demo_weight < 0:
-            raise ValueError("demo_weight must be non-negative.")
-        if max_balance_scale <= 0 or balance_eps <= 0:
-            raise ValueError("max_balance_scale and balance_eps must be positive.")
-        if pref_temperature <= 0:
-            raise ValueError("pref_temperature must be positive.")
-        if demo_mode not in VALID_DEMO_MODES:
-            raise ValueError(f"demo_mode must be one of {VALID_DEMO_MODES}, got {demo_mode!r}.")
-        if gcl_fusion not in VALID_GCL_FUSIONS:
-            raise ValueError(f"gcl_fusion must be one of {VALID_GCL_FUSIONS}, got {gcl_fusion!r}.")
-        if alpha_eps <= 0:
-            raise ValueError("alpha_eps must be positive.")
-        if not 0.0 <= label_smoothing < 1.0:
-            raise ValueError("label_smoothing must be in [0, 1).")
-        if demo_pref_pairs_per_iteration < 0:
-            raise ValueError("demo_pref_pairs_per_iteration must be non-negative.")
-        if not 0 <= demo_pref_batch_fraction <= 1:
-            raise ValueError("demo_pref_batch_fraction must be in [0, 1].")
+        _require(expert_trajectories,
+                 "expert_trajectories must be a non-empty list of Trajectory objects.")
+        _require(loss_type in self.VALID_LOSSES,
+                 f"loss_type must be one of {self.VALID_LOSSES}, got {loss_type!r}.")
+        _require(gradient_steps_rew > 0, "gradient_steps_rew must be positive.")
+        _require(batch_size_expert > 0 and batch_size_model > 0,
+                 "Reward-model batch sizes must be positive.")
+        _require(batch_size_pref > 0, "batch_size_pref must be positive.")
+        _require(preference_fragment_length > 0,
+                 "preference_fragment_length must be positive.")
+        _require(demo_weight >= 0, "demo_weight must be non-negative.")
+        _require(max_balance_scale > 0 and balance_eps > 0,
+                 "max_balance_scale and balance_eps must be positive.")
+        _require(pref_temperature > 0, "pref_temperature must be positive.")
+        _require(demo_mode in VALID_DEMO_MODES,
+                 f"demo_mode must be one of {VALID_DEMO_MODES}, got {demo_mode!r}.")
+        _require(gcl_fusion in VALID_GCL_FUSIONS,
+                 f"gcl_fusion must be one of {VALID_GCL_FUSIONS}, got {gcl_fusion!r}.")
+        _require(alpha_eps > 0, "alpha_eps must be positive.")
+        _require(0.0 <= label_smoothing < 1.0, "label_smoothing must be in [0, 1).")
+        _require(demo_pref_pairs_per_iteration >= 0,
+                 "demo_pref_pairs_per_iteration must be non-negative.")
+        _require(0 <= demo_pref_batch_fraction <= 1,
+                 "demo_pref_batch_fraction must be in [0, 1].")
 
         reward_model = make_reward_ensemble(env, **(reward_model_kwargs or {}))
 
@@ -264,23 +245,14 @@ class HybridAlgorithm(
             queue_size=comparison_queue_size, rng=self._rng_train)
 
     def _split_rng(self):
-        """Three independent streams, derived from the master seed.
+        """Three independent streams, spawned from the master seed.
 
-        With a single shared RNG, every draw made by the optimization moves the
-        state of the one that picks the fragments and samples the Bernoulli
-        labels. Two runs differing ONLY in ``gradient_steps_rew`` therefore
-        received different feedback: measured on a short run, 10 comparisons
-        out of 12 changed (the two that matched were the bootstrap ones, drawn
-        before the first gradient step). A comparison between hyperparameters
-        thus mixed their quality with which realisation of comparisons happened
-        to come up -- and ``gradient_steps_rew`` is one of the tuned ones.
+            query    which fragments get compared
+            oracle   oracle labels, Bernoulli draws included
+            train    preference and demonstration minibatches, bootstrap
 
-        The streams stay deterministic and reproducible because they are spawned
-        from the master seed's ``SeedSequence``: same ``run.seed``, same streams.
-
-        * ``query``  -- which fragments get compared
-        * ``oracle`` -- oracle labels, Bernoulli draws included
-        * ``train``  -- preference and demonstration minibatches, bootstrap
+        Sharing one RNG made the feedback depend on how many gradient steps the reward
+        model took, which put the optimizer settings inside the comparison.
         """
         seed_seq = getattr(self.rng.bit_generator, "seed_seq", None)
         if seed_seq is None:      # Generator built without a SeedSequence
@@ -376,532 +348,40 @@ class HybridAlgorithm(
     # Feedback collection
     # ------------------------------------------------------------------
 
-    def _collect_feedback(self, num_queries: int) -> None:
-        self._collect_preference_feedback(num_queries)
-        if self.demo_mode == "preferences":
-            self._collect_demo_preference_pairs(self.demo_pref_pairs_per_iteration)
 
-    def _collect_preference_feedback(self, num_queries: int) -> None:
-        if num_queries <= 0:
-            return
-        fragments = self.fragmenter(
-            self.trajectories,
-            self.preference_fragment_length,
-            num_queries,
-        )
-        preferences = self.preference_gatherer(fragments)
-        self.dataset_train.push(fragments, preferences)
-        self.logger.record("dataset/n_train", len(self.dataset_train), exclude="stdout")
-        self._count_duplicate_comparisons(fragments)
 
-    def _count_duplicate_comparisons(self, pairs) -> None:
-        """Measures how far the comparison threshold overstates distinct ones.
 
-        The fragmenter draws with replacement and does not deduplicate, so
-        ``n_pref`` counts stored items, not distinct comparisons. In principle a
-        pair can repeat, a fragment can land in two comparisons, or a pair can
-        compare a fragment with itself.
-
-        In practice it should almost never happen: queries made in different
-        iterations draw from DISJOINT pools, because ``pop_finished_trajectories``
-        empties the buffer, so only queries from the same iteration can collide.
-        The expected count is below 0.01 per run at B=10 and B=100, and about
-        1.8 at B=1000. This counter replaces that estimate with a measurement,
-        without touching the sampling.
-
-        The signature is over CONTENT rather than ``id()``: Transition objects
-        stay alive while the dataset references them, but a reused identity
-        would give a silent false positive.
-        """
-        def signature(frag):
-            return tuple(
-                (t.observation.tobytes(), np.asarray(t.action).tobytes(),
-                 float(t.true_reward))
-                for t in frag
-            )
-
-        for pair in pairs:
-            f1, f2 = signature(pair.frag1), signature(pair.frag2)
-            if f1 == f2:
-                self._dup_self_pairs += 1
-            pair_key = (f1, f2) if f1 <= f2 else (f2, f1)
-            if pair_key in self._seen_pairs:
-                self._dup_pairs += 1
-            else:
-                self._seen_pairs.add(pair_key)
-            for f in (f1, f2):
-                if f in self._seen_fragments:
-                    self._dup_fragments += 1
-                else:
-                    self._seen_fragments.add(f)
-
-        self.logger.record("dataset/dup_pairs", self._dup_pairs, exclude="stdout")
-        self.logger.record("dataset/dup_self_pairs", self._dup_self_pairs, exclude="stdout")
-        self.logger.record("dataset/dup_fragments", self._dup_fragments, exclude="stdout")
-
-    def _collect_demo_preference_pairs(self, num_pairs: int) -> None:
-        """Expert fragment > agent fragment pairs (Ibarz et al. 2018).
-
-        The expert is preferred by assumption — no reward signal is used.
-        """
-        if num_pairs <= 0 or not self.trajectories:
-            return
-        from human_feedback_rl.common.types import FragmentPair
-
-        expert_frags = self._single_fragmenter(
-            self.expert_trajectories, self.preference_fragment_length, num_pairs
-        )
-        agent_frags = self._single_fragmenter(
-            self.trajectories, self.preference_fragment_length, num_pairs
-        )
-        pairs = [FragmentPair(e, a) for e, a in zip(expert_frags, agent_frags)]
-        preferences = [Preference(1.0, 0.0) for _ in pairs]
-        self.dataset_demo_prefs_train.push(pairs, preferences)
-        self.logger.record(
-            "dataset/n_demo_prefs_train", len(self.dataset_demo_prefs_train), exclude="stdout"
-        )
 
     # ------------------------------------------------------------------
     # Reward-model training
     # ------------------------------------------------------------------
 
-    def _train_reward_model(self) -> None:
-        if not self.trajectories:
-            return
-        if self.demo_mode == "preferences":
-            self._train_reward_model_pure_preferences()
-        else:
-            self._train_reward_model_gcl()
 
-    def _training_view(self, dataset):
-        """The dataset this iteration draws its minibatches from.
 
-        The bootstrap exists to decorrelate the ensemble members: each sees a
-        different resampling. With a SINGLE member there is nothing to
-        decorrelate, and resampling n items out of n with replacement contains
-        on average only 63.2% distinct ones. Over a third of the comparisons
-        collected would be thrown away every iteration for no benefit: at B=10
-        that means training on ~6 comparisons instead of 10, while the
-        demonstration channel always sees its whole budget
-        (``_sample_trajectories`` draws WITHOUT replacement).
 
-        Dropping it also makes the alpha estimate coherent: it measures the
-        dispersion over the WHOLE dataset while the gradient was computed on
-        the bootstrap, so alpha underestimated the noise of the preference
-        channel and gave preferences more weight than they deserved.
-        """
-        if self.bootstrap_comparisons is None:
-            resample = len(self.reward_model.members) > 1
-        else:
-            resample = bool(self.bootstrap_comparisons)
-        return dataset.bootstrap() if resample else dataset
-
-    def _train_reward_model_gcl(self) -> None:
-        """BT + GCL on the shared net with norm-balanced gradient fusion.
-
-        Degenerate cases stay well-defined: with an empty preference dataset
-        only the demo loss trains (demo-only arm); with ``demo_weight == 0``
-        only the preference loss trains (pref-only arm).
-        """
-        has_prefs = len(self.dataset_train) > 0
-        demo_weight = self.demo_weight
-        if not has_prefs and demo_weight == 0.0:
-            return
-
-        self.logger.record("reward/demo_weight", demo_weight, exclude="stdout")
-        # Before any step: the weight has to describe this theta.
-        self._estimate_alpha()
-        t0 = time.perf_counter()
-
-        def member_step(member, optimizer):
-            member.train()
-            boot_dataset = self._training_view(self.dataset_train) if has_prefs else None
-            # One alpha per member for the whole iteration, estimated above
-            # at these same parameters.
-            alpha = self._alpha_weight(member)
-            stats = []
-            for _ in range(self.gradient_steps_rew):
-                pref_loss = (
-                    self._preference_loss(member, boot_dataset.sample(self.batch_size_pref))
-                    if boot_dataset is not None
-                    else None
-                )
-                demo_loss = self._reward_loss(member) if demo_weight > 0.0 else None
-                stats.append(
-                    self._reward_step(member, optimizer, pref_loss, demo_loss, alpha=alpha)
-                )
-            return stats
-
-        all_stats = [s for stats in self.train_reward_members(member_step) for s in stats]
-        t_train = time.perf_counter() - t0
-
-        self._log_reward_loss_diagnostics()
-        self._log_preference_diagnostics()
-        self._log_hybrid_step_stats(all_stats)
-        self.logger.record("reward/weight_norm", self._param_norm(self.reward_model), exclude="stdout")
-        self.logger.record("time/train_reward_model", t_train)
-
-    def _train_reward_model_pure_preferences(self) -> None:
-        """Single BT objective on mixed oracle + expert-vs-agent batches."""
-        has_oracle = len(self.dataset_train) > 0
-        has_demo = len(self.dataset_demo_prefs_train) > 0
-        if not has_oracle and not has_demo:
-            return
-
-        t0 = time.perf_counter()
-        n_demo = round(self.batch_size_pref * self.demo_pref_batch_fraction)
-        if not has_demo:
-            n_demo = 0
-        if not has_oracle:
-            n_demo = self.batch_size_pref
-        n_oracle = self.batch_size_pref - n_demo
-
-        def member_step(member, optimizer):
-            member.train()
-            boot_oracle = self._training_view(self.dataset_train) if n_oracle else None
-            boot_demo = self._training_view(self.dataset_demo_prefs_train) if n_demo else None
-            losses = []
-            for _ in range(self.gradient_steps_rew):
-                parts = []
-                if boot_oracle is not None:
-                    parts.append(boot_oracle.sample(n_oracle))
-                if boot_demo is not None:
-                    parts.append(boot_demo.sample(n_demo))
-                batch = PreferenceBatch(
-                    [pair for part in parts for pair in part.fragment_pairs],
-                    [pref for part in parts for pref in part.preferences],
-                )
-                loss = self._preference_loss(member, batch)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                losses.append(float(loss.detach()))
-            return losses
-
-        all_losses = [l for losses in self.train_reward_members(member_step) for l in losses]
-        t_train = time.perf_counter() - t0
-
-        self._log_preference_diagnostics()
-        self.logger.record("reward/hybrid_pref_loss", float(np.mean(all_losses)), exclude="stdout")
-        self.logger.record("reward/weight_norm", self._param_norm(self.reward_model), exclude="stdout")
-        self.logger.record("time/train_reward_model", t_train)
 
     # ------------------------------------------------------------------
     # Balanced gradient step
     # ------------------------------------------------------------------
 
-    def _reward_step(self, member, optimizer, pref_loss, demo_loss,
-                     alpha=None) -> Dict[str, float]:
-        """One optimizer step from the preference and/or demo losses.
-
-        With both losses present, the two gradients are computed separately,
-        the demo gradient is norm-balanced to ``demo_weight`` times the
-        preference gradient, and the composed gradient (an exact per-parameter
-        linear combination ``g_pref + scale * g_demo``) is written back before
-        ``step()``.
-        """
-        nan = float("nan")
-        stats = {
-            "pref_loss": nan, "demo_loss": nan, "scale": nan, "pref_norm": nan,
-            "demo_norm": nan, "grad_norm": nan, "alpha": nan,
-        }
-
-        if pref_loss is None and demo_loss is None:
-            return stats
-
-        if demo_loss is None:  # pref-only arm
-            optimizer.zero_grad()
-            pref_loss.backward()
-            stats.update(pref_loss=float(pref_loss.detach()), grad_norm=self._grad_norm(member))
-            optimizer.step()
-            return stats
-        if pref_loss is None:  # demo-only arm
-            optimizer.zero_grad()
-            demo_loss.backward()
-            stats.update(demo_loss=float(demo_loss.detach()), grad_norm=self._grad_norm(member))
-            optimizer.step()
-            return stats
-
-        params = list(member.parameters())
-        optimizer.zero_grad()
-        pref_loss.backward()
-        g_pref = [None if p.grad is None else p.grad.detach().clone() for p in params]
-        optimizer.zero_grad()
-        demo_loss.backward()
-        g_demo = [None if p.grad is None else p.grad.detach().clone() for p in params]
-
-        flat_pref = self._flatten(g_pref, params)
-        flat_demo = self._flatten(g_demo, params)
-        pref_norm = float(flat_pref.norm())
-        demo_norm = float(flat_demo.norm())
-
-        if self.gcl_fusion == "alpha_norm_single_adam":
-            # g_fin = (1 - a) * g_p/||g_p|| + a * g_d/||g_d||, then a SINGLE
-            # Adam. The two channel norms are discarded on purpose: only the
-            # direction survives, which is why alpha has to be dimensionless
-            # (hence dividing by ||g||^2 in CV^2).
-            if alpha is None:
-                alpha = self._alpha_weight(member)
-            alpha = float(np.clip(alpha, 0.0, 1.0))
-            unit_pref = flat_pref / (pref_norm + self.balance_eps)
-            unit_demo = flat_demo / (demo_norm + self.balance_eps)
-            g_fin = (1.0 - alpha) * unit_pref + alpha * unit_demo
-            self._set_flat_grad(params, g_fin)
-            optimizer.step()
-            stats.update(
-                pref_loss=float(pref_loss.detach()),
-                demo_loss=float(demo_loss.detach()),
-                pref_norm=pref_norm, demo_norm=demo_norm,
-                grad_norm=float(g_fin.norm()), alpha=alpha,
-            )
-            return stats
-
-        scale = min(
-            self.demo_weight * pref_norm / (demo_norm + self.balance_eps),
-            self.max_balance_scale,
-        )
-
-        for p, gp, gd in zip(params, g_pref, g_demo):
-            if gp is None and gd is None:
-                p.grad = None
-                continue
-            grad = th.zeros_like(p)
-            if gp is not None:
-                grad += gp
-            if gd is not None:
-                grad += scale * gd
-            p.grad = grad
-
-        grad_norm = self._grad_norm(member)
-        optimizer.step()
-
-        stats.update(
-            pref_loss=float(pref_loss.detach()),
-            demo_loss=float(demo_loss.detach()),
-            scale=scale, pref_norm=pref_norm, demo_norm=demo_norm, grad_norm=grad_norm,
-        )
-        return stats
 
     # ------------------------------------------------------------------
     # Reliability weight (alpha)
     # ------------------------------------------------------------------
 
-    def _alpha_weight(self, member) -> float:
-        """Weight on the demonstration channel for the current iteration.
 
-        Read-only: the value comes from ``_estimate_alpha``, which runs once at
-        the start of reward training, at the parameters where the weight will
-        be applied. Falls back to 1 (demonstrations only) when there is no
-        estimate for this member.
-        """
-        estimate = self._alpha_current.get(id(member))
-        return 1.0 if estimate is None else estimate.alpha
 
-    def _alpha_is_active(self) -> bool:
-        """True when alpha is estimated rather than pinned to the fallback."""
-        estimates = [
-            self._alpha_current.get(id(member)) for member in self.reward_model.members
-        ]
-        present = [e for e in estimates if e is not None]
-        return bool(present) and all(not e.pinned for e in present)
 
-    def _estimate_alpha(self) -> None:
-        """Estimate this iteration's alpha, BEFORE any gradient step.
 
-        The timing matters: the weight says how noisy each channel's gradient is
-        AT A POINT IN PARAMETER SPACE, so it has to be measured where it is
-        used. Measuring it after the update and applying it to the next
-        iteration would describe a different point. On the first call theta is
-        the random initialisation: that is a legitimate measurement, and there
-        N_p is almost always below the threshold, so alpha stays pinned to 1.
 
-        The rollout the demonstration loss needs is drawn ONCE and shared by
-        every sample: it is not feedback, so its sampling noise must not end up
-        in the channel's variance. It is drawn from the diagnostics RNG, so the
-        estimate never perturbs the training draws.
-        """
-        if self.gcl_fusion == "norm_balance":
-            return                       # that fusion does not use alpha
-        self._alpha_current = {}
-        if self.demo_weight <= 0.0 or not self.trajectories:
-            return                       # no demonstration channel
-        if self.loss_type != "demo_2":
-            raise NotImplementedError(
-                "alpha estimation implements the demo_2 per-sample "
-                f"decomposition; got loss_type={self.loss_type!r}."
-            )
 
-        pref_batch = (
-            self.dataset_train.get_all() if len(self.dataset_train) else None
-        )
-        n_model = min(self.batch_size_model, len(self.trajectories))
-        model_indices = self._grad_probe_rng.choice(
-            len(self.trajectories), size=n_model, replace=False
-        )
-        model_trajs = [self.trajectories[i] for i in model_indices]
-
-        t0 = time.perf_counter()
-        for member in self.reward_model.members:
-            params = [p for p in member.parameters() if p.requires_grad]
-            smooth = (
-                self._smoothed_labels(preference_labels_tensor(pref_batch.preferences))
-                if pref_batch is not None else None
-            )
-            self._alpha_current[id(member)] = estimate_alpha(
-                member,
-                params,
-                pref_batch,
-                smooth,
-                self.expert_trajectories,
-                model_trajs,
-                batch_size_pref=self.batch_size_pref,
-                batch_size_expert=self.batch_size_expert,
-                min_prefs=ALPHA_MIN_PREFS,
-                eps=self.alpha_eps,
-            )
-        self.logger.record("time/estimate_alpha", time.perf_counter() - t0)
-        self._log_alpha_estimate()
-
-    def _log_alpha_estimate(self) -> None:
-        """Publish the two dispersions that make up alpha, and their parts.
-
-        ``alpha/S_*`` is the sanity check: it is the variance of the gradient
-        the optimizer actually applies, so it has to fall as the budget grows.
-        """
-        estimates = [
-            self._alpha_current.get(id(member)) for member in self.reward_model.members
-        ]
-        estimates = [e for e in estimates if e is not None]
-        if not estimates:
-            return
-        self.logger.record(
-            "reward/hybrid_alpha",
-            float(np.mean([e.alpha for e in estimates])),
-            exclude="stdout",
-        )
-        self.logger.record(
-            "reward/hybrid_alpha_active",
-            float(self._alpha_is_active()),
-            exclude="stdout",
-        )
-        for name, channel in (("pref", "pref"), ("demo", "demo")):
-            values = [getattr(e, channel) for e in estimates]
-            values = [v for v in values if v is not None]
-            if not values:
-                continue
-            for key, attr in (
-                ("V", "process_var"),
-                ("S", "mean_var"),
-                ("cv2", "cv2"),
-                ("gradmean_norm_sq", "mean_norm_sq"),
-                ("n", "n"),
-                ("batch", "batch"),
-            ):
-                self.logger.record(
-                    f"alpha/{key}_{name}",
-                    float(np.mean([getattr(v, attr) for v in values])),
-                    exclude="stdout",
-                )
-
-    @staticmethod
-    def _set_flat_grad(params, direction: th.Tensor) -> None:
-        """Write a flat vector into the ``.grad`` fields for ``step()``."""
-        offset = 0
-        for p in params:
-            k = p.numel()
-            p.grad = direction[offset:offset + k].view_as(p).clone()
-            offset += k
-
-    @staticmethod
-    def _flatten(grads, params) -> th.Tensor:
-        parts = [
-            g.reshape(-1) if g is not None else th.zeros(p.numel())
-            for g, p in zip(grads, params)
-        ]
-        return th.cat(parts) if parts else th.zeros(0)
-
-    def _log_hybrid_step_stats(self, all_stats: List[Dict[str, float]]) -> None:
-        def nanmean(key):
-            values = np.asarray([s[key] for s in all_stats], dtype=float)
-            finite = values[np.isfinite(values)]
-            return float(finite.mean()) if finite.size else None
-
-        pairs = {
-            "reward/hybrid_pref_loss": "pref_loss",
-            "reward/hybrid_demo_loss": "demo_loss",
-            "reward/hybrid_demo_scale": "scale",
-            "reward/grad_norm_pref": "pref_norm",
-            "reward/grad_norm_demo": "demo_norm",
-            "reward/grad_norm": "grad_norm",
-        }
-        for log_key, stat_key in pairs.items():
-            value = nanmean(stat_key)
-            if value is not None:
-                self.logger.record(log_key, value, exclude="stdout")
-
-        norms = {k: nanmean(k2) for k, k2 in (("pref", "pref_norm"), ("demo", "demo_norm"))}
-        if norms["pref"] is not None and norms["demo"] is not None:
-            self.logger.record(
-                "reward/grad_norm_demo_pref_ratio",
-                norms["demo"] / (norms["pref"] + self.balance_eps),
-                exclude="stdout",
-            )
-        grad_norms = [s["grad_norm"] for s in all_stats if np.isfinite(s["grad_norm"])]
-        if grad_norms:
-            self.logger.record("reward/grad_norm_max", float(np.max(grad_norms)), exclude="stdout")
 
     # ------------------------------------------------------------------
     # Preference loss / diagnostics
     # ------------------------------------------------------------------
 
-    def _preference_loss(self, member, batch) -> th.Tensor:
-        r1 = fragment_avg_rewards(member, [p.frag1 for p in batch.fragment_pairs])
-        r2 = fragment_avg_rewards(member, [p.frag2 for p in batch.fragment_pairs])
-        labels = self._smoothed_labels(preference_labels_tensor(batch.preferences))
-        return preference_nll(bradley_terry_probs(r1, r2), labels)
 
-    def _smoothed_labels(self, labels: th.Tensor) -> th.Tensor:
-        """Move the labels ``label_smoothing`` of the way towards 1/2.
 
-        Only sampled binary labels need it: cross-entropy against a target in
-        {0, 1} has its minimum at Delta = +-inf, so with few comparisons the
-        model separates them arbitrarily and memorises them. With the target
-        y' = (1-eps) y + eps/2 the minimum is finite again, Delta* = logit(y'),
-        and the loss has a floor H(y') > 0 once more.
-
-        ``soft`` labels are already oracle probabilities: they have a finite
-        optimum and a floor of their own, and moving them would introduce a bias
-        while correcting nothing. They are left alone.
-
-        Applied here rather than at generation time (``gatherers.py``) on
-        purpose: the dataset keeps the true labels, so the diagnostics stay
-        computed on the raw target.
-        """
-        if self.label_smoothing <= 0.0 or self.labels_type != "binary_bernoulli":
-            return labels
-        eps = self.label_smoothing
-        return (1.0 - eps) * labels + eps / 2.0
-
-    def _log_preference_diagnostics(self) -> None:
-        """Fit diagnostics on the training comparisons.
-
-        There is no validation set: feedback is the scarce resource here, and
-        holding a share of it back took it away from training while no decision
-        really depended on that measurement. The ``*_val`` keys disappear with
-        it.
-        """
-        if not len(self.dataset_train):
-            return
-        train_loss, train_acc = evaluate_preference_batch(
-            self.reward_model, self.dataset_train.get_all()
-        )
-        self.logger.record("reward/loss_pref_train", train_loss, exclude="stdout")
-        self.logger.record("reward/acc_pref_train", train_acc, exclude="stdout")
-        if self.demo_mode == "preferences" and len(self.dataset_demo_prefs_train):
-            _, demo_acc = evaluate_preference_batch(
-                self.reward_model, self.dataset_demo_prefs_train.get_all()
-            )
-            self.logger.record("reward/acc_demo_pref_train", demo_acc, exclude="stdout")
 
     def _refresh_replay_relabel_cache(self) -> None:
         """Relabel the replay buffer once per iteration (the model is frozen during learn).

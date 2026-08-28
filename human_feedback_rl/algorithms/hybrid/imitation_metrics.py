@@ -7,20 +7,11 @@ class ImitationMetricsMixin:
     """Agent-vs-expert imitation error metrics used by ``DemoAlgorithm``."""
 
     def _log_expert_imitation_errors(self) -> None:
-        """Direct agent-vs-expert imitation errors over the expert dataset.
+        """Agent-versus-expert error over the whole expert dataset.
 
-        Two metrics, both computed on every expert transition (trajectories are
-        flattened to single ``(state, action)`` pairs):
-
-        * ``imitation/action_rmse`` — RMSE between the expert action and the
-          agent's deterministic action (for SAC, the actor's mode: the
-          continuous analogue of argmax) on the same state.
-        * ``imitation/expert_action_nll`` — mean negative log-likelihood of the
-          expert actions under the agent policy. This is the cross-entropy
-          ``H(expert, agent) = KL(expert || agent) + H(expert)``, i.e. a KL
-          surrogate differing from the true KL only by the expert's entropy
-          (constant w.r.t. the agent). The literal KL is not computable from
-          samples alone because the dataset provides no expert action density.
+        action_rmse compares the expert action with the agent's deterministic one.
+        expert_action_nll is the cross-entropy of the expert actions under the policy,
+        a KL surrogate: the dataset carries no expert action density.
         """
         observations, expert_actions = self._flatten_expert_transitions()
         if len(observations) == 0:
