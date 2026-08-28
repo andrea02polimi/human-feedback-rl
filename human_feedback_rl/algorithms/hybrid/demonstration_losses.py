@@ -20,12 +20,12 @@ VALID_LOSSES = ("demo_1", "demo_2")
 # ---------------------------------------------------------------------------
 
 def demo_1_loss(expert_returns: th.Tensor, model_returns: th.Tensor) -> th.Tensor:
-    """Difference-of-means loss (formerly ``demo``)."""
+    """Difference of means: the experts should score above the rollout."""
     return -expert_returns.mean() + model_returns.mean()
 
 
 def demo_2_loss(expert_returns: th.Tensor, model_returns: th.Tensor) -> th.Tensor:
-    """MaxEnt surrogate with expert+model partition estimate (formerly ``maxent_2``)."""
+    """MaxEnt surrogate, with the partition estimated over experts and rollout."""
     all_returns = th.cat([model_returns, expert_returns], dim=0)
     return -expert_returns.mean() + th.logsumexp(all_returns, dim=0) - np.log(len(all_returns))
 

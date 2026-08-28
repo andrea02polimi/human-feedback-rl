@@ -1,11 +1,6 @@
-"""
-Most general base class for all human-feedback RL algorithms.
+"""The most general base: environment, agent, logger and rng.
 
-Owns the three resources shared across every algorithm family:
-  - environment, agent, logger, rng.
-
-Concrete algorithm families (reward learning, imitation learning, …) inherit
-from this and add their own components on top.
+Algorithm families inherit from this and add their own components on top.
 """
 
 from abc import ABC, abstractmethod

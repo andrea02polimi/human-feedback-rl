@@ -1,10 +1,9 @@
 """Shared base for reward-learning algorithms.
 
 Owns what any reward-learning loop needs: the learned reward model, the
-trajectory generator (rollouts + agent updates on predicted rewards), rollout
-and validation logging, query scheduling, and checkpointing. The concrete
-algorithm (:class:`~human_feedback_rl.algorithms.HybridAlgorithm`) implements
-its ``train()`` loop on top of these utilities.
+trajectory generator that rolls out and trains the agent on predicted rewards,
+rollout logging, the query schedule and checkpointing. HybridAlgorithm builds
+its ``train()`` loop on top.
 """
 
 import os
@@ -40,14 +39,11 @@ QUERY_SCHEDULES: Dict[str, Callable[[float], float]] = {
 # ---------------------------------------------------------------------------
 
 class BaseRewardLearningAlgorithm(BaseAlgorithm):
-    """
-    Shared base for reward-learning algorithms.
+    """Shared base for the reward-learning algorithms.
 
-    Extends ``BaseAlgorithm`` with:
-      * A learned reward model driving the agent's rewards.
-      * A ``TrajectoryGeneratorFromAgent`` for rollouts and agent updates.
-      * Rollout sampling/logging, reward-model validation logging, query
-        scheduling, per-member reward training, and checkpointing.
+    Adds to ``BaseAlgorithm`` a learned reward model, a trajectory generator for
+    rollouts and agent updates, the query schedule, per-member reward training
+    and checkpointing.
 
     Subclasses implement ``train()`` (the outer loop) using these utilities,
     define ``self.optimizers`` (one per reward-model ensemble member), and may

@@ -4,7 +4,7 @@ from human_feedback_rl.common.trajectory_generators import policy_action_log_pro
 
 
 class ImitationMetricsMixin:
-    """Agent-vs-expert imitation error metrics used by ``DemoAlgorithm``."""
+    """How far the agent is from the expert, on the expert states."""
 
     def _log_expert_imitation_errors(self) -> None:
         """Agent-versus-expert error over the whole expert dataset.

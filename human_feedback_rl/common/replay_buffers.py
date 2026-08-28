@@ -30,7 +30,7 @@ class RewardDiagnosticsReplayBuffer(ReplayBuffer):
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        # The model is checkpointed separately and reattached by DemoAlgorithm.
+        # The model is checkpointed separately and reattached by HybridAlgorithm.
         state["reward_model"] = None
         return state
 

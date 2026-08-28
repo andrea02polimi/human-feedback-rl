@@ -13,10 +13,10 @@ from .types import Trajectory, Transition
 # ---------------------------------------------------------------------------
 
 class EnvRewardWrapper(VecEnvWrapper):
-    """
-    VecEnvWrapper that replaces environment rewards with EnsembleRewardModel
-    predictions. Uses the pre-step observation for reward prediction to align
-    with how the reward predictor was trained on (obs_t, a_t) pairs.
+    """Replace the environment reward with what RewardEnsemble predicts.
+
+    The prediction uses the observation from before the step, matching the
+    (obs_t, a_t) pairs the reward model was trained on.
 
     Agent-only reward transformations are owned by ``reward_model.predict``;
     reward-model training uses ``forward`` and remains unaffected.
@@ -191,7 +191,8 @@ class PolicyExplorationWrapper:
         exploration_eps: float,
         rng: np.random.Generator,
     ):
-        """
+        """Wrap a policy so a fraction of its actions are random.
+
         Args:
             venv: vectorized env, used to sample random actions.
             policy: wrapped policy; must be callable and return (actions, state).

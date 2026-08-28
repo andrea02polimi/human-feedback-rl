@@ -39,15 +39,10 @@ class TrajectoryGeneratorFromAgent:
         self.rng = rng if rng is not None else np.random.default_rng()
         self.reward_model    = reward_model
 
-        # The BufferingWrapper records all trajectories, so we can return
-        # them after training. This should come first (before the wrapper that
-        # changes the reward function), so that we return the original environment
-        # rewards.
-        # When applying BufferingWrapper and RewardVecEnvWrapper, we should use `venv`
-        # instead of `agent.get_env()` because SB3 may apply some wrappers to
-        # `agent`'s env under the hood. In particular, in image-based environments,
-        # SB3 may move the image-channel dimension in the observation space, making
-        # `agent.get_env()` not match with `reward_fn`.
+        # EnvBufferingWrapper records the trajectories, and goes first so what it
+        # records are the environment's own rewards rather than predicted ones.
+        # Both wrappers take `venv`, not `agent.get_env()`: SB3 may have wrapped
+        # the agent's env itself, and then the two would not line up.
 
         self._shared_sampling_env = sampling_venv is None
         if self._shared_sampling_env:
