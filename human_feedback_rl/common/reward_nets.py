@@ -263,7 +263,7 @@ def make_reward_ensemble(
     activation_fn: str = None,
     alpha: float = 1,
 ) -> RewardEnsemble:
-    
+
     obs_space = venv.observation_space
     act_space = venv.action_space
 

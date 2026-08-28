@@ -35,8 +35,6 @@ QUERY_SCHEDULES: Dict[str, Callable[[float], float]] = {
 }
 
 
-
-
 # ---------------------------------------------------------------------------
 # Base class
 # ---------------------------------------------------------------------------
@@ -174,7 +172,7 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         This method only adds the aggregated scalars that only the base loop knows.
         """
         t_total = time.perf_counter() - t0
-        
+
         t0 = time.perf_counter()
         self.logger.record("iterations",                  self.iteration)
         self.logger.record("agent/time/total_timesteps",  self.agent.num_timesteps)
@@ -184,11 +182,11 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
 
     def sample_rollout(self, agent_steps: int, exploration_steps: int = 0):
         """Collect trajectories via the trajectory generator."""
-        
+
         t0 = time.perf_counter()
         trajectories = self.trajectory_generator.sample(agent_steps, exploration_steps)
         t_sample_rollout = time.perf_counter() - t0
-        
+
         t0 = time.perf_counter()
         true_rewards  = [traj.total_reward()              for traj in trajectories]
         model_rewards = self._score_trajectories(trajectories)
@@ -240,13 +238,12 @@ class BaseRewardLearningAlgorithm(BaseAlgorithm):
         boundaries = np.cumsum(lengths)[:-1]
         return [float(chunk.sum()) for chunk in np.split(rewards, boundaries)]
 
-
     def train_agent(self, steps: int, log_interval: int) -> None:
         """Train the agent for ``steps`` timesteps via the trajectory generator."""
-        
+
         t0 = time.perf_counter()
         self.trajectory_generator.train(steps=steps, log_interval=log_interval)
         t_train_agent = time.perf_counter() - t0
-        
+
         self.logger.record("time/train_agent", t_train_agent)
 

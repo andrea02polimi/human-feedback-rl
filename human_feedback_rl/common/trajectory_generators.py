@@ -97,7 +97,6 @@ class TrajectoryGeneratorFromAgent:
             **kwargs,
         )
 
-
     def sample(self, agent_steps, exploration_steps = 0) -> Sequence[types.Trajectory]:
         """Collect at least ``agent_steps`` transitions and log rollout metrics."""
         agent_trajs  = self.buffering_wrapper.pop_finished_trajectories()

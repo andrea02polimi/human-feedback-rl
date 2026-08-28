@@ -22,10 +22,9 @@ class Trajectory(List[Transition]):
     def __init__(self, transitions=None):
         super().__init__(list(transitions) if transitions is not None else [])
 
-
     def total_reward(self) -> float:
         return sum(t.true_reward for t in self)
-    
+
     def length(self) -> int:
         return len(self)
 

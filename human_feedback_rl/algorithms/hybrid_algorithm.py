@@ -259,10 +259,6 @@ class HybridAlgorithm(
             seed_seq = np.random.SeedSequence(int(self.rng.integers(0, 2**63)))
         return tuple(np.random.default_rng(s) for s in seed_seq.spawn(3))
 
-    # ------------------------------------------------------------------
-    # Training loop
-    # ------------------------------------------------------------------
-
     def train(
         self,
         total_timesteps: int = 1_000_000,
@@ -343,45 +339,6 @@ class HybridAlgorithm(
                 self.save_checkpoint(checkpoint_dir, iteration + 1)
 
         return self.trajectory_generator.agent
-
-    # ------------------------------------------------------------------
-    # Feedback collection
-    # ------------------------------------------------------------------
-
-
-
-
-
-    # ------------------------------------------------------------------
-    # Reward-model training
-    # ------------------------------------------------------------------
-
-
-
-
-
-    # ------------------------------------------------------------------
-    # Balanced gradient step
-    # ------------------------------------------------------------------
-
-
-    # ------------------------------------------------------------------
-    # Reliability weight (alpha)
-    # ------------------------------------------------------------------
-
-
-
-
-
-
-
-
-    # ------------------------------------------------------------------
-    # Preference loss / diagnostics
-    # ------------------------------------------------------------------
-
-
-
 
     def _refresh_replay_relabel_cache(self) -> None:
         """Relabel the replay buffer once per iteration (the model is frozen during learn).

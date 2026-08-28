@@ -176,7 +176,6 @@ class EnvBufferingWrapper(VecEnvWrapper):
         return obs
 
 
-
 class PolicyExplorationWrapper:
     """Epsilon-greedy exploration wrapper around a policy.
 

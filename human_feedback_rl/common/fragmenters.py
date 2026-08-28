@@ -112,7 +112,7 @@ class RandomPairFragmenter(RandomFragmenter):
         fragment_length: Optional[int],
         num_pairs: int,
     ) -> List[FragmentPair]:
-        
+
         fragments = self._sample_fragments(trajectories, fragment_length, 2 * num_pairs)
 
         pairs = [
@@ -131,7 +131,7 @@ class RandomSingleFragmenter(RandomFragmenter):
         fragment_length: Optional[int],
         num_fragments: int,
     ) -> List[Fragment]:
-        
+
         return self._sample_fragments(trajectories, fragment_length, num_fragments)
 
 
@@ -188,7 +188,7 @@ class HighVariancePairFragmenter(HighVarianceFragmenter):
         fragment_length: Optional[int],
         num_pairs: int,
     ) -> List[FragmentPair]:
-        
+
         candidates = self._sample_fragments(trajectories, fragment_length, self.oversample * 2 * num_pairs)
         fragments  = self._select_high_variance(candidates, 2 * num_pairs)
 
