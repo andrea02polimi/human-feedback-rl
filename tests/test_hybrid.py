@@ -82,7 +82,7 @@ def _run_step(g_pref, g_demo, alpha=None, **shim_kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Fusione prova 1: direzioni unitarie pesate da alpha, un solo Adam
+# Alpha fusion: unit directions weighted by alpha, a single Adam
 # ---------------------------------------------------------------------------
 
 def _unit(v):
@@ -91,25 +91,25 @@ def _unit(v):
 
 
 @pytest.mark.parametrize("alpha", [0.0, 0.25, 0.5, 0.75, 1.0])
-def test_prova1_combina_direzioni_unitarie_con_alpha(alpha):
-    """g_fin = (1-a) * g_p/||g_p|| + a * g_d/||g_d||, passato a UN solo optimizer."""
-    g_pref, g_demo = [3.0, 4.0], [0.0, 2.0]      # norme 5 e 2
+def test_alpha_fusion_combines_unit_directions(alpha):
+    """g_fin = (1-a) * g_p/||g_p|| + a * g_d/||g_d||, into a SINGLE optimizer."""
+    g_pref, g_demo = [3.0, 4.0], [0.0, 2.0]      # norms 5 and 2
     grad, stats = _run_step(g_pref, g_demo, alpha=alpha,
                             gcl_fusion="alpha_norm_single_adam")
-    atteso = (1 - alpha) * _unit(g_pref) + alpha * _unit(g_demo)
-    assert np.allclose(grad, atteso, atol=1e-6)
+    expected = (1 - alpha) * _unit(g_pref) + alpha * _unit(g_demo)
+    assert np.allclose(grad, expected, atol=1e-6)
     assert stats["alpha"] == pytest.approx(alpha)
 
 
-def test_prova1_con_alpha_uno_resta_solo_la_direzione_delle_dimostrazioni():
-    """Il fallback sotto la soglia deve ridursi al canale dimostrazioni."""
+def test_alpha_one_leaves_only_the_demonstration_direction():
+    """The fallback below the threshold must reduce to the demo channel."""
     grad, _ = _run_step([3.0, 4.0], [0.0, 2.0], alpha=1.0,
                         gcl_fusion="alpha_norm_single_adam")
     assert np.allclose(grad, _unit([0.0, 2.0]), atol=1e-6)
 
 
-def test_prova1_butta_via_le_norme_dei_due_canali():
-    """Scalare un canale non cambia l'update: sopravvive solo la direzione."""
+def test_alpha_fusion_discards_the_channel_norms():
+    """Scaling a channel does not change the update: only the direction lives."""
     a, _ = _run_step([3.0, 4.0], [0.0, 2.0], alpha=0.5,
                      gcl_fusion="alpha_norm_single_adam")
     b, _ = _run_step([300.0, 400.0], [0.0, 0.02], alpha=0.5,
@@ -117,18 +117,18 @@ def test_prova1_butta_via_le_norme_dei_due_canali():
     assert np.allclose(a, b, atol=1e-6)
 
 
-def test_prova1_alpha_viene_clampato_in_zero_uno():
+def test_alpha_is_clamped_to_zero_one():
     grad, stats = _run_step([1.0, 0.0], [0.0, 1.0], alpha=5.0,
                             gcl_fusion="alpha_norm_single_adam")
     assert stats["alpha"] == pytest.approx(1.0)
     assert np.allclose(grad, [0.0, 1.0], atol=1e-6)
 
 
-def test_la_fusione_storica_resta_il_default():
-    """Chi non chiede la prova 1 deve avere il comportamento di prima."""
+def test_norm_balance_stays_the_default():
+    """Not asking for the alpha fusion must give the earlier behaviour."""
     grad, stats = _run_step([1.0, 0.0], [0.0, 1.0])
     assert np.isnan(stats["alpha"])
-    assert np.allclose(grad, [1.0, 1.0], atol=1e-6)   # somma bilanciata di norma
+    assert np.allclose(grad, [1.0, 1.0], atol=1e-6)   # norm-balanced sum
 
 
 def test_norm_balanced_sum():
@@ -247,7 +247,7 @@ def test_hybrid_pref_only_arm_trains(rng):
 
 
 # ---------------------------------------------------------------------------
-# alpha dentro un'iterazione vera
+# alpha inside a real iteration
 # ---------------------------------------------------------------------------
 
 def _train_once(algo, n_queries=8):
@@ -256,37 +256,37 @@ def _train_once(algo, n_queries=8):
     algo._train_reward_model()
 
 
-def test_l_iterazione_pubblica_le_quantita_che_formano_alpha(rng):
-    """Contratto di logging: senza queste chiavi il sanity check e' invisibile."""
+def test_an_iteration_publishes_the_quantities_alpha_is_made_of(rng):
+    """Logging contract: without these keys the sanity check is invisible."""
     algo = _hybrid(rng, gcl_fusion="alpha_norm_single_adam", total_queries=12,
                    reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     _train_once(algo, n_queries=12)
-    scritte = {k for k, _ in algo.logger.name_to_value.items()}
-    attese = {
+    written = {k for k, _ in algo.logger.name_to_value.items()}
+    expected = {
         "alpha/V_pref", "alpha/S_pref", "alpha/cv2_pref",
         "alpha/gradmean_norm_sq_pref", "alpha/n_pref", "alpha/batch_pref",
         "alpha/V_demo", "alpha/S_demo", "alpha/cv2_demo",
         "alpha/gradmean_norm_sq_demo", "alpha/n_demo", "alpha/batch_demo",
         "reward/hybrid_alpha", "reward/hybrid_alpha_active",
     }
-    assert attese <= scritte, sorted(attese - scritte)
+    assert expected <= written, sorted(expected - written)
 
 
-def test_le_identita_fra_le_quantita_loggate_tengono(rng):
-    """S = V/B e CV^2 = S/||gbar||^2, come misurate e pubblicate."""
+def test_the_identities_between_the_logged_quantities_hold(rng):
+    """S = V/B and CV^2 = S/||gbar||^2, as measured and as published."""
     algo = _hybrid(rng, gcl_fusion="alpha_norm_single_adam", total_queries=12,
                    reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     _train_once(algo, n_queries=12)
     v = algo.logger.name_to_value
-    for canale in ("pref", "demo"):
-        assert v[f"alpha/S_{canale}"] == pytest.approx(
-            v[f"alpha/V_{canale}"] / v[f"alpha/batch_{canale}"], rel=1e-6)
-        assert v[f"alpha/cv2_{canale}"] == pytest.approx(
-            v[f"alpha/S_{canale}"] / v[f"alpha/gradmean_norm_sq_{canale}"], rel=1e-6)
+    for channel in ("pref", "demo"):
+        assert v[f"alpha/S_{channel}"] == pytest.approx(
+            v[f"alpha/V_{channel}"] / v[f"alpha/batch_{channel}"], rel=1e-6)
+        assert v[f"alpha/cv2_{channel}"] == pytest.approx(
+            v[f"alpha/S_{channel}"] / v[f"alpha/gradmean_norm_sq_{channel}"], rel=1e-6)
 
 
-def test_sotto_la_soglia_alpha_e_uno_e_non_risulta_attivo(rng):
-    """Con pochi confronti il peso e' fissato, e il log lo dichiara."""
+def test_below_the_threshold_alpha_is_one_and_reads_as_inactive(rng):
+    """With few comparisons the weight is pinned, and the log says so."""
     algo = _hybrid(rng, gcl_fusion="alpha_norm_single_adam", total_queries=2,
                    reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     _train_once(algo, n_queries=2)
@@ -295,29 +295,29 @@ def test_sotto_la_soglia_alpha_e_uno_e_non_risulta_attivo(rng):
     assert algo.logger.name_to_value["reward/hybrid_alpha_active"] == pytest.approx(0.0)
 
 
-def test_alpha_weight_e_sola_lettura(rng):
-    """_alpha_weight legge la stima corrente; produrla spetta a _estimate_alpha."""
+def test_alpha_weight_is_read_only(rng):
+    """_alpha_weight reads the current estimate; producing it is _estimate_alpha's job."""
     algo = _hybrid(rng, gcl_fusion="alpha_norm_single_adam",
                    reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     member = algo.reward_model.members[0]
-    assert algo._alpha_weight(member) == 1.0        # nessuna stima ancora
+    assert algo._alpha_weight(member) == 1.0        # no estimate yet
     _train_once(algo, n_queries=12)
     assert 0.0 <= algo._alpha_weight(member) <= 1.0
 
 
-def test_la_stima_non_consuma_l_rng_del_training(rng):
-    """Estrarre il rollout per la stima non deve spostare le estrazioni di training."""
+def test_the_estimate_does_not_consume_the_training_rng(rng):
+    """Drawing the rollout for the estimate must not move the training draws."""
     algo = _hybrid(rng, gcl_fusion="alpha_norm_single_adam", total_queries=12,
                    reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     algo.trajectories = algo.sample_rollout(64)
     algo._collect_feedback(12)
-    prima = algo.rng.bit_generator.state
+    before = algo.rng.bit_generator.state
     algo._estimate_alpha()
-    assert algo.rng.bit_generator.state == prima
+    assert algo.rng.bit_generator.state == before
 
 
-def test_la_fusione_storica_non_stima_alpha(rng):
-    """norm_balance non usa alpha: non deve nemmeno pagarne il costo."""
+def test_norm_balance_does_not_estimate_alpha(rng):
+    """norm_balance does not use alpha, so it should not pay for it either."""
     algo = _hybrid(rng, gcl_fusion="norm_balance", total_queries=12,
                    reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     _train_once(algo, n_queries=12)
@@ -325,8 +325,8 @@ def test_la_fusione_storica_non_stima_alpha(rng):
     assert "alpha/S_demo" not in algo.logger.name_to_value
 
 
-def test_demo_1_non_e_supportato_dalla_stima(rng):
-    """La decomposizione implementata e' quella di demo_2: meglio fallire chiaro."""
+def test_demo_1_is_not_supported_by_the_estimate(rng):
+    """The decomposition implemented is demo_2's: better to fail loudly."""
     algo = _hybrid(rng, gcl_fusion="alpha_norm_single_adam", loss_type="demo_1",
                    total_queries=12, reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     algo.trajectories = algo.sample_rollout(64)
@@ -335,7 +335,7 @@ def test_demo_1_non_e_supportato_dalla_stima(rng):
         algo._estimate_alpha()
 
 
-def test_label_smoothing_solo_per_le_etichette_bernoulliane(rng):
+def test_label_smoothing_only_for_bernoulli_labels(rng):
     algo_b = _hybrid(rng, labels_type="binary_bernoulli", label_smoothing=0.1)
     algo_s = _hybrid(rng, labels_type="soft", label_smoothing=0.1)
     hard = th.tensor([[1.0, 0.0], [0.0, 1.0]])
@@ -343,84 +343,84 @@ def test_label_smoothing_solo_per_le_etichette_bernoulliane(rng):
     assert th.allclose(algo_s._smoothed_labels(hard), hard)
 
 
-def test_gcl_fusion_sconosciuta_viene_rifiutata(rng):
+def test_an_unknown_gcl_fusion_is_rejected(rng):
     with pytest.raises(ValueError, match="gcl_fusion"):
-        _hybrid(rng, gcl_fusion="non_esiste")
+        _hybrid(rng, gcl_fusion="does_not_exist")
 
-# --- il bootstrap serve all'ensemble, non al membro singolo -----------------
-# Un ricampionamento con rimpiazzo di n elementi su n ne contiene in media solo
-# il 63.2% distinti. Con piu' membri e' il prezzo della decorrelazione; con un
-# membro solo e' un terzo dei confronti buttato via a ogni iterazione, mentre
-# il canale dimostrazioni continua a vedere tutto il suo budget.
+# --- the bootstrap serves the ensemble, not the single member ---------------
+# Resampling n items out of n with replacement contains on average only 63.2%
+# distinct ones. With several members that is the price of decorrelation; with
+# a single member it is a third of the comparisons thrown away every iteration,
+# while the demonstration channel keeps seeing its whole budget.
 
 
-def test_con_un_solo_membro_si_usa_tutto_il_dataset(rng):
+def test_with_a_single_member_the_whole_dataset_is_used(rng):
     algo = _hybrid(rng, total_queries=12,
                    reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     _train_once(algo, n_queries=12)
-    vista = algo._training_view(algo.dataset_train)
-    assert vista is algo.dataset_train, "con un membro non si ricampiona"
+    view = algo._training_view(algo.dataset_train)
+    assert view is algo.dataset_train, "a single member does not resample"
 
 
-def test_con_piu_membri_ogni_membro_vede_un_ricampionamento(rng):
+def test_with_several_members_each_sees_its_own_resampling(rng):
     algo = _hybrid(rng, total_queries=12,
                    reward_model_kwargs=dict(n_ensembles=2, net_arch=[8]))
     _train_once(algo, n_queries=12)
     a = algo._training_view(algo.dataset_train)
     b = algo._training_view(algo.dataset_train)
     assert a is not algo.dataset_train and len(a) == len(algo.dataset_train)
-    # due estrazioni indipendenti: e' cio' che decorrela i membri
+    # two independent draws: that is what decorrelates the members
     assert [id(x) for x in a.get_all().fragment_pairs] != \
            [id(x) for x in b.get_all().fragment_pairs]
 
 
-def test_il_membro_singolo_non_perde_confronti(rng):
-    """La proprieta' che conta: nessun confronto raccolto resta inutilizzato."""
+def test_a_single_member_loses_no_comparisons(rng):
+    """The property that matters: no collected comparison goes unused."""
     algo = _hybrid(rng, total_queries=12,
                    reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     _train_once(algo, n_queries=12)
-    vista = algo._training_view(algo.dataset_train)
-    distinti = {id(x) for x in vista.get_all().fragment_pairs}
-    tutti = {id(x) for x in algo.dataset_train.get_all().fragment_pairs}
-    assert distinti == tutti
+    view = algo._training_view(algo.dataset_train)
+    distinct = {id(x) for x in view.get_all().fragment_pairs}
+    everything = {id(x) for x in algo.dataset_train.get_all().fragment_pairs}
+    assert distinct == everything
 
-# --- stream di RNG indipendenti --------------------------------------------
-# Con un unico RNG, ogni estrazione dell'ottimizzazione spostava lo stato di
-# quello che sceglie i frammenti e che estrae le etichette. Due run diverse
-# solo per gradient_steps_rew ricevevano cosi' feedback diverso, e il confronto
-# fra iperparametri misurava anche quale realizzazione era capitata.
+# --- independent RNG streams ------------------------------------------------
+# With a single RNG, every draw made by the optimization moved the state of the
+# one that picks the fragments and samples the labels. Two runs differing only
+# in gradient_steps_rew therefore received different feedback, and comparing
+# hyperparameters also measured which realisation happened to come up.
 
 
-def _feedback_raccolto(gradient_steps_rew):
+def _collected_feedback(gradient_steps_rew):
     algo = _hybrid(np.random.default_rng(0), total_queries=8, initial_queries=2,
                    gradient_steps_rew=gradient_steps_rew,
                    reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     _train_once(algo, n_queries=4)
     batch = algo.dataset_train.get_all()
-    frammenti = [round(float(fp.frag1[0].true_reward), 8) for fp in batch.fragment_pairs]
-    etichette = [(p.pref1, p.pref2) for p in batch.preferences]
-    return frammenti, etichette
+    fragments = [round(float(fp.frag1[0].true_reward), 8) for fp in batch.fragment_pairs]
+    labels = [(p.pref1, p.pref2) for p in batch.preferences]
+    return fragments, labels
 
 
-def test_gli_iperparametri_di_ottimizzazione_non_cambiano_il_feedback():
-    """La proprieta' che rende confrontabili due trial di tuning."""
-    a = _feedback_raccolto(2)
-    b = _feedback_raccolto(9)
-    assert a[0] == b[0], "i frammenti scelti dipendono da gradient_steps_rew"
-    assert a[1] == b[1], "le etichette dipendono da gradient_steps_rew"
+def test_optimization_hyperparameters_do_not_change_the_feedback():
+    """The property that makes two configurations comparable."""
+    a = _collected_feedback(2)
+    b = _collected_feedback(9)
+    assert a[0] == b[0], "the fragments chosen depend on gradient_steps_rew"
+    assert a[1] == b[1], "the labels depend on gradient_steps_rew"
 
 
-def test_gli_stream_sono_distinti_fra_loro():
+def test_the_streams_are_distinct_from_each_other():
     algo = _hybrid(np.random.default_rng(0),
                    reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
-    stream = [algo._rng_query, algo._rng_oracle, algo._rng_train, algo._grad_probe_rng]
-    assert len({id(r) for r in stream}) == 4
-    estratti = [r.integers(0, 2**62) for r in stream]
-    assert len(set(estratti)) == 4
+    streams = [algo._rng_query, algo._rng_oracle, algo._rng_train, algo._grad_probe_rng]
+    assert len({id(r) for r in streams}) == 4
+    drawn = [r.integers(0, 2**62) for r in streams]
+    assert len(set(drawn)) == 4
 
 
-def test_gli_stream_restano_riproducibili_dal_seed():
-    """Indipendenti fra loro, ma deterministici dato run.seed."""
+def test_the_streams_stay_reproducible_from_the_seed():
+    """Independent of each other, but deterministic given run.seed."""
     a = _hybrid(np.random.default_rng(3),
                 reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     b = _hybrid(np.random.default_rng(3),
@@ -428,63 +428,64 @@ def test_gli_stream_restano_riproducibili_dal_seed():
     assert a._rng_query.integers(0, 2**62) == b._rng_query.integers(0, 2**62)
     assert a._rng_oracle.integers(0, 2**62) == b._rng_oracle.integers(0, 2**62)
 
-# --- contatore delle duplicazioni fra confronti -----------------------------
+# --- the counter for duplicated comparisons ---------------------------------
 
 
-def test_il_contatore_delle_duplicazioni_parte_a_zero_e_viene_loggato(rng):
+def test_the_duplicate_counter_starts_at_zero_and_gets_logged(rng):
     algo = _hybrid(rng, total_queries=8, initial_queries=2,
                    reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     _train_once(algo, n_queries=4)
-    for chiave in ("dataset/dup_pairs", "dataset/dup_self_pairs",
-                   "dataset/dup_fragments"):
-        assert chiave in algo.logger.name_to_value, chiave
+    for key in ("dataset/dup_pairs", "dataset/dup_self_pairs",
+                "dataset/dup_fragments"):
+        assert key in algo.logger.name_to_value, key
 
 
-def test_una_coppia_ripetuta_viene_contata(rng):
-    """Se lo stesso confronto rientra, il contatore lo vede."""
+def test_a_repeated_pair_is_counted(rng):
+    """If the same comparison comes back, the counter sees it."""
     algo = _hybrid(rng, total_queries=8, initial_queries=2,
                    reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     _train_once(algo, n_queries=4)
     pairs = algo.dataset_train.get_all().fragment_pairs
-    prima = algo._dup_pairs
-    algo._count_duplicate_comparisons([pairs[0]])       # la stessa coppia, di nuovo
-    assert algo._dup_pairs == prima + 1
+    before = algo._dup_pairs
+    algo._count_duplicate_comparisons([pairs[0]])       # the same pair, again
+    assert algo._dup_pairs == before + 1
 
 
-def test_un_frammento_confrontato_con_se_stesso_viene_contato(rng):
+def test_a_fragment_compared_with_itself_is_counted(rng):
     from human_feedback_rl.common.types import FragmentPair
     algo = _hybrid(rng, total_queries=8, initial_queries=2,
                    reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     _train_once(algo, n_queries=4)
     frag = algo.dataset_train.get_all().fragment_pairs[0].frag1
-    prima = algo._dup_self_pairs
+    before = algo._dup_self_pairs
     algo._count_duplicate_comparisons([FragmentPair(frag1=frag, frag2=frag)])
-    assert algo._dup_self_pairs == prima + 1
+    assert algo._dup_self_pairs == before + 1
 
-def test_il_bootstrap_si_puo_forzare_con_un_membro_solo(rng):
-    """Serve a riprodurre le run storiche: prima era incondizionato."""
+
+def test_the_bootstrap_can_be_forced_with_a_single_member(rng):
+    """For reproducing earlier runs, where it was unconditional."""
     algo = _hybrid(rng, total_queries=12, bootstrap_comparisons=True,
                    reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
     _train_once(algo, n_queries=12)
-    vista = algo._training_view(algo.dataset_train)
-    assert vista is not algo.dataset_train
-    assert len(vista) == len(algo.dataset_train)
+    view = algo._training_view(algo.dataset_train)
+    assert view is not algo.dataset_train
+    assert len(view) == len(algo.dataset_train)
 
 
-def test_il_bootstrap_si_puo_disattivare_con_piu_membri(rng):
+def test_the_bootstrap_can_be_switched_off_with_several_members(rng):
     algo = _hybrid(rng, total_queries=12, bootstrap_comparisons=False,
                    reward_model_kwargs=dict(n_ensembles=2, net_arch=[8]))
     _train_once(algo, n_queries=12)
     assert algo._training_view(algo.dataset_train) is algo.dataset_train
 
 
-def test_senza_indicazione_decide_il_numero_di_membri(rng):
-    uno = _hybrid(rng, total_queries=12,
+def test_left_unset_the_number_of_members_decides(rng):
+    one = _hybrid(rng, total_queries=12,
                   reward_model_kwargs=dict(n_ensembles=1, net_arch=[8]))
-    _train_once(uno, n_queries=12)
-    assert uno._training_view(uno.dataset_train) is uno.dataset_train
-    tre = _hybrid(rng, total_queries=12,
-                  reward_model_kwargs=dict(n_ensembles=3, net_arch=[8]))
-    _train_once(tre, n_queries=12)
-    assert tre._training_view(tre.dataset_train) is not tre.dataset_train
+    _train_once(one, n_queries=12)
+    assert one._training_view(one.dataset_train) is one.dataset_train
+    three = _hybrid(rng, total_queries=12,
+                    reward_model_kwargs=dict(n_ensembles=3, net_arch=[8]))
+    _train_once(three, n_queries=12)
+    assert three._training_view(three.dataset_train) is not three.dataset_train
 

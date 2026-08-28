@@ -122,7 +122,7 @@ class TestPolicyExplorationWrapper:
 
 
 class _CountingVecEnv(FakeVecEnv):
-    """FakeVecEnv che conta i passi davvero eseguiti nell'ambiente."""
+    """FakeVecEnv that counts the steps actually taken in the environment."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -134,17 +134,17 @@ class _CountingVecEnv(FakeVecEnv):
 
 
 class TestRolloutContinuation:
-    """L'episodio lasciato a meta' da SAC non deve sparire.
+    """The episode SAC leaves half done must not disappear.
 
-    Con l'ambiente condiviso ``agent.learn()`` ritorna quasi sempre a meta'
-    episodio, e la parte gia' raccolta vive in ``_partial_trajectories``. Un
-    ``venv.reset()`` la cancellerebbe, e la vecchia guardia non se ne accorgeva
-    perche' guardava solo le traiettorie CONCLUSE -- che ``sample()`` ha appena
-    svuotato con ``pop_finished_trajectories()``.
+    With a shared environment ``agent.learn()`` almost always returns
+    mid-episode, and the part already collected lives in
+    ``_partial_trajectories``. A ``venv.reset()`` would erase it, and the old
+    guard did not notice because it looked only at FINISHED trajectories --
+    which ``sample()`` has just emptied with ``pop_finished_trajectories()``.
     """
 
     class _Fixed:
-        """Politica deterministica; espone action_log_prob per non passare da SB3."""
+        """Deterministic policy; exposes action_log_prob to bypass SB3."""
 
         def predict(self, obs, state=None, episode_start=None, deterministic=False):
             return np.zeros((len(obs), ACT_DIM), dtype=np.float32), None
@@ -153,48 +153,48 @@ class TestRolloutContinuation:
             return np.zeros(len(obs), dtype=np.float32)
 
     def _stepped_env(self, steps, episode_len=10):
-        """Ambiente con un episodio iniziato e NON concluso."""
+        """An environment with an episode started and NOT finished."""
         env = EnvBufferingWrapper(FakeVecEnv(num_envs=1, episode_len=episode_len))
         env.reset()
         for _ in range(steps):
             env.step(np.zeros((1, ACT_DIM), dtype=np.float32))
         return env
 
-    # --- la guardia ---------------------------------------------------------
+    # --- the guard ----------------------------------------------------------
 
-    def test_reset_solleva_se_un_episodio_e_in_corso(self):
-        """Cio' che prima si perdeva in silenzio ora e' un errore esplicito."""
+    def test_reset_raises_if_an_episode_is_in_progress(self):
+        """What used to be lost silently is now an explicit error."""
         env = self._stepped_env(4)
         assert len(env._partial_trajectories[0]) == 4
         with pytest.raises(RuntimeError, match="still in progress"):
             env.reset()
 
-    def test_il_messaggio_dice_quante_transizioni_si_perderebbero(self):
+    def test_the_message_says_how_many_transitions_would_be_lost(self):
         env = self._stepped_env(6)
         with pytest.raises(RuntimeError, match=r"\[6\] transitions"):
             env.reset()
 
-    def test_reset_non_solleva_a_episodi_chiusi(self):
-        """Il percorso dedicato, dove rollout_agent lascia sempre tutto chiuso."""
-        env = self._stepped_env(10)                  # episodio esattamente concluso
+    def test_reset_does_not_raise_with_episodes_closed(self):
+        """The dedicated path, where rollout_agent always leaves all closed."""
+        env = self._stepped_env(10)                  # episode exactly finished
         env.pop_finished_trajectories()
         assert all(len(t) == 0 for t in env._partial_trajectories)
-        env.reset()                                   # non deve sollevare
+        env.reset()                                   # must not raise
 
-    # --- la continuazione ---------------------------------------------------
+    # --- continuation -------------------------------------------------------
 
-    def test_proseguire_conserva_le_transizioni_gia_raccolte(self):
+    def test_continuing_keeps_the_transitions_already_collected(self):
         from human_feedback_rl.common.trajectory_generators import rollout_agent
 
-        env = self._stepped_env(4)                    # 4 passi su 10
+        env = self._stepped_env(4)                    # 4 steps out of 10
         rollout_agent(self._Fixed(), env, steps=1, start_obs=env.venv._obs)
         done = env.pop_finished_trajectories()
-        assert done, "nessuna traiettoria conclusa"
-        # i 4 passi di SAC piu' i 6 necessari a chiudere l'episodio
-        assert len(done[0]) == 10, f"attesi 10 passi, trovati {len(done[0])}"
+        assert done, "no trajectory finished"
+        # SAC's 4 steps plus the 6 needed to close the episode
+        assert len(done[0]) == 10, f"expected 10 steps, found {len(done[0])}"
 
-    def test_da_pulito_il_rollout_resetta_come_prima(self):
-        """Senza start_obs e senza episodi aperti il comportamento non cambia."""
+    def test_from_clean_the_rollout_resets_as_before(self):
+        """With no start_obs and no open episodes, behaviour is unchanged."""
         from human_feedback_rl.common.trajectory_generators import rollout_agent
 
         env = EnvBufferingWrapper(FakeVecEnv(num_envs=1, episode_len=10))
@@ -204,11 +204,11 @@ class TestRolloutContinuation:
 
 
 class TestSampleEndToEnd:
-    """L'invariante che conta: nulla di raccolto viene buttato via.
+    """The invariant that matters: nothing collected is thrown away.
 
-    Non basta provare ``rollout_agent`` in isolamento: il difetto nasceva
-    dall'intreccio fra ``train()``, che lascia un episodio aperto, e
-    ``sample()``, che svuotava le concluse e poi resettava.
+    Testing ``rollout_agent`` in isolation is not enough: the defect came from
+    the interplay between ``train()``, which leaves an episode open, and
+    ``sample()``, which emptied the finished ones and then reset.
     """
 
     def _generator(self, rng, episode_len=10):
@@ -240,14 +240,14 @@ class TestSampleEndToEnd:
 
         trajs = gen.sample(agent_steps=20)
 
-        raccolte = sum(len(t) for t in trajs)
-        aperte_dopo = sum(len(t) for t in gen.buffering_wrapper._partial_trajectories)
-        # ogni passo eseguito nell'ambiente e' o in una traiettoria restituita
-        # o in un episodio ancora aperto: nessuno sparisce
-        assert raccolte + aperte_dopo == env.total_steps
+        collected = sum(len(t) for t in trajs)
+        still_open = sum(len(t) for t in gen.buffering_wrapper._partial_trajectories)
+        # every step taken in the environment is either in a returned trajectory
+        # or in an episode still open: none disappears
+        assert collected + still_open == env.total_steps
 
-    def test_le_traiettorie_restituite_sono_episodi_interi(self, rng):
-        """Niente troncature: demo_2 aggrega per somma, la lunghezza conta."""
+    def test_the_returned_trajectories_are_whole_episodes(self, rng):
+        """No truncation: demo_2 aggregates by sum, so length matters."""
         gen, _ = self._generator(rng)
         gen.train(steps=14, log_interval=100)
         trajs = gen.sample(agent_steps=20)

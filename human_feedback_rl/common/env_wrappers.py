@@ -140,33 +140,33 @@ class EnvBufferingWrapper(VecEnvWrapper):
         return trajectories
 
     def reset(self, **kwargs):
-        """Riparte da capo, verificando che non ci sia nulla da perdere.
+        """Start over, after checking there is nothing to lose.
 
-        Due cose andrebbero perse in silenzio, e la guardia copre entrambe:
+        Two things would be lost silently, and the guard covers both:
 
-        * traiettorie CONCLUSE non ancora lette da ``pop_finished_trajectories``;
-        * un episodio IN CORSO, la cui parte gia' raccolta vive in
+        * FINISHED trajectories not yet read by ``pop_finished_trajectories``;
+        * an episode IN PROGRESS, whose collected part lives in
           ``_partial_trajectories``.
 
-        Il secondo caso e' quello dell'ambiente condiviso: SAC lascia quasi
-        sempre un episodio a meta', e chi legge il buffer ha appena svuotato le
-        concluse, quindi una guardia sulle sole concluse non scatterebbe mai
-        proprio quando servirebbe. Il percorso normale non resetta piu' a
-        episodio aperto (``rollout_agent`` prosegue da ``start_obs``); questa
-        e' la rete che impedisce a un percorso futuro di reintrodurre la
-        perdita senza accorgersene.
+        The second case is the shared-environment one: SAC almost always leaves
+        an episode half done, and whoever reads the buffer has just emptied the
+        finished ones, so a guard on the finished alone would never fire
+        precisely when it is needed. The normal path no longer resets with an
+        episode open (``rollout_agent`` continues from ``start_obs``); this is
+        the net that stops a future path from reintroducing the loss without
+        noticing.
         """
         if self._initialized and self.error_on_premature_reset:
             if len(self._finished_trajectories) > 0:
                 raise RuntimeError(
                     "reset() called before the buffered trajectories were read."
                 )
-            aperti = [i for i, t in enumerate(self._partial_trajectories) if len(t) > 0]
-            if aperti:
-                lunghezze = [len(self._partial_trajectories[i]) for i in aperti]
+            open_envs = [i for i, t in enumerate(self._partial_trajectories) if len(t) > 0]
+            if open_envs:
+                lengths = [len(self._partial_trajectories[i]) for i in open_envs]
                 raise RuntimeError(
                     "reset() called while episodes are still in progress in envs "
-                    f"{aperti} ({lunghezze} transitions would be discarded). "
+                    f"{open_envs} ({lengths} transitions would be discarded). "
                     "Continue the rollout from the current observation instead "
                     "(rollout_agent(..., start_obs=...))."
                 )

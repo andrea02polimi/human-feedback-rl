@@ -42,16 +42,6 @@ class PreferenceGathererFromReward:
         self.temperature = temperature
         self.rng = rng if rng is not None else np.random.default_rng()
 
-    # --- EXTENSION PLACEHOLDER: preference label noise ----------------------
-    # Planned experiment ("rumore sulle preferenze"): corrupt the oracle's
-    # labels on top of the softness model, via a new constructor knob, e.g.
-    # ``label_noise: float = 0.0``:
-    #   * with probability ``label_noise`` swap the pair -> Preference(p2, p1)
-    #     (soft labels) or flip the sampled bit (binary/bernoulli labels).
-    # Keep it a separate knob from ``temperature``: temperature models
-    # annotator *softness*, ``label_noise`` models outright mistakes.
-    # Behaviour with label_noise=0.0 must be bit-for-bit identical to today.
-
     def __call__(self, fragment_pairs: List[FragmentPair]) -> List[Preference]:
         preferences = []
         for p in fragment_pairs:

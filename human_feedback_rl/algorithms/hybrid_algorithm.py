@@ -15,16 +15,16 @@ Two integration mechanisms for the demonstration signal (``demo_mode``):
 * ``"preferences"`` — demonstrations enter as preference pairs (expert
   fragment preferred over agent fragment, Ibarz et al. 2018): a single
   Bradley-Terry objective on mixed batches, no scale conflict by
-  construction. This mode doubles as the LITERATURE HYBRID BASELINE
-  ("demonstrations as implicit preferences") for the thesis comparison —
-  it is fully implemented and tested; to run it as an experiment arm see
-  the ``ibarz`` placeholder in ``scripts/tune_hybrid_sac.py``.
+  construction. This is the literature hybrid baseline ("demonstrations as
+  implicit preferences"). It is implemented and covered by the tests, but it
+  is not one of the configured methods: reaching it takes ``demo_mode`` set
+  explicitly.
 
 Health metrics: with soft oracle labels at high ``pref_temperature`` the BT
-loss sits at its ln(2) cross-entropy floor even when learning succeeds —
-watch ``reward/acc_pref_val`` and ``reward_val/.../pred_true/pearson_*``
+loss sits at its ln(2) cross-entropy floor even when learning succeeds --
+watch ``reward/acc_pref_train`` and ``reward_val/.../pred_true/pearson_*``
 instead. Adam weight decay at 1e-2 overwhelms the BT gradient and collapses
-the reward net (diagnosed 2026-07-05).
+the reward net.
 """
 
 import os
@@ -61,13 +61,13 @@ from human_feedback_rl.common.types import Preference, Trajectory
 
 VALID_DEMO_MODES = ("gcl", "preferences")
 
-# Come i due gradienti diventano un update.
-#   norm_balance            somma bilanciata di norma (ricetta storica)
-#   alpha_norm_single_adam  direzioni unitarie combinate con alpha, UN solo Adam
+# How the two gradients become one update.
+#   norm_balance            norm-balanced sum
+#   alpha_norm_single_adam  unit directions combined by alpha, a SINGLE Adam
 VALID_GCL_FUSIONS = ("norm_balance", "alpha_norm_single_adam")
 
-# Sotto questo numero di confronti distinti la dispersione delle preferenze non
-# e' stimabile: alpha resta fissato a 1 (tutto il peso alle dimostrazioni).
+# Below this many comparisons the preference dispersion cannot be estimated:
+# alpha stays pinned to 1, that is, all the weight on the demonstrations.
 ALPHA_MIN_PREFS = 5
 
 
@@ -217,39 +217,26 @@ class HybridAlgorithm(
 
         self.demo_mode = demo_mode
         self.demo_weight = float(demo_weight)
-        # --- EXTENSION PLACEHOLDER: learned demo_weight via Adam ------------
-        # Planned (phase 5, first tested on hybrid + soft preferences): make
-        # the demo/preference balance a learnable parameter instead of a fixed
-        # hyperparameter. Sketch (disabled until implemented):
-        #   self.log_demo_weight = th.nn.Parameter(
-        #       th.tensor(math.log(self.demo_weight)))       # log-space -> w>0
-        #   self.demo_weight_optimizer = th.optim.Adam(
-        #       [self.log_demo_weight], lr=demo_weight_lr)   # new kwarg
-        # The weight used in ``_reward_step`` then becomes
-        # ``exp(self.log_demo_weight)`` and is updated once per reward-model
-        # step (see the twin placeholder in ``_reward_step``). With the
-        # feature off, behaviour must stay identical to the constant weight.
-        # Design notes: docs/extensions-roadmap.md.
         self.max_balance_scale = float(max_balance_scale)
         self.balance_eps = float(balance_eps)
         self.gcl_fusion = gcl_fusion
         self.alpha_eps = float(alpha_eps)
         self.label_smoothing = float(label_smoothing)
-        # None = decide il numero di membri (il bootstrap serve a
-        # decorrelarli). True/False forzano, e servono a riprodurre una
-        # configurazione storica: prima il ricampionamento era
-        # incondizionato, quindi le run a un membro solo lo avevano.
+        # None lets the number of members decide (the bootstrap is there to
+        # decorrelate them). True/False force it, and exist to reproduce an
+        # earlier configuration: resampling used to be unconditional, so
+        # single-member runs had it too.
         self.bootstrap_comparisons = bootstrap_comparisons
         self.labels_type = labels_type
-        # Stima di alpha dell'iterazione corrente, una per membro (id -> AlphaEstimate).
+        # This iteration's alpha, one per member (id -> AlphaEstimate).
         self._alpha_current = {}
-        # RNG separato per le diagnostiche: estrarre il rollout per la stima non
-        # deve consumare lo stato di quello usato dal training.
+        # Separate RNG for the diagnostics: drawing the rollout for the
+        # estimate must not consume the state the training draws from.
         self._grad_probe_rng = np.random.default_rng(12345)
         self._rng_query, self._rng_oracle, self._rng_train = self._split_rng()
-        # Contatori diagnostici delle duplicazioni fra confronti (vedi
-        # _count_duplicate_comparisons): la soglia conta elementi, non
-        # confronti distinti, e questo dice di quanto le due cose divergono.
+        # Diagnostic counters for duplicated comparisons (see
+        # _count_duplicate_comparisons): the threshold counts stored items, not
+        # distinct comparisons, and this says how far the two drift apart.
         self._seen_pairs = set()
         self._seen_fragments = set()
         self._dup_pairs = 0
@@ -277,27 +264,26 @@ class HybridAlgorithm(
             queue_size=comparison_queue_size, rng=self._rng_train)
 
     def _split_rng(self):
-        """Tre stream indipendenti, derivati dal seed master.
+        """Three independent streams, derived from the master seed.
 
-        Con un solo RNG condiviso, ogni estrazione fatta dall'ottimizzazione
-        sposta lo stato di quello che sceglie i frammenti e che estrae le
-        etichette Bernoulli. Due run che differiscono SOLO per
-        ``gradient_steps_rew`` finivano cosi' per ricevere feedback diverso:
-        misurato su una run breve, 10 confronti su 12 cambiavano (i due
-        coincidenti erano quelli del bootstrap, estratti prima del primo passo
-        di gradiente). Un confronto fra iperparametri mescolava quindi la loro
-        qualita' con quale realizzazione di confronti era capitata -- e
-        ``gradient_steps_rew`` e' proprio uno dei parametri tarati.
+        With a single shared RNG, every draw made by the optimization moves the
+        state of the one that picks the fragments and samples the Bernoulli
+        labels. Two runs differing ONLY in ``gradient_steps_rew`` therefore
+        received different feedback: measured on a short run, 10 comparisons
+        out of 12 changed (the two that matched were the bootstrap ones, drawn
+        before the first gradient step). A comparison between hyperparameters
+        thus mixed their quality with which realisation of comparisons happened
+        to come up -- and ``gradient_steps_rew`` is one of the tuned ones.
 
-        Gli stream restano deterministici e riproducibili perche' nascono dal
-        ``SeedSequence`` del seed master: stesso ``run.seed``, stessi flussi.
+        The streams stay deterministic and reproducible because they are spawned
+        from the master seed's ``SeedSequence``: same ``run.seed``, same streams.
 
-        * ``query``  -- scelta dei frammenti da confrontare
-        * ``oracle`` -- etichette dell'oracolo, estrazioni Bernoulli comprese
-        * ``train``  -- minibatch di preferenze e dimostrazioni, bootstrap
+        * ``query``  -- which fragments get compared
+        * ``oracle`` -- oracle labels, Bernoulli draws included
+        * ``train``  -- preference and demonstration minibatches, bootstrap
         """
         seed_seq = getattr(self.rng.bit_generator, "seed_seq", None)
-        if seed_seq is None:      # Generator costruito senza SeedSequence
+        if seed_seq is None:      # Generator built without a SeedSequence
             seed_seq = np.random.SeedSequence(int(self.rng.integers(0, 2**63)))
         return tuple(np.random.default_rng(s) for s in seed_seq.spawn(3))
 
@@ -321,11 +307,10 @@ class HybridAlgorithm(
             raise ValueError("scatter_interval must be non-negative.")
 
         n_iterations = int(total_timesteps / timesteps_per_iteration)
-        # Il budget di query sta con i suoi fratelli (initial_queries,
-        # query_schedule) fra i kwargs dell'algoritmo. Prima era anche un
-        # parametro di train(), che quando presente vinceva in silenzio: due
-        # posti per lo stesso numero, e nessun modo di accorgersi di averne
-        # impostato solo uno.
+        # The query budget sits with its siblings (initial_queries,
+        # query_schedule) among the algorithm kwargs. It used to be a train()
+        # parameter as well, which quietly won when passed: two places for one
+        # number, and no way to notice you had set only one.
         schedule = self.build_query_schedule(n_iterations, self.total_queries)
         self._n_training_iterations = n_iterations
 
@@ -410,25 +395,25 @@ class HybridAlgorithm(
         self._count_duplicate_comparisons(fragments)
 
     def _count_duplicate_comparisons(self, pairs) -> None:
-        """Misura quanto la soglia sui confronti sovrastima quelli distinti.
+        """Measures how far the comparison threshold overstates distinct ones.
 
-        Il fragmenter estrae con rimpiazzo e non deduplica, quindi ``n_pref``
-        conta elementi memorizzati, non confronti distinti. In teoria una
-        coppia puo' ripetersi, un frammento puo' finire in due confronti, o una
-        coppia puo' confrontare un frammento con se stesso.
+        The fragmenter draws with replacement and does not deduplicate, so
+        ``n_pref`` counts stored items, not distinct comparisons. In principle a
+        pair can repeat, a fragment can land in two comparisons, or a pair can
+        compare a fragment with itself.
 
-        In pratica dovrebbe non accadere quasi mai: query fatte in iterazioni
-        diverse pescano da pool DISGIUNTI, perche' ``pop_finished_trajectories``
-        svuota il buffer, quindi solo le query della stessa iterazione possono
-        collidere. Il conto atteso e' sotto 0.01 per run a B=10 e B=100, e
-        circa 1.8 a B=1000. Questo contatore serve a sostituire quella stima
-        con una misura, senza toccare il campionamento.
+        In practice it should almost never happen: queries made in different
+        iterations draw from DISJOINT pools, because ``pop_finished_trajectories``
+        empties the buffer, so only queries from the same iteration can collide.
+        The expected count is below 0.01 per run at B=10 and B=100, and about
+        1.8 at B=1000. This counter replaces that estimate with a measurement,
+        without touching the sampling.
 
-        La firma e' sul CONTENUTO e non su ``id()``: gli oggetti Transition
-        restano vivi finche' il dataset li referenzia, ma un'identita' riusata
-        darebbe un falso positivo silenzioso.
+        The signature is over CONTENT rather than ``id()``: Transition objects
+        stay alive while the dataset references them, but a reused identity
+        would give a silent false positive.
         """
-        def firma(frag):
+        def signature(frag):
             return tuple(
                 (t.observation.tobytes(), np.asarray(t.action).tobytes(),
                  float(t.true_reward))
@@ -436,14 +421,14 @@ class HybridAlgorithm(
             )
 
         for pair in pairs:
-            f1, f2 = firma(pair.frag1), firma(pair.frag2)
+            f1, f2 = signature(pair.frag1), signature(pair.frag2)
             if f1 == f2:
                 self._dup_self_pairs += 1
-            coppia = (f1, f2) if f1 <= f2 else (f2, f1)
-            if coppia in self._seen_pairs:
+            pair_key = (f1, f2) if f1 <= f2 else (f2, f1)
+            if pair_key in self._seen_pairs:
                 self._dup_pairs += 1
             else:
-                self._seen_pairs.add(coppia)
+                self._seen_pairs.add(pair_key)
             for f in (f1, f2):
                 if f in self._seen_fragments:
                     self._dup_fragments += 1
@@ -489,27 +474,27 @@ class HybridAlgorithm(
             self._train_reward_model_gcl()
 
     def _training_view(self, dataset):
-        """Il dataset da cui pescare i minibatch di questa iterazione.
+        """The dataset this iteration draws its minibatches from.
 
-        Il bootstrap esiste per decorrelare i membri dell'ensemble: ognuno vede
-        un ricampionamento diverso. Con UN SOLO membro non c'e' nulla da
-        decorrelare, e un ricampionamento con rimpiazzo di n elementi su n ne
-        contiene in media solo il 63.2% distinti. Si butterebbe oltre un terzo
-        dei confronti raccolti a ogni iterazione senza alcun beneficio: a B=10
-        significa allenarsi su ~6 confronti invece di 10, mentre il canale
-        dimostrazioni vede sempre tutto il suo budget (``_sample_trajectories``
-        estrae SENZA rimpiazzo).
+        The bootstrap exists to decorrelate the ensemble members: each sees a
+        different resampling. With a SINGLE member there is nothing to
+        decorrelate, and resampling n items out of n with replacement contains
+        on average only 63.2% distinct ones. Over a third of the comparisons
+        collected would be thrown away every iteration for no benefit: at B=10
+        that means training on ~6 comparisons instead of 10, while the
+        demonstration channel always sees its whole budget
+        (``_sample_trajectories`` draws WITHOUT replacement).
 
-        Toglierlo rende anche coerente la stima di alpha, che misura la
-        dispersione sul dataset INTERO mentre il gradiente veniva calcolato sul
-        bootstrap: alpha sottostimava il rumore del canale preferenze, quindi
-        dava alle preferenze piu' peso di quanto ne meritassero.
+        Dropping it also makes the alpha estimate coherent: it measures the
+        dispersion over the WHOLE dataset while the gradient was computed on
+        the bootstrap, so alpha underestimated the noise of the preference
+        channel and gave preferences more weight than they deserved.
         """
         if self.bootstrap_comparisons is None:
-            usa = len(self.reward_model.members) > 1
+            resample = len(self.reward_model.members) > 1
         else:
-            usa = bool(self.bootstrap_comparisons)
-        return dataset.bootstrap() if usa else dataset
+            resample = bool(self.bootstrap_comparisons)
+        return dataset.bootstrap() if resample else dataset
 
     def _train_reward_model_gcl(self) -> None:
         """BT + GCL on the shared net with norm-balanced gradient fusion.
@@ -524,15 +509,15 @@ class HybridAlgorithm(
             return
 
         self.logger.record("reward/demo_weight", demo_weight, exclude="stdout")
-        # Prima di qualunque passo: il peso deve descrivere questo theta.
+        # Before any step: the weight has to describe this theta.
         self._estimate_alpha()
         t0 = time.perf_counter()
 
         def member_step(member, optimizer):
             member.train()
             boot_dataset = self._training_view(self.dataset_train) if has_prefs else None
-            # Un alpha per membro per tutta l'iterazione, stimato sopra su
-            # questi stessi parametri.
+            # One alpha per member for the whole iteration, estimated above
+            # at these same parameters.
             alpha = self._alpha_weight(member)
             stats = []
             for _ in range(self.gradient_steps_rew):
@@ -651,11 +636,10 @@ class HybridAlgorithm(
         demo_norm = float(flat_demo.norm())
 
         if self.gcl_fusion == "alpha_norm_single_adam":
-            # g_fin = (1 - a) * g_p/||g_p|| + a * g_d/||g_d||, poi UN solo Adam.
-            # Le norme dei due canali vengono buttate via di proposito:
-            # sopravvive solo la direzione, ed e' per questo che alpha deve
-            # essere adimensionale (da qui la normalizzazione per ||g||^2 in
-            # CV^2).
+            # g_fin = (1 - a) * g_p/||g_p|| + a * g_d/||g_d||, then a SINGLE
+            # Adam. The two channel norms are discarded on purpose: only the
+            # direction survives, which is why alpha has to be dimensionless
+            # (hence dividing by ||g||^2 in CV^2).
             if alpha is None:
                 alpha = self._alpha_weight(member)
             alpha = float(np.clip(alpha, 0.0, 1.0))
@@ -676,16 +660,6 @@ class HybridAlgorithm(
             self.demo_weight * pref_norm / (demo_norm + self.balance_eps),
             self.max_balance_scale,
         )
-        # --- EXTENSION PLACEHOLDER: learned demo_weight via Adam ------------
-        # With the learnable weight enabled (see __init__), this becomes:
-        #   demo_weight = float(th.exp(self.log_demo_weight))
-        #   scale = min(demo_weight * pref_norm / (demo_norm + eps), max_scale)
-        # and, after ``optimizer.step()`` below, the weight takes its own Adam
-        # step on a validation signal — e.g. the Bradley-Terry loss of the
-        # updated member on a held-out preference batch
-        # (a held-out preference batch, when one is available), with the
-        # gradient wrt log_demo_weight obtained by differentiating through the
-        # mixing coefficient (unrolled one-step or finite differences).
 
         for p, gp, gd in zip(params, g_pref, g_demo):
             if gp is None and gd is None:
@@ -709,22 +683,22 @@ class HybridAlgorithm(
         return stats
 
     # ------------------------------------------------------------------
-    # Peso di affidabilita' (alpha)
+    # Reliability weight (alpha)
     # ------------------------------------------------------------------
 
     def _alpha_weight(self, member) -> float:
-        """Peso sul canale dimostrazioni per l'iterazione corrente.
+        """Weight on the demonstration channel for the current iteration.
 
-        Sola lettura: il valore lo produce ``_estimate_alpha``, che gira una
-        volta all'inizio del training del reward sui parametri dove il peso
-        verra' applicato. Fallback a 1 (sole dimostrazioni) quando non esiste
-        una stima per questo membro.
+        Read-only: the value comes from ``_estimate_alpha``, which runs once at
+        the start of reward training, at the parameters where the weight will
+        be applied. Falls back to 1 (demonstrations only) when there is no
+        estimate for this member.
         """
         estimate = self._alpha_current.get(id(member))
         return 1.0 if estimate is None else estimate.alpha
 
     def _alpha_is_active(self) -> bool:
-        """True quando alpha e' stimato e non fissato al fallback."""
+        """True when alpha is estimated rather than pinned to the fallback."""
         estimates = [
             self._alpha_current.get(id(member)) for member in self.reward_model.members
         ]
@@ -732,26 +706,25 @@ class HybridAlgorithm(
         return bool(present) and all(not e.pinned for e in present)
 
     def _estimate_alpha(self) -> None:
-        """Stima l'alpha di questa iterazione, PRIMA di ogni passo di gradiente.
+        """Estimate this iteration's alpha, BEFORE any gradient step.
 
-        Il momento conta: il peso dice quanto e' rumoroso il gradiente di ogni
-        canale IN UN PUNTO DEI PARAMETRI, quindi va misurato dove viene usato.
-        Misurarlo dopo l'update e applicarlo all'iterazione successiva
-        significherebbe descrivere un punto diverso. Alla prima chiamata theta
-        e' l'inizializzazione random: e' una misura legittima, e li' N_p e'
-        quasi sempre sotto la soglia, quindi alpha resta fissato a 1.
+        The timing matters: the weight says how noisy each channel's gradient is
+        AT A POINT IN PARAMETER SPACE, so it has to be measured where it is
+        used. Measuring it after the update and applying it to the next
+        iteration would describe a different point. On the first call theta is
+        the random initialisation: that is a legitimate measurement, and there
+        N_p is almost always below the threshold, so alpha stays pinned to 1.
 
-        Il rollout che serve alla loss dimostrazioni e' estratto UNA volta e
-        condiviso da tutti i campioni: non e' feedback, quindi il suo rumore di
-        campionamento non deve finire nella varianza del canale. Viene estratto
-        dall'RNG delle diagnostiche, cosi' la stima non perturba mai le
-        estrazioni del training.
+        The rollout the demonstration loss needs is drawn ONCE and shared by
+        every sample: it is not feedback, so its sampling noise must not end up
+        in the channel's variance. It is drawn from the diagnostics RNG, so the
+        estimate never perturbs the training draws.
         """
         if self.gcl_fusion == "norm_balance":
-            return                       # quella fusione non usa alpha
+            return                       # that fusion does not use alpha
         self._alpha_current = {}
         if self.demo_weight <= 0.0 or not self.trajectories:
-            return                       # canale dimostrazioni assente
+            return                       # no demonstration channel
         if self.loss_type != "demo_2":
             raise NotImplementedError(
                 "alpha estimation implements the demo_2 per-sample "
@@ -790,11 +763,10 @@ class HybridAlgorithm(
         self._log_alpha_estimate()
 
     def _log_alpha_estimate(self) -> None:
-        """Pubblica le due dispersioni che formano alpha, e i loro ingredienti.
+        """Publish the two dispersions that make up alpha, and their parts.
 
-        ``alpha/S_*`` e' il sanity check: e' la varianza del gradiente che
-        l'ottimizzatore applica davvero, quindi deve calare al crescere del
-        budget.
+        ``alpha/S_*`` is the sanity check: it is the variance of the gradient
+        the optimizer actually applies, so it has to fall as the budget grows.
         """
         estimates = [
             self._alpha_current.get(id(member)) for member in self.reward_model.members
@@ -833,7 +805,7 @@ class HybridAlgorithm(
 
     @staticmethod
     def _set_flat_grad(params, direction: th.Tensor) -> None:
-        """Scrive un vettore piatto sui ``.grad`` cosi' che ``step()`` lo usi."""
+        """Write a flat vector into the ``.grad`` fields for ``step()``."""
         offset = 0
         for p in params:
             k = p.numel()
@@ -889,21 +861,21 @@ class HybridAlgorithm(
         return preference_nll(bradley_terry_probs(r1, r2), labels)
 
     def _smoothed_labels(self, labels: th.Tensor) -> th.Tensor:
-        """Sposta le etichette verso 1/2 di ``label_smoothing``.
+        """Move the labels ``label_smoothing`` of the way towards 1/2.
 
-        Serve solo alle etichette binarie campionate: la cross-entropy contro un
-        target in {0, 1} ha minimo in Delta = +-inf, quindi con pochi confronti
-        il modello li separa arbitrariamente e li memorizza. Con target
-        y' = (1-eps) y + eps/2 il minimo torna finito, Delta* = logit(y'), e la
-        loss ha di nuovo un pavimento H(y') > 0.
+        Only sampled binary labels need it: cross-entropy against a target in
+        {0, 1} has its minimum at Delta = +-inf, so with few comparisons the
+        model separates them arbitrarily and memorises them. With the target
+        y' = (1-eps) y + eps/2 the minimum is finite again, Delta* = logit(y'),
+        and the loss has a floor H(y') > 0 once more.
 
-        Le etichette ``soft`` sono gia' probabilita' dell'oracolo: hanno un
-        ottimo finito e un pavimento loro, e spostarle introdurrebbe un bias
-        senza correggere nulla. Restano intatte.
+        ``soft`` labels are already oracle probabilities: they have a finite
+        optimum and a floor of their own, and moving them would introduce a bias
+        while correcting nothing. They are left alone.
 
-        Applicato qui e non alla generazione (``gatherers.py``) di proposito: il
-        dataset conserva le etichette vere, quindi le diagnostiche restano
-        calcolate sul target grezzo.
+        Applied here rather than at generation time (``gatherers.py``) on
+        purpose: the dataset keeps the true labels, so the diagnostics stay
+        computed on the raw target.
         """
         if self.label_smoothing <= 0.0 or self.labels_type != "binary_bernoulli":
             return labels
@@ -913,10 +885,10 @@ class HybridAlgorithm(
     def _log_preference_diagnostics(self) -> None:
         """Fit diagnostics on the training comparisons.
 
-        Non c'e' piu' un validation set: il budget di feedback e' la risorsa
-        scarsa dello studio, e tenerne da parte una quota la sottraeva
-        all'addestramento senza che nessuna decisione dipendesse davvero da
-        quella misura. Le chiavi ``*_val`` spariscono di conseguenza.
+        There is no validation set: feedback is the scarce resource here, and
+        holding a share of it back took it away from training while no decision
+        really depended on that measurement. The ``*_val`` keys disappear with
+        it.
         """
         if not len(self.dataset_train):
             return

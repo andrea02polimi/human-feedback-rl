@@ -113,8 +113,8 @@ class TrajectoryGeneratorFromAgent:
                 venv=self.sampling_venv,
                 steps=agent_steps - avail_steps,
                 deterministic_policy=False,
-                # col nostro env condiviso si riprende da dove SAC si e'
-                # fermato, invece di resettare e perdere l'episodio in corso
+                # with the shared env, resume where SAC stopped instead of
+                # resetting and losing the episode in progress
                 **self._continuation_kwargs(),
             )
             if self._shared_sampling_env:
@@ -142,13 +142,13 @@ class TrajectoryGeneratorFromAgent:
         return trajectories
 
     def _continuation_kwargs(self) -> dict:
-        """Da dove far ripartire il rollout.
+        """Where the rollout should start from.
 
-        Vuoto (quindi reset) con l'ambiente dedicato, dove nessun altro tocca
-        l'env e ``rollout_agent`` lascia sempre gli episodi chiusi. Vuoto anche
-        alla primissima chiamata in modalita' condivisa, quando SAC non ha
-        ancora un ``_last_obs``: li' il reset e' corretto e non c'e' nulla da
-        perdere.
+        Empty (so, a reset) with a dedicated environment, where nobody else
+        touches the env and ``rollout_agent`` always leaves episodes closed.
+        Empty also on the very first call in shared mode, when SAC has no
+        ``_last_obs`` yet: there the reset is correct and there is nothing to
+        lose.
         """
         if not self._shared_sampling_env:
             return {}
@@ -191,22 +191,22 @@ def rollout_agent(
     start_obs: Optional[np.ndarray] = None,
     start_episode_starts: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Raccoglie almeno ``steps`` transizioni, chiudendo gli episodi aperti.
+    """Collect at least ``steps`` transitions, closing the open episodes.
 
-    ``start_obs`` serve all'ambiente CONDIVISO. Li' l'env e' lo stesso su cui
-    gira SAC, e ``agent.learn()`` ritorna quasi sempre a meta' episodio: un
-    ``venv.reset()`` troncherebbe quell'episodio e la sua parte gia' raccolta,
-    che il wrapper tiene in ``_partial_trajectories``, verrebbe buttata via in
-    silenzio. Ripartendo dall'osservazione corrente l'episodio prosegue e si
-    chiude da solo, quindi entra nel pool come traiettoria COMPLETA.
+    ``start_obs`` is for the SHARED environment. There the env is the same one
+    SAC runs on, and ``agent.learn()`` almost always returns mid-episode: a
+    ``venv.reset()`` would truncate that episode, and the part already
+    collected -- which the wrapper holds in ``_partial_trajectories`` -- would
+    be thrown away silently. Resuming from the current observation lets the
+    episode finish on its own, so it enters the pool COMPLETE.
 
-    Conservarla invece come traiettoria troncata sarebbe peggio: ``demo_2``
-    aggrega i return per SOMMA, quindi una traiettoria piu' corta avrebbe un
-    return piu' basso solo perche' e' piu' corta, e la partizione -- dove gli
-    esperti prendono gia' il 95-99% della massa -- degenererebbe ancora.
+    Keeping it as a truncated trajectory would be worse: ``demo_2`` aggregates
+    returns by SUM, so a shorter trajectory would have a lower return merely
+    for being shorter, and the partition -- where the experts already take
+    95-99% of the mass -- would degenerate further.
 
-    Senza ``start_obs`` si resetta come prima: e' il caso dell'ambiente
-    dedicato, e del bootstrap, quando l'agente non ha ancora uno stato.
+    Without ``start_obs`` it resets as before: the dedicated-environment case,
+    and the bootstrap, when the agent has no state yet.
     """
     if start_obs is None:
         obs = venv.reset()

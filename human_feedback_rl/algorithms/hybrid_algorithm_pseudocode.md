@@ -1,134 +1,169 @@
-# HybridAlgorithm — pseudocodice
+# HybridAlgorithm — pseudocode
 
-Apprendimento di UNA reward net da dimostrazioni + preferenze. È l'unico
-algoritmo del package: con `demo_weight=0` degenera nel baseline solo-preferenze,
-con `total_queries=0` nel baseline solo-dimostrazioni.
-Due meccanismi (`demo_mode`):
-  - `"gcl"`         : loss demo (`demo_1` differenza di medie | `demo_2` surrogato
-                      MaxEnt) + loss Bradley-Terry sulle preferenze,
-                      fuse sulla STESSA rete con bilanciamento di norma dei gradienti.
-  - `"preferences"` : le demo diventano coppie di preferenza (expert ≻ agent),
-                      unico obiettivo BT su batch misti (nessun conflitto di scala).
+Learning ONE reward net from demonstrations and preferences. It is the only
+algorithm in the package: with `demo_weight=0` it degenerates into the
+preference-only baseline, with `total_queries=0` into the demonstration-only
+one.
+
+Two ways of taking in the demonstration signal (`demo_mode`):
+
+- `"gcl"` — the demo loss (`demo_1`, difference of means, or `demo_2`, MaxEnt
+  surrogate) and the Bradley-Terry preference loss are fused on the SAME
+  network. How they are fused is `gcl_fusion`.
+- `"preferences"` — the demonstrations become preference pairs (expert ≻
+  agent): a single BT objective over mixed batches, so no scale conflict by
+  construction. This is the literature hybrid (Ibarz et al. 2018).
 
 ```text
 ────────────────────────────────────────────────────────────────────
 INIT(...)
-  valida gli iperparametri (batch_size_pref>0, train_frac∈(0,1),
-      demo_weight≥0, pref_temperature>0, demo_mode∈{gcl,preferences}, ...)
-  super().__init__(...)                      # DemoAlgorithm: reward net, IRL loss, agente
-  salva parametri (demo_mode, demo_weight, max_balance_scale, balance_eps,
-      frazioni batch demo/pref)
-  crea:
-      fragmenter (a coppie)
-      preference_gatherer  (oracolo soft, con pref_temperature propria)
-      dataset_train / dataset_val                 # preferenze oracolo
-      dataset_demo_prefs_train / _val             # coppie expert-vs-agent (solo mode "preferences")
+  validate the hyperparameters (batch_size_pref>0, demo_weight≥0,
+      pref_temperature>0, demo_mode ∈ {gcl, preferences},
+      gcl_fusion ∈ {norm_balance, alpha_norm_single_adam}, ...)
+  super().__init__(...)              # reward net, IRL loss, agent
+  split the master seed into four independent streams:
+      query   -- which fragments get compared
+      oracle  -- oracle labels, Bernoulli draws included
+      train   -- preference and demonstration minibatches, bootstrap
+      probe   -- the rollout the alpha estimate needs
+  build:
+      fragmenter (pairs)             random, or active on ensemble disagreement
+      preference_gatherer            synthetic oracle, own pref_temperature
+      dataset_train                  oracle preferences
+      dataset_demo_prefs_train       expert-vs-agent pairs (mode "preferences")
 
 ────────────────────────────────────────────────────────────────────
 TRAIN(total_timesteps, timesteps_per_iteration, ...):
   n_iterations = total_timesteps / timesteps_per_iteration
-  schedule = build_query_schedule(n_iterations, query_budget)   # #query per iterazione
+  schedule = build_query_schedule(n_iterations, total_queries)
 
-  SE initial_agent_timesteps > 0:                 # bootstrap opzionale
-      raccogli transizioni bootstrap → colleziona feedback iniziale
-      allena reward model (bootstrap) → normalizza reward → rinfresca cache replay
-      pre-allena l'agente sulla reward appresa
+  IF initial_agent_timesteps > 0:                  # optional bootstrap
+      collect bootstrap transitions -> _collect_feedback(initial_queries)
+      subtract those queries from the first slot of the schedule
+      train the reward model -> normalize -> refresh the replay cache
+      pre-warm the agent on the learned reward
 
-  PER ogni (iteration, num_queries) nello schedule:
-      raccogli rollout dell'agente (+ transizioni di esplorazione)
+  FOR each (iteration, num_queries) in the schedule:
+      collect the agent rollout (+ exploration transitions)
       _collect_feedback(num_queries)
-      logga errori di imitazione + snapshot validazione "pre_update"
+      log imitation errors and the "pre_update" validation snapshot
 
-      _train_reward_model()                        # cuore ibrido
-      normalizza reward agente
-      logga snapshot "post_update", returns, staleness replay
-      (periodicamente) logga scatter return predetti vs veri
+      _train_reward_model()                        # the hybrid core
+      normalize the agent-facing reward
+      log "post_update", outcome returns, replay staleness
+      (periodically) log predicted-vs-true return scatter
 
-      rinfresca cache di relabel del replay
-      train_agent(timesteps_per_iteration)         # RL sulla reward corrente
-      logga iterazione; salva checkpoint ogni checkpoint_interval
-  RITORNA l'agente allenato
+      refresh the replay relabelling cache
+      train_agent(timesteps_per_iteration)         # RL on the current reward
+      log the iteration; checkpoint every checkpoint_interval
+  RETURN the trained agent
 
 ────────────────────────────────────────────────────────────────────
 _collect_feedback(num_queries):
-  _collect_preference_feedback(num_queries)        # coppie oracolo etichettate
-  SE demo_mode == "preferences":
+  _collect_preference_feedback(num_queries)
+  IF demo_mode == "preferences":
       _collect_demo_preference_pairs(demo_pref_pairs_per_iteration)
 
 _collect_preference_feedback(num_queries):
-  SE num_queries ≤ 0: return
-  fragments = fragmenter(trajectories, len, num_queries)
-  preferences = preference_gatherer(fragments)     # etichette oracolo soft
-  push_split → dataset_train / dataset_val
+  IF num_queries ≤ 0: return
+  fragments   = fragmenter(trajectories, fragment_length, num_queries)
+  preferences = preference_gatherer(fragments)     # oracle labels
+  dataset_train.push(fragments, preferences)
+  _count_duplicate_comparisons(fragments)          # diagnostic only
+
+  Everything collected is trained on: there is no validation split. Feedback
+  is the scarce resource, and holding a share back took it away from training
+  while no decision really depended on that measurement.
 
 _collect_demo_preference_pairs(num_pairs):         # Ibarz et al. 2018
-  expert_frags = fragmenta(expert_trajectories)
-  agent_frags  = fragmenta(trajectories)
-  pairs  = zip(expert, agent);  preferences = [expert≻agent] fisse (nessuna reward)
-  push_split → dataset_demo_prefs_train / _val
-
-push_split(train_ds, val_ds, fragments, prefs):
-  shuffle; n_train = train_comparison_frac·N; distribuisci in train/val
+  expert_frags = fragment(expert_trajectories)
+  agent_frags  = fragment(trajectories)
+  pairs = zip(expert, agent); labels fixed at expert ≻ agent (no reward used)
 
 ────────────────────────────────────────────────────────────────────
 _train_reward_model():
-  SE nessuna traiettoria: return
-  SE demo_mode == "preferences": _train_reward_model_pure_preferences()
-  ALTRIMENTI:                    _train_reward_model_gcl()
+  IF no trajectories: return
+  IF demo_mode == "preferences": _train_reward_model_pure_preferences()
+  ELSE:                          _train_reward_model_gcl()
 
-── modalità GCL ─────────────────────────────────────────────────────
+── GCL mode ─────────────────────────────────────────────────────────
 _train_reward_model_gcl():
   has_prefs = |dataset_train| > 0
-  SE non has_prefs E demo_weight==0: return        # niente da allenare
+  IF not has_prefs AND demo_weight == 0: return
 
-  definisci member_step(member, optimizer):        # per ogni membro dell'ensemble
-      per gradient_steps_rew volte:
-          pref_loss = BT loss su batch bootstrap di preferenze   (se has_prefs)
-          demo_loss = IRL/GCL loss                               (se demo_weight>0)
-          stats += _reward_step(member, optimizer, pref_loss, demo_loss)
+  _estimate_alpha()          # BEFORE any step: the weight describes THIS theta
 
-  esegui member_step su tutti i membri
-  logga diagnostica loss/maxent/preferenze + statistiche step ibride + norma pesi
+  member_step(member, optimizer):                  # per ensemble member
+      alpha = this member's estimate, fixed for the whole iteration
+      repeat gradient_steps_rew times:
+          pref_loss = BT loss on a preference minibatch    (if has_prefs)
+          demo_loss = IRL/GCL loss                         (if demo_weight>0)
+          stats += _reward_step(member, optimizer, pref_loss, demo_loss, alpha)
 
-── modalità PREFERENCES ─────────────────────────────────────────────
+  run member_step on every member
+  log the loss diagnostics, the step statistics and the weight norm
+
+── PREFERENCES mode ─────────────────────────────────────────────────
 _train_reward_model_pure_preferences():
-  ripartisci batch: n_demo = frazione·batch (coppie expert-vs-agent),
-                    n_oracle = resto (coppie oracolo)
-  member_step: per gradient_steps_rew volte:
-      campiona n_oracle da dataset_train + n_demo da dataset_demo_prefs_train
-      concatena in un unico PreferenceBatch
-      loss = BT loss;  zero_grad → backward → step
-  logga diagnostica preferenze + loss media
+  split the batch: n_demo = fraction·batch (expert-vs-agent pairs),
+                   n_oracle = the rest (oracle pairs)
+  member_step: repeat gradient_steps_rew times:
+      sample n_oracle from dataset_train + n_demo from dataset_demo_prefs_train
+      concatenate into one PreferenceBatch
+      loss = BT loss; zero_grad -> backward -> step
 
 ────────────────────────────────────────────────────────────────────
-_reward_step(member, optimizer, pref_loss, demo_loss)  → stats:
-  # UN passo di ottimizzatore che compone i due gradienti
+_estimate_alpha():                                 # alpha_norm_single_adam only
+  # alpha = CV²_pref / (CV²_pref + CV²_demo), the weight on demonstrations
+  IF gcl_fusion == "norm_balance": return          # that fusion ignores alpha
+  IF demo_weight ≤ 0 or no trajectories: return
+  IF loss_type != "demo_2": raise NotImplementedError
 
-  SE entrambi None: return  (no-op)
+  n_pref = comparisons collected
+  IF n_pref < ALPHA_MIN_PREFS (5):
+      alpha = 1, pinned                            # all weight on demos
+  ELSE, per member:
+      per-sample gradients for each channel
+      V = Σ‖gᵢ - ḡ‖² / (n-1)      # how the generating process scatters
+      S = V / B,  B = min(batch_size, N)   # noise of the gradient applied
+      CV² = S / ‖ḡ‖²                       # dimensionless
+      alpha = CV²_pref / (CV²_pref + CV²_demo)
 
-  SE solo pref_loss:  zero_grad → backward → step            (arm solo-pref)
-  SE solo demo_loss:  zero_grad → backward → step            (arm solo-demo)
-
-  # --- entrambi presenti: calcola i due gradienti separatamente ---
-  g_pref = grad(pref_loss)
-  g_demo = grad(demo_loss)
-  appiattisci; pref_norm, demo_norm
-
-  # bilanciamento di norma: porta g_demo a demo_weight·||g_pref||
-  scale = min(demo_weight · pref_norm / (demo_norm+eps), max_balance_scale)
-
-  scrivi p.grad = g_pref + scale·g_demo  per ogni parametro
-  optimizer.step()
-  ritorna stats (loss, scale, norme, grad_norm)
+  The rollout the demo loss needs is drawn ONCE, from the probe stream, and
+  shared by every sample: it is not feedback, so its noise must not enter the
+  channel's variance, and the estimate must not move the training draws.
 
 ────────────────────────────────────────────────────────────────────
-Helper:
+_reward_step(member, optimizer, pref_loss, demo_loss, alpha) → stats:
+  # ONE optimizer step composing the two gradients
+
+  IF both None: return (no-op)
+  IF only one of them: zero_grad -> backward -> step   (single-channel methods)
+
+  g_pref = grad(pref_loss);  g_demo = grad(demo_loss)
+  flatten; pref_norm, demo_norm
+
+  IF gcl_fusion == "alpha_norm_single_adam":
+      g = (1-alpha)·g_pref/‖g_pref‖ + alpha·g_demo/‖g_demo‖
+      # the channel norms are discarded on purpose: only the direction
+      # survives, which is why alpha has to be dimensionless
+  ELSE:                       # norm_balance
+      scale = min(demo_weight · pref_norm / (demo_norm + eps), max_balance_scale)
+      g = g_pref + scale·g_demo
+
+  write g into p.grad for every parameter; optimizer.step()
+  return stats (losses, alpha or scale, norms, grad_norm)
+
+────────────────────────────────────────────────────────────────────
+Helpers:
   _preference_loss(member, batch):
-      r1,r2 = reward media dei frammenti;  return preference_nll(BT(r1,r2), labels)
+      r1, r2 = mean fragment rewards; preference_nll(BT(r1, r2), labels)
 
-  diagnostica: rapporto norme demo/pref, accuratezza preferenze train/val,
-               ln(2) è il floor atteso della BT loss con etichette soft
+  _smoothed_labels: only for sampled binary labels, which otherwise have their
+      optimum at Delta = ±inf; soft labels are left alone
 
-  _save_checkpoint_extras: salva demo_mode, demo_weight,
-               e i quattro dataset di preferenze
+  diagnostics: demo/pref norm ratio, preference accuracy, and the reminder
+      that ln(2) is the expected BT floor with soft labels
+
+  _save_checkpoint_extras: demo_mode, demo_weight and the preference datasets
 ```

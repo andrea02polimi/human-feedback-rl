@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "human-feedback-rl"
 version = "0.2.0"
-description = "Human-feedback RL algorithms (preference-based, demonstration-based, DAgger) for SUMO driving"
+description = "Reward learning from demonstrations and preferences for SUMO driving"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",

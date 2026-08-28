@@ -1,21 +1,20 @@
-"""Selezione riproducibile del sottocampione di dimostrazioni.
+"""Reproducible selection of the demonstration subsample.
 
-Ogni braccio che consuma dimostrazioni — i baseline solo-dimostrazioni e
-l'algoritmo ibrido — deve vedere le STESSE dimostrazioni allo stesso budget.
-Altrimenti una differenza fra bracci potrebbe venire da quali traiettorie sono
-capitate, non dal metodo.
+Every method that consumes demonstrations -- the demonstration-only baselines
+and the hybrid algorithm -- has to see the SAME demonstrations at the same
+budget. Otherwise a difference between methods could come from which
+trajectories happened to be drawn rather than from the method.
 
-Due proprieta' danno la garanzia:
+Two properties give that guarantee:
 
-* il seed della selezione e' una costante condivisa, **indipendente dal seed di
-  training**: cambiare ``run.seed`` cambia l'inizializzazione della rete e il
-  rollout, non l'insieme di dimostrazioni;
-* si permuta l'INTERO dataset e poi se ne prende un prefisso, quindi i budget
-  sono annidati: passare da 10 a 100 aggiunge 90 dimostrazioni senza scambiare
-  le prime 10.
+* the selection seed is a shared constant, **independent of the training
+  seed**: changing ``run.seed`` changes the network initialisation and the
+  rollout, not the set of demonstrations;
+* the WHOLE dataset is permuted and a prefix taken, so budgets are nested:
+  going from 10 to 100 adds 90 demonstrations without swapping the first 10.
 
-Le impronte servono a verificarlo a posteriori: due run allo stesso budget
-devono scrivere lo stesso ``fingerprint``.
+The fingerprints are there to check it afterwards: two runs at the same budget
+must write the same ``fingerprint``.
 """
 from __future__ import annotations
 
@@ -24,7 +23,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-# Costante condivisa: NON e' il seed di training.
+# Shared constant: this is NOT the training seed.
 DEMO_SUBSAMPLE_SEED = 1000
 
 
@@ -35,15 +34,15 @@ def select_demo_indices(
     n_transitions: Optional[int] = None,
     seed: Optional[int] = None,
 ) -> np.ndarray:
-    """Indici delle dimostrazioni da tenere, nell'ordine di selezione.
+    """Indices of the demonstrations to keep, in selection order.
 
-    ``n_trajectories`` fissa il budget in traiettorie intere; ``n_transitions``
-    lo fissa in transizioni (si prendono traiettorie intere finche' la lunghezza
-    cumulata sta nel cap, sempre almeno una). I due sono mutuamente esclusivi.
-    Senza nessuno dei due si restituisce l'intero dataset.
+    ``n_trajectories`` sets the budget in whole trajectories; ``n_transitions``
+    sets it in transitions (whole trajectories are taken while the cumulative
+    length fits the cap, always at least one). The two are mutually exclusive.
+    With neither, the whole dataset is returned.
 
-    ``seed=None`` significa :data:`DEMO_SUBSAMPLE_SEED`, cosi' chi dimentica di
-    passarlo ottiene comunque il sottocampione condiviso e non uno privato.
+    ``seed=None`` means :data:`DEMO_SUBSAMPLE_SEED`, so forgetting to pass it
+    still yields the shared subsample rather than a private one.
     """
     if n_trajectories is not None and n_transitions is not None:
         raise ValueError(
@@ -57,8 +56,8 @@ def select_demo_indices(
 
     if seed is None:
         seed = DEMO_SUBSAMPLE_SEED
-    # Permutare tutto il dataset (non solo il budget) e' cio' che rende i
-    # budget annidati: ogni budget legge un prefisso dello stesso ordine.
+    # Permuting the whole dataset, not just the budget, is what makes the
+    # budgets nested: every budget reads a prefix of the same order.
     order = np.random.default_rng(seed).permutation(n_available)
 
     if n_transitions is not None:
@@ -90,20 +89,20 @@ def select_demo_indices(
 
 
 def indices_fingerprint(indices: Sequence[int]) -> str:
-    """Hash dell'INSIEME selezionato, non del suo ordine.
+    """Hash of the selected SET, not of its order.
 
-    Due bracci allo stesso budget possono elencare le stesse dimostrazioni in
-    ordine diverso: cio' che deve coincidere e' l'insieme.
+    Two methods at the same budget may list the same demonstrations in a
+    different order: what has to match is the set.
     """
     payload = ",".join(str(int(i)) for i in sorted(indices))
     return hashlib.sha1(payload.encode()).hexdigest()
 
 
 def dataset_fingerprint(lengths: Sequence[int]) -> str:
-    """Hash della forma del dataset: quante traiettorie e lunghe quanto.
+    """Hash of the dataset's shape: how many trajectories, and how long.
 
-    Serve a distinguere "stesso budget, stesso dataset" da "stesso budget, ma
-    qualcuno ha rigenerato le dimostrazioni".
+    It separates "same budget, same dataset" from "same budget, but someone
+    regenerated the demonstrations".
     """
     payload = ",".join(str(int(x)) for x in lengths)
     return hashlib.sha1(payload.encode()).hexdigest()
@@ -117,11 +116,11 @@ def subsample_manifest(
     n_transitions: Optional[int] = None,
     dataset_name: str = "",
 ) -> Dict:
-    """Descrive una selezione abbastanza da riprodurla e da confrontarla."""
+    """Describes a selection well enough to reproduce it and to compare it."""
     idx = [int(i) for i in indices]
-    # I nomi delle chiavi sono un'interfaccia: scripts/train_hybrid_sac.py e
-    # scripts/verify_demo_subsample.py leggono subsample_seed, fingerprint,
-    # dataset_fingerprint e n_transitions_selected. Rinominarle rompe entrambi.
+    # The key names are an interface: the training entry point logs
+    # subsample_seed, fingerprint, dataset_fingerprint and
+    # n_transitions_selected. Renaming them breaks it.
     return {
         "dataset_name": dataset_name,
         "dataset_size": len(lengths),

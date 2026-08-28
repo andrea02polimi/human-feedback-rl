@@ -12,10 +12,10 @@ def make_pair_fragmenter(kind: str, rng, logger, reward_ensemble=None, oversampl
     if kind == "active":
         if reward_ensemble is None:
             raise ValueError('fragmenter "active" requires a reward_ensemble.')
-        # Con un membro solo il punteggio di acquisizione (disaccordo fra
-        # membri) e' identicamente zero: "active" degenererebbe in silenzio in
-        # uno casuale, e i risultati sarebbero attribuiti alla strategia
-        # sbagliata. Meglio fallire subito.
+        # With a single member the acquisition score (disagreement between
+        # members) is identically zero: "active" would quietly degenerate into
+        # random sampling, and the results would be credited to the wrong
+        # strategy. Better to fail immediately.
         if len(getattr(reward_ensemble, "members", []) or []) < 2:
             raise ValueError(
                 'fragmenter "active" needs at least 2 ensemble members; '
@@ -63,19 +63,19 @@ class RandomFragmenter:
                 fragments.append(Fragment(traj[:]))
             return fragments
 
-        # Un frammento contiguo di lunghezza L dentro una traiettoria lunga T
-        # puo' iniziare in max(T - L + 1, 1) posizioni. Lo stesso conteggio
-        # serve due volte -- per l'avviso e per i pesi di campionamento -- e va
-        # calcolato UNA sola volta. Quando erano due espressioni diverse i pesi
-        # usavano len(traj) // L + 1, che con L=1 vale T+1 invece di T: le
-        # traiettorie corte (cioe' gli episodi finiti in collisione) venivano
-        # sovracampionate, e la distorsione cresceva con L -- a L=10 arrivava
-        # al 26% fra la traiettoria piu' corta e la piu' lunga.
-        per_traiettoria = np.array(
+        # A contiguous fragment of length L inside a trajectory of length T
+        # can start at max(T - L + 1, 1) positions. The same count is needed
+        # twice -- for the warning and for the sampling weights -- and must be
+        # computed ONCE. When they were two separate expressions the weights
+        # used len(traj) // L + 1, which at L=1 gives T+1 instead of T: short
+        # trajectories (the episodes that ended in a collision) were
+        # oversampled, and the bias grew with L -- at L=10 it reached 26%
+        # between the shortest and the longest trajectory.
+        starts_per_trajectory = np.array(
             [max(len(traj) - fragment_length + 1, 1) for traj in trajectories],
             dtype=float,
         )
-        num_unique = int(per_traiettoria.sum())
+        num_unique = int(starts_per_trajectory.sum())
         if num_fragments > num_unique:
             self.logger.warn(
                 f"Requested {num_fragments} fragments but only "
@@ -83,10 +83,10 @@ class RandomFragmenter:
                 "Some fragments will be sampled more than once.",
             )
 
-        # Pesare per il numero di frammenti distinti, e poi estrarre lo start
-        # uniformemente dentro la traiettoria, rende equiprobabile ogni
-        # frammento del pool.
-        weights = per_traiettoria / per_traiettoria.sum()
+        # Weighting by the number of distinct fragments, then drawing the
+        # start uniformly inside the trajectory, makes every fragment in the
+        # pool equally likely.
+        weights = starts_per_trajectory / starts_per_trajectory.sum()
 
         fragments = []
         for _ in range(num_fragments):

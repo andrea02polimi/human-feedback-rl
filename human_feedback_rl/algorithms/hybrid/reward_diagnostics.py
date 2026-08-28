@@ -289,9 +289,9 @@ class RewardDiagnosticsMixin:
         # scale, fitted on RUNNING steps only (terminal rewards stay the signal we
         # want to reconstruct). One shift/scale shared by every trajectory, so the
         # cross-trajectory ranking is untouched and only the x-axis units change.
-        # Nessuna temperatura: non e' un attributo dell'algoritmo (vive nel
-        # gatherer) e l'affine la cancellerebbe comunque, essendo fittata
-        # sulle stesse predizioni a cui verrebbe applicata.
+        # No temperature: it is not an attribute of the algorithm (it lives in
+        # the gatherer) and the affine would cancel it anyway, being fitted on
+        # the very predictions it would be applied to.
         pred_steps = np.concatenate(pred_step_lists)
         true_steps = np.concatenate(true_step_lists)
         running = np.concatenate(running_lists)
