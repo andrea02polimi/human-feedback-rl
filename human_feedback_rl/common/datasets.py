@@ -1,3 +1,10 @@
+"""Where the collected comparisons are kept.
+
+PreferenceDataset is a circular buffer: past the queue size the oldest
+comparisons drop out. `bootstrap()` returns a resampled view, used to
+decorrelate the members of a reward ensemble.
+"""
+
 import numpy as np
 from collections import deque
 from dataclasses import dataclass

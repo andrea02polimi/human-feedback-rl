@@ -1,3 +1,9 @@
+"""The four records the whole package passes around.
+
+A Transition is one step; a Trajectory is a list of them; a FragmentPair is
+two slices offered to the oracle, and a Preference is what it answers.
+"""
+
 from dataclasses import dataclass
 from typing import Any, List
 

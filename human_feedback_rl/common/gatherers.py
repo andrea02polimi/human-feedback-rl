@@ -1,3 +1,10 @@
+"""The synthetic oracle that answers the comparisons.
+
+It scores a pair by true reward and returns a label: soft probabilities, a
+hard bit, or a Bernoulli draw. `temperature` sets how decisive it is, and
+describes the annotator, not the learner.
+"""
+
 import math
 from typing import List, Optional
 

@@ -1,3 +1,6 @@
+"""Shared infrastructure: the environment side, the reward model, the logging.
+"""
+
 from .base_algorithm import BaseAlgorithm
 from .base_reward_learning_algorithm import BaseRewardLearningAlgorithm, QUERY_SCHEDULES
 from .datasets import PreferenceDataset

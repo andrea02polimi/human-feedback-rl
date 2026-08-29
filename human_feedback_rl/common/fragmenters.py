@@ -1,3 +1,9 @@
+"""Choosing which pieces of trajectory to ask the oracle about.
+
+Random sampling draws fragments uniformly from the pool. Active sampling
+oversamples and keeps the pairs the ensemble disagrees on most.
+"""
+
 import numpy as np
 import torch as th
 from typing import List, Optional

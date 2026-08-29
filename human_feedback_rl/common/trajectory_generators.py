@@ -1,3 +1,9 @@
+"""Running the agent: collecting trajectories, and training it on predicted reward.
+
+The delicate part is the shared environment, where SAC and the rollout use
+the same env and an episode is usually left half done between the two.
+"""
+
 from stable_baselines3.common.vec_env import VecEnv, VecMonitor
 from stable_baselines3.common.base_class import BaseAlgorithm
 from gymnasium import spaces

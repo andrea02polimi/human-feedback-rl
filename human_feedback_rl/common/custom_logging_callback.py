@@ -1,3 +1,9 @@
+"""SB3 callbacks: episode metrics, and dumping at a fixed interval.
+
+SB3 flushes its logger on its own schedule, which does not line up with the
+iterations of reward learning; these make the two agree.
+"""
+
 from stable_baselines3.common.callbacks import BaseCallback
 
 

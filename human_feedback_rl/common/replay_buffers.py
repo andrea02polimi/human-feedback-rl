@@ -1,3 +1,10 @@
+"""SAC replay buffers that know the reward model can change under them.
+
+One measures how far the stored rewards have drifted from what the model
+predicts now; the other relabels them, so the critic regresses on the
+current reward instead of an older one.
+"""
+
 from typing import Any, Optional
 
 import numpy as np

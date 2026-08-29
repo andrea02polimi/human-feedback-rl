@@ -1,3 +1,10 @@
+"""Three wrappers that sit between the agent and the environment.
+
+One replaces the environment reward with the predicted one, one records the
+trajectories the algorithm will ask for, and one mixes random actions into a
+policy for exploration.
+"""
+
 import numpy as np
 from typing import Callable, List
 

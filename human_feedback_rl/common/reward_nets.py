@@ -1,3 +1,11 @@
+"""The learned reward: one network, an ensemble of them, and normalization.
+
+SumoRewardNet reads an observation, an action and the ego status.
+RewardEnsemble holds several and exposes their spread, which is what active
+fragment selection needs. NormalizedRewardNet applies an agent-facing affine
+in `predict` while leaving `forward` raw, so reward learning is untouched.
+"""
+
 import abc
 from typing import Iterable, List, Optional, Tuple
 

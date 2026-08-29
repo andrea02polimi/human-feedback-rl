@@ -1,3 +1,10 @@
+"""Where the metrics go: the SB3 logger, W&B, and a JSONL file.
+
+PrefixedLogger is what puts the agent metrics under `agent/`, which is also
+what gives them their own x axis. `configure_wandb_metrics` declares which
+metrics matter, so the generated workspace stays readable.
+"""
+
 import json
 import os
 import sys
