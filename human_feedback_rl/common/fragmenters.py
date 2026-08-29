@@ -12,10 +12,7 @@ def make_pair_fragmenter(kind: str, rng, logger, reward_ensemble=None, oversampl
     if kind == "active":
         if reward_ensemble is None:
             raise ValueError('fragmenter "active" requires a reward_ensemble.')
-        # With a single member the acquisition score (disagreement between
-        # members) is identically zero: "active" would quietly degenerate into
-        # random sampling, and the results would be credited to the wrong
-        # strategy. Better to fail immediately.
+        # Without the guard "active" would quietly become random sampling.
         if len(getattr(reward_ensemble, "members", []) or []) < 2:
             raise ValueError(
                 'fragmenter "active" needs at least 2 ensemble members; '
@@ -63,14 +60,6 @@ class RandomFragmenter:
                 fragments.append(Fragment(traj[:]))
             return fragments
 
-        # A contiguous fragment of length L inside a trajectory of length T
-        # can start at max(T - L + 1, 1) positions. The same count is needed
-        # twice -- for the warning and for the sampling weights -- and must be
-        # computed ONCE. When they were two separate expressions the weights
-        # used len(traj) // L + 1, which at L=1 gives T+1 instead of T: short
-        # trajectories (the episodes that ended in a collision) were
-        # oversampled, and the bias grew with L -- at L=10 it reached 26%
-        # between the shortest and the longest trajectory.
         starts_per_trajectory = np.array(
             [max(len(traj) - fragment_length + 1, 1) for traj in trajectories],
             dtype=float,
@@ -83,9 +72,8 @@ class RandomFragmenter:
                 "Some fragments will be sampled more than once.",
             )
 
-        # Weighting by the number of distinct fragments, then drawing the
-        # start uniformly inside the trajectory, makes every fragment in the
-        # pool equally likely.
+        # These weights, with the uniform start drawn below, make every fragment
+        # in the pool equally likely rather than every trajectory.
         weights = starts_per_trajectory / starts_per_trajectory.sum()
 
         fragments = []
