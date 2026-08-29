@@ -6,10 +6,6 @@ how much the process scatters; B, the minibatch, divides it, because the
 applied gradient averages B draws.
 """
 
-#: Below this many comparisons the preference dispersion cannot be estimated,
-#: so alpha stays pinned to 1 and all the weight goes to the demonstrations.
-ALPHA_MIN_PREFS = 5
-
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
@@ -24,6 +20,11 @@ from human_feedback_rl.common.preference_losses import (
     bradley_terry_probs,
     preference_nll_per_sample,
 )
+
+#: Below this many comparisons the preference dispersion cannot be estimated.
+#: Estimating it anyway biases the value downwards, towards the channel that is
+#: in fact less reliable, so alpha is pinned to 1: all weight on demonstrations.
+ALPHA_MIN_PREFS = 5
 
 
 @dataclass(frozen=True)
@@ -174,16 +175,8 @@ def estimate_alpha(
     Called BEFORE the gradient steps of the iteration, not after: the weight has
     to describe the point where it will be applied.
     """
-    # Comparisons COLLECTED, not necessarily distinct: the fragmenter draws with
-    # replacement, and nothing stops a pair from repeating or a fragment from
-    # being compared with itself. At L=1 with a pool of ~20,000 transitions the
-    # probability is ~1/20,000 per pair, so in practice it does not happen; but
-    # the threshold counts elements, and the name should not promise more.
     n_pref = 0 if pref_batch is None else len(pref_batch.fragment_pairs)
     if n_pref < min_prefs:
-        # Below a handful of comparisons the preference dispersion cannot be
-        # estimated and the value would be biased downwards, that is, towards
-        # the less reliable channel. All the weight goes to demonstrations.
         return AlphaEstimate(alpha=1.0, pref=None, demo=None, pinned=True)
 
     pref_grads = preference_sample_gradients(member, pref_batch, smooth_labels, params)
