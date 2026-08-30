@@ -230,13 +230,13 @@ class TestSampleEndToEnd:
         )
         return gen, env
 
-    def test_nessuna_transizione_persa_fra_train_e_sample(self, rng):
+    def test_no_transition_is_lost_between_train_and_sample(self, rng):
         gen, env = self._generator(rng)
 
-        # 14 passi su episodi da 10: SAC si ferma a meta' del secondo
+        # 14 steps over episodes of 10: SAC stops halfway through the second
         gen.train(steps=14, log_interval=100)
-        aperte_prima = sum(len(t) for t in gen.buffering_wrapper._partial_trajectories)
-        assert aperte_prima > 0, "il test non esercita il caso che ci interessa"
+        open_before = sum(len(t) for t in gen.buffering_wrapper._partial_trajectories)
+        assert open_before > 0, "the test does not exercise the case it is about"
 
         trajs = gen.sample(agent_steps=20)
 
