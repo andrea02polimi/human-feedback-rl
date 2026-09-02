@@ -51,7 +51,10 @@ VALID_DEMO_MODES = ("gcl", "preferences")
 # How the two gradients become one update.
 #   norm_balance            norm-balanced sum
 #   alpha_norm_single_adam  unit directions combined by alpha, a SINGLE Adam
-VALID_GCL_FUSIONS = ("norm_balance", "alpha_norm_single_adam")
+#   unit_mean_single_adam   the same, with alpha pinned to 1/2 instead of
+#                           estimated: the unweighted counterpart of the above
+VALID_GCL_FUSIONS = ("norm_balance", "alpha_norm_single_adam",
+                     "unit_mean_single_adam")
 
 
 class HybridAlgorithm(

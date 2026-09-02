@@ -38,8 +38,8 @@ class ReliabilityWeightMixin:
         where it will be applied. The rollout it needs comes from the diagnostics RNG,
         so measuring never moves the training draws.
         """
-        if self.gcl_fusion == "norm_balance":
-            return                       # that fusion does not use alpha
+        if self.gcl_fusion in ("norm_balance", "unit_mean_single_adam"):
+            return                       # neither fusion estimates alpha
         self._alpha_current = {}
         if self.demo_weight <= 0.0 or not self.trajectories:
             return                       # no demonstration channel

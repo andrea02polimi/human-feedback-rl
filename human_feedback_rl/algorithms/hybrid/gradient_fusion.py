@@ -7,7 +7,7 @@ import torch as th
 
 
 class GradientFusionMixin:
-    """The two fusion rules: norm balancing and the reliability weight."""
+    """The fusion rules: norm balancing, and the two unit-direction mixes."""
 
     def _reward_step(self, member, optimizer, pref_loss, demo_loss,
                      alpha=None) -> Dict[str, float]:
@@ -42,6 +42,11 @@ class GradientFusionMixin:
         if self.gcl_fusion == "alpha_norm_single_adam":
             fused = self._fuse_by_reliability_weight(
                 member, params, flat_pref, flat_demo, pref_norm, demo_norm, alpha)
+        elif self.gcl_fusion == "unit_mean_single_adam":
+            # Same rule with alpha pinned to 1/2, so the two channels enter as
+            # the mean of their unit directions and nothing is estimated.
+            fused = self._fuse_by_reliability_weight(
+                member, params, flat_pref, flat_demo, pref_norm, demo_norm, 0.5)
         else:
             fused = self._fuse_by_norm_balance(
                 member, params, g_pref, g_demo, pref_norm, demo_norm)
